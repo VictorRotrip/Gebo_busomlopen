@@ -51,6 +51,7 @@ class Trip:
     arrival: int          # minutes from midnight
     stops: list           # list of (station_code, station_name, halt_code, halt_name, time_minutes)
     copy_nr: int = 1      # which copy (1..multiplicity)
+    is_reserve: bool = False  # phantom trip for reserve bus duty
 
     @property
     def duration(self) -> int:
@@ -86,7 +87,11 @@ class BusRotation:
 
     @property
     def total_ride_minutes(self) -> int:
-        return sum(t.arrival - t.departure for t in self.trips)
+        return sum(t.arrival - t.departure for t in self.trips if not t.is_reserve)
+
+    @property
+    def total_reserve_minutes(self) -> int:
+        return sum(t.arrival - t.departure for t in self.trips if t.is_reserve)
 
     @property
     def total_idle_minutes(self) -> int:
@@ -99,6 +104,14 @@ class BusRotation:
     @property
     def total_dienst_minutes(self) -> int:
         return self.end_time - self.start_time if self.trips else 0
+
+    @property
+    def real_trips(self) -> list:
+        return [t for t in self.trips if not t.is_reserve]
+
+    @property
+    def reserve_trip_list(self) -> list:
+        return [t for t in self.trips if t.is_reserve]
 
 
 @dataclass
@@ -506,6 +519,7 @@ def normalize_location(code: str) -> str:
         "klp": "veenendaal_klomp", "klp90": "veenendaal_klomp",
         "rhn": "rhenen", "rhn90": "rhenen",
         "vdn": "veenendaal", "vdnc": "veenendaal_centrum",
+        "vdnw": "veenendaal_west",
         "mrn": "maarn", "mrn90": "maarn", "mrn91": "maarn",
         "amf": "amersfoort", "amf91": "amersfoort",
         "bhv": "bilthoven", "bhv90": "bilthoven",
@@ -518,19 +532,326 @@ def normalize_location(code: str) -> str:
     return mapping.get(code, code)
 
 
-def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict) -> bool:
-    """Check if a bus finishing prev_trip can start next_trip."""
+def normalize_reserve_station(station_name: str) -> str:
+    """Normalize a reserve bus station name to match normalize_location output."""
+    name = station_name.strip().lower()
+    mapping = {
+        "driebergen-zeist": "driebergen",
+        "ede-wageningen": "ede",
+        "utrecht centraal": "utrecht",
+        "veenendaal west": "veenendaal_west",
+        "veenendaal-de klomp": "veenendaal_klomp",
+        "arnhem centraal": "arnhem",
+        "amersfoort centraal": "amersfoort",
+        "breukelen": "breukelen",
+        "houten": "houten",
+        "maarn": "maarn",
+        "rhenen": "rhenen",
+        "woerden": "woerden",
+    }
+    return mapping.get(name, name)
+
+
+def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
+    """Match a reserve day string to a trip date_str.
+    E.g. 'donderdag 11 juni' -> 'do 11-06-2026'
+    """
+    day_lower = reserve_day.strip().lower()
+    # Extract day number
+    parts = day_lower.split()
+    for trip_date in trip_dates:
+        # trip_date format: "do 11-06-2026"
+        td_parts = trip_date.split()
+        day_num = td_parts[1].split("-")[0]  # "11"
+        # Check if day number appears in reserve day and weekday prefix matches
+        day_map = {
+            "maandag": "ma", "dinsdag": "di", "woensdag": "wo",
+            "donderdag": "do", "vrijdag": "vr", "zaterdag": "za", "zondag": "zo"
+        }
+        for full, short in day_map.items():
+            if full in day_lower and td_parts[0] == short and day_num in parts:
+                return trip_date
+    return ""
+
+
+def analyze_reserve_coverage(rotations: list, reserves: list, trip_dates: list) -> list:
+    """
+    Analyze which bus rotations cover reserve bus requirements.
+
+    A rotation covers a reserve requirement if:
+    - It has a gap (idle period) at the reserve station
+    - The gap fully covers the reserve time window
+    - The rotation's bus is at that station during the entire reserve window
+
+    Returns list of dicts with coverage info per reserve requirement.
+    """
+    results = []
+
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        res_loc = normalize_reserve_station(rb.station)
+
+        # Find rotations that are idle at this station during the reserve window
+        covering_buses = []
+
+        for rot in rotations:
+            if rot.date_str != date_str:
+                continue
+
+            # Check each gap between consecutive trips
+            for i in range(len(rot.trips) - 1):
+                prev_trip = rot.trips[i]
+                next_trip = rot.trips[i + 1]
+
+                # Bus is at prev_trip's destination after prev_trip ends
+                bus_loc = normalize_location(prev_trip.dest_code)
+                idle_start = prev_trip.arrival
+                idle_end = next_trip.departure
+
+                # Does this gap cover the reserve window?
+                if (bus_loc == res_loc and
+                    idle_start <= rb.start and
+                    idle_end >= rb.end):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": idle_start,
+                        "idle_end": idle_end,
+                        "prev_trip": f"{prev_trip.origin_name}→{prev_trip.dest_name}",
+                        "next_trip": f"{next_trip.origin_name}→{next_trip.dest_name}",
+                    })
+
+            # Also check: bus arrives at last trip and has no more trips
+            if rot.trips:
+                last = rot.trips[-1]
+                bus_loc = normalize_location(last.dest_code)
+                if (bus_loc == res_loc and last.arrival <= rb.start):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": last.arrival,
+                        "idle_end": 1440,  # end of day
+                        "prev_trip": f"{last.origin_name}→{last.dest_name}",
+                        "next_trip": "(einde dienst)",
+                    })
+
+            # Also check: bus starts first trip from reserve station
+            if rot.trips:
+                first = rot.trips[0]
+                bus_loc = normalize_location(first.origin_code)
+                if (bus_loc == res_loc and first.departure >= rb.end):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": 0,
+                        "idle_end": first.departure,
+                        "prev_trip": "(start dienst)",
+                        "next_trip": f"{first.origin_name}→{first.dest_name}",
+                    })
+
+        results.append({
+            "reserve": rb,
+            "date_str": date_str,
+            "location": res_loc,
+            "required": rb.count,
+            "covered": len(covering_buses),
+            "covering_buses": covering_buses,
+            "shortfall": max(0, rb.count - len(covering_buses)),
+        })
+
+    return results
+
+
+def optimize_reserve_idle_matching(rotations: list, reserves: list, trip_dates: list) -> list:
+    """
+    Optimally allocate idle bus time to cover reserve requirements using
+    bipartite matching (Hopcroft-Karp).  Maximises the number of reserve
+    slots covered by buses that are already idle at the right station.
+
+    Returns a list of dicts (same format as analyze_reserve_coverage) but
+    with the optimal assignment.
+    """
+    # Build idle slots: (rotation, location, idle_start, idle_end, date_str)
+    idle_slots = []
+    for rot in rotations:
+        # Gaps between consecutive trips
+        for i in range(len(rot.trips) - 1):
+            prev_t = rot.trips[i]
+            next_t = rot.trips[i + 1]
+            loc = normalize_location(prev_t.dest_code)
+            idle_slots.append((rot, loc, prev_t.arrival, next_t.departure))
+        # After last trip
+        if rot.trips:
+            last = rot.trips[-1]
+            idle_slots.append((rot, normalize_location(last.dest_code), last.arrival, 1440))
+        # Before first trip
+        if rot.trips:
+            first = rot.trips[0]
+            idle_slots.append((rot, normalize_location(first.origin_code), 0, first.departure))
+
+    # Expand reserves into individual slots (one per count)
+    reserve_slots = []  # (ReserveBus, copy_idx, date_str, normalized_location)
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        res_loc = normalize_reserve_station(rb.station)
+        for i in range(rb.count):
+            reserve_slots.append((rb, i, date_str, res_loc))
+
+    n_idle = len(idle_slots)
+    n_res = len(reserve_slots)
+
+    # Build bipartite adjacency: idle slot i → reserve slot j
+    adj = [[] for _ in range(n_idle)]
+    for i, (rot, loc, istart, iend) in enumerate(idle_slots):
+        for j, (rb, _, date_str, res_loc) in enumerate(reserve_slots):
+            if rot.date_str == date_str and loc == res_loc and istart <= rb.start and iend >= rb.end:
+                adj[i].append(j)
+
+    match_l, match_r = _hopcroft_karp(adj, n_idle, n_res)
+
+    # Build results grouped by original ReserveBus
+    results = []
+    slot_idx = 0
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        res_loc = normalize_reserve_station(rb.station)
+        covered = 0
+        covering_buses = []
+        for _ in range(rb.count):
+            if slot_idx < n_res and match_r[slot_idx] != -1:
+                idle_idx = match_r[slot_idx]
+                rot = idle_slots[idle_idx][0]
+                covering_buses.append({"bus_id": rot.bus_id, "bus_type": rot.bus_type})
+                covered += 1
+            slot_idx += 1
+        results.append({
+            "reserve": rb,
+            "date_str": date_str,
+            "location": res_loc,
+            "required": rb.count,
+            "covered": covered,
+            "covering_buses": covering_buses,
+            "shortfall": max(0, rb.count - covered),
+        })
+    return results
+
+
+def assign_reserves_to_bus_types(reserves: list, all_trips: list) -> list:
+    """
+    Assign each reserve requirement to the bus type most common at that
+    station on that day.
+
+    Returns list of (ReserveBus, bus_type, date_str) tuples.
+    """
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+
+    # Count trips per (normalized_station, date, bus_type)
+    station_type_count = {}
+    for t in all_trips:
+        for loc_code in [t.origin_code, t.dest_code]:
+            loc = normalize_location(loc_code)
+            key = (loc, t.date_str, t.bus_type)
+            station_type_count[key] = station_type_count.get(key, 0) + 1
+
+    assignments = []
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        if not date_str:
+            continue
+        res_loc = normalize_reserve_station(rb.station)
+
+        # Find bus type with most trips at this station on this day
+        best_type = None
+        best_count = 0
+        for (loc, d, bt), count in station_type_count.items():
+            if loc == res_loc and d == date_str and count > best_count:
+                best_count = count
+                best_type = bt
+
+        if best_type:
+            assignments.append((rb, best_type, date_str))
+
+    return assignments
+
+
+def create_reserve_trips(reserves: list, all_trips: list) -> list:
+    """
+    Create phantom Trip objects for reserve bus requirements.
+
+    Each reserve of count N at station S produces N phantom trips that
+    occupy a bus at S for the reserve time window.  The bus type is
+    assigned to the most common type at that station/day.
+    """
+    assignments = assign_reserves_to_bus_types(reserves, all_trips)
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+
+    # Build station code / name lookup from real trips
+    loc_info = {}  # normalized_loc → (code, name)
+    for t in all_trips:
+        for code, name in [(t.origin_code, t.origin_name), (t.dest_code, t.dest_name)]:
+            nloc = normalize_location(code)
+            if nloc not in loc_info:
+                loc_info[nloc] = (code, name)
+
+    reserve_trips = []
+    for rb, bus_type, date_str in assignments:
+        res_loc = normalize_reserve_station(rb.station)
+        code, name = loc_info.get(res_loc, ("", rb.station))
+
+        for i in range(rb.count):
+            trip_id = f"RES_{rb.station.replace(' ', '')}_{date_str.replace(' ', '')}_{i + 1}"
+            reserve_trips.append(Trip(
+                trip_id=trip_id,
+                bus_nr=0,
+                service=f"Reserve {rb.station}",
+                date_str=date_str,
+                date_label=f"Reserve {rb.day}",
+                direction="reserve",
+                bus_type=bus_type,
+                snel_stop="",
+                pattern="",
+                multiplicity=1,
+                origin_code=code,
+                origin_name=name,
+                origin_halt="",
+                dest_code=code,
+                dest_name=name,
+                dest_halt="",
+                departure=rb.start,
+                arrival=rb.end,
+                stops=[],
+                is_reserve=True,
+            ))
+
+    return reserve_trips
+
+
+def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
+                service_constraint: bool = False) -> bool:
+    """Check if a bus finishing prev_trip can start next_trip.
+
+    If service_constraint=True, two real (non-reserve) trips must belong to
+    the same service.  Reserve trips can bridge different services.
+    """
     # Must be same bus type
     if prev_trip.bus_type != next_trip.bus_type:
         return False
     # Must be same date
     if prev_trip.date_str != next_trip.date_str:
         return False
+    # Service constraint: real-to-real must be same service
+    if service_constraint:
+        if not prev_trip.is_reserve and not next_trip.is_reserve:
+            if prev_trip.service != next_trip.service:
+                return False
     # Location must match: prev destination = next origin
     if normalize_location(prev_trip.dest_code) != normalize_location(next_trip.origin_code):
         return False
-    # Timing: enough turnaround (per bus type)
-    min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+    # Timing: reserve trips need 0 turnaround (bus just stays at station)
+    if prev_trip.is_reserve or next_trip.is_reserve:
+        min_turnaround = 0
+    else:
+        min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
     gap = next_trip.departure - prev_trip.arrival
     if gap < min_turnaround:
         return False
@@ -567,7 +888,7 @@ def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
 # Algorithm 1: Greedy best-fit
 # ---------------------------------------------------------------------------
 
-def _optimize_greedy(group_trips, turnaround_map):
+def _optimize_greedy(group_trips, turnaround_map, service_constraint=False):
     """Greedy best-fit: assign each trip to the bus with shortest idle time."""
     group_trips.sort(key=lambda t: (t.departure, t.arrival))
     buses = []  # list of lists of trip indices
@@ -578,7 +899,7 @@ def _optimize_greedy(group_trips, turnaround_map):
 
         for bus in buses:
             last = group_trips[bus[-1]]
-            if can_connect(last, trip, turnaround_map):
+            if can_connect(last, trip, turnaround_map, service_constraint):
                 gap = trip.departure - last.arrival
                 if gap < best_gap:
                     best_gap = gap
@@ -667,7 +988,7 @@ def _matching_to_chains(n, match_l):
     return chains
 
 
-def _optimize_matching(group_trips, turnaround_map):
+def _optimize_matching(group_trips, turnaround_map, service_constraint=False):
     """Maximum bipartite matching via Hopcroft-Karp. Minimizes bus count."""
     group_trips.sort(key=lambda t: (t.departure, t.arrival))
     n = len(group_trips)
@@ -676,7 +997,7 @@ def _optimize_matching(group_trips, turnaround_map):
     adj = [[] for _ in range(n)]
     for i in range(n):
         for j in range(i + 1, n):
-            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map, service_constraint):
                 adj[i].append(j)
 
     match_l, _ = _hopcroft_karp(adj, n, n)
@@ -688,7 +1009,7 @@ def _optimize_matching(group_trips, turnaround_map):
 #   Minimizes buses first, then minimizes total idle time.
 # ---------------------------------------------------------------------------
 
-def _optimize_mincost(group_trips, turnaround_map):
+def _optimize_mincost(group_trips, turnaround_map, service_constraint=False):
     """
     Min-cost max matching via successive shortest path (SPFA).
     Minimizes number of buses (primary) and total idle time (secondary).
@@ -703,7 +1024,7 @@ def _optimize_mincost(group_trips, turnaround_map):
     cost_map = {}
     for i in range(n):
         for j in range(i + 1, n):
-            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map, service_constraint):
                 idle = group_trips[j].departure - group_trips[i].arrival
                 adj[i].append(j)
                 cost_map[(i, j)] = idle
@@ -802,12 +1123,15 @@ ALGORITHMS = {
 
 def optimize_rotations(trips: list, turnaround_map: dict = None,
                        algorithm: str = "greedy",
-                       per_service: bool = False) -> list:
+                       per_service: bool = False,
+                       service_constraint: bool = False) -> list:
     """
     Optimize bus rotations using the specified algorithm.
 
     If per_service=True, only chains trips within the same service (Excel tab).
     If per_service=False, chains across all services (cross-tab optimization).
+    If service_constraint=True (only when per_service=False), real-to-real trip
+    connections must be within the same service; reserve trips can bridge services.
     """
     groups, turnaround_map = _group_trips(trips, turnaround_map)
     algo_name, algo_func = ALGORITHMS[algorithm]
@@ -825,7 +1149,7 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
         rotation_counter = 0
         for key, group_trips in sorted(new_groups.items()):
             date_str, bus_type = key[0], key[1]
-            chains = algo_func(group_trips, turnaround_map)
+            chains = algo_func(group_trips, turnaround_map, service_constraint=False)
             rotations, rotation_counter = _build_rotations(
                 group_trips, date_str, bus_type, chains, rotation_counter
             )
@@ -836,7 +1160,7 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
     rotation_counter = 0
 
     for (date_str, bus_type), group_trips in sorted(groups.items()):
-        chains = algo_func(group_trips, turnaround_map)
+        chains = algo_func(group_trips, turnaround_map, service_constraint=service_constraint)
         rotations, rotation_counter = _build_rotations(
             group_trips, date_str, bus_type, chains, rotation_counter
         )
@@ -967,7 +1291,10 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
                         base_col = 1 + i * cols_per_bus
                         if trip_idx < len(bus.trips):
                             t = bus.trips[trip_idx]
-                            ws.cell(row=row, column=base_col, value=t.origin_name)
+                            if t.is_reserve:
+                                ws.cell(row=row, column=base_col, value=f"RESERVE {t.origin_name}")
+                            else:
+                                ws.cell(row=row, column=base_col, value=t.origin_name)
                             ws.cell(row=row, column=base_col + 1, value=t.dest_name)
                             ws.cell(row=row, column=base_col + 2, value=minutes_to_time(t.departure))
                             ws.cell(row=row, column=base_col + 2).number_format = "HH:MM"
@@ -982,10 +1309,12 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
                                 hold = next_t.departure - t.arrival
                                 ws.cell(row=row, column=base_col + 5, value=f"{hold // 60}:{hold % 60:02d}")
 
-                            # Apply borders
+                            # Apply borders + reserve highlight
                             for cc in range(base_col, base_col + 6):
                                 ws.cell(row=row, column=cc).border = THIN_BORDER
                                 ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
+                                if t.is_reserve:
+                                    ws.cell(row=row, column=cc).fill = RESERVE_FILL
                     row += 1
 
                 # Subtotals for this block
@@ -1093,7 +1422,9 @@ def write_overzicht_sheet(wb_out, rotations: list, all_trips: list):
                 cell = ws.cell(row=row, column=1 + j, value=v)
                 cell.border = THIN_BORDER
                 cell.alignment = Alignment(horizontal="center")
-                if use_fill:
+                if trip.is_reserve:
+                    cell.fill = RESERVE_FILL
+                elif use_fill:
                     cell.fill = use_fill
                 if j in (8, 9):
                     cell.number_format = "HH:MM"
@@ -1108,7 +1439,9 @@ def write_overzicht_sheet(wb_out, rotations: list, all_trips: list):
     ws.freeze_panes = "A4"
 
 
-def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None, algorithm: str = "greedy"):
+def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list,
+                             turnaround_map: dict = None, algorithm: str = "greedy",
+                             output_mode: int = 1):
     """
     Tab 3: Berekeningen - Calculations and KPIs.
     """
@@ -1245,38 +1578,149 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
 
     row += 2
 
-    # --- Section 3: Reservebussen ---
-    ws.cell(row=row, column=1, value="3. Reservebussen")
-    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
-    row += 1
+    # --- Section 3: Reservebussen analyse ---
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+    real_trip_count = sum(1 for t in all_trips if not t.is_reserve)
 
-    res_headers = ["Station", "Aantal", "Dag", "Van", "Tot", "Opmerking"]
-    for j, h in enumerate(res_headers):
-        cell = ws.cell(row=row, column=1 + j, value=h)
-        cell.font = HEADER_FONT_WHITE
-        cell.fill = HEADER_FILL
-        cell.border = THIN_BORDER
-        cell.alignment = Alignment(horizontal="center")
-    row += 1
-
-    total_reserve = 0
-    for rb in reserves:
-        values = [rb.station, rb.count, rb.day,
-                  minutes_to_time(rb.start), minutes_to_time(rb.end), rb.remark]
-        for j, v in enumerate(values):
-            cell = ws.cell(row=row, column=1 + j, value=v)
-            cell.border = THIN_BORDER
-            cell.alignment = Alignment(horizontal="center")
-            if j in (3, 4):
-                cell.number_format = "HH:MM"
-        total_reserve += rb.count
+    if output_mode in (1, 2):
+        # Modes 1 & 2: post-hoc coverage analysis
+        mode_label = {
+            1: "3. Reservebussen - Dekkingsanalyse (wachttijd, greedy)",
+            2: "3. Reservebussen - Optimale toewijzing (wachttijd, matching)",
+        }[output_mode]
+        ws.cell(row=row, column=1, value=mode_label)
+        ws.cell(row=row, column=1).font = Font(bold=True, size=12)
         row += 1
 
-    ws.cell(row=row, column=1, value="Totaal reservebussen:")
-    ws.cell(row=row, column=1).font = Font(bold=True)
-    ws.cell(row=row, column=2, value=total_reserve)
-    ws.cell(row=row, column=2).font = Font(bold=True)
-    row += 3
+        if output_mode == 1:
+            coverage = analyze_reserve_coverage(rotations, reserves, trip_dates)
+        else:
+            coverage = optimize_reserve_idle_matching(rotations, reserves, trip_dates)
+
+        res_headers = ["Station", "Dag", "Van", "Tot", "Nodig", "Gedekt door omloop",
+                       "Extra nodig", "Opmerking", "Dekkende bus(sen)"]
+        for j, h in enumerate(res_headers):
+            cell = ws.cell(row=row, column=1 + j, value=h)
+            cell.font = HEADER_FONT_WHITE
+            cell.fill = HEADER_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        row += 1
+
+        total_reserve = 0
+        total_covered = 0
+        total_extra = 0
+        for c in coverage:
+            rb = c["reserve"]
+            covered = min(c["covered"], c["required"])
+            extra = c["shortfall"]
+            total_reserve += rb.count
+            total_covered += covered
+            total_extra += extra
+
+            bus_names = ", ".join(b["bus_id"] for b in c["covering_buses"][:c["required"]])
+
+            values = [rb.station, rb.day, minutes_to_time(rb.start), minutes_to_time(rb.end),
+                      rb.count, covered, extra, rb.remark, bus_names]
+            for j, v in enumerate(values):
+                cell = ws.cell(row=row, column=1 + j, value=v)
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(horizontal="center")
+                if j in (2, 3):
+                    cell.number_format = "HH:MM"
+                if j == 6 and extra > 0:
+                    cell.font = Font(bold=True, color="FF0000")
+                elif j == 6 and extra == 0:
+                    cell.font = Font(bold=True, color="008000")
+            row += 1
+
+        # Totals
+        row += 1
+        summary_items = [
+            ("Totaal reservebussen nodig:", total_reserve),
+            ("Gedekt door bestaande busomlopen:", total_covered),
+            ("Extra bussen nodig voor reserve:", total_extra),
+            ("Totaal vloot (omloop + extra reserve):", len(rotations) + total_extra),
+        ]
+        for label, val in summary_items:
+            ws.cell(row=row, column=1, value=label)
+            ws.cell(row=row, column=1).font = Font(bold=True)
+            ws.cell(row=row, column=2, value=val)
+            ws.cell(row=row, column=2).font = Font(bold=True)
+            row += 1
+
+    else:
+        # Modes 3 & 4: reserves are phantom trips in the rotations
+        ws.cell(row=row, column=1, value="3. Reservebussen - Ingepland in busomlopen")
+        ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+        row += 1
+
+        # Count reserve coverage from the rotations themselves
+        reserve_in_rot = []
+        for rot in rotations:
+            for t in rot.trips:
+                if t.is_reserve:
+                    reserve_in_rot.append((rot.bus_id, rot.bus_type, t))
+
+        # Summarise per reserve requirement
+        res_headers = ["Station", "Dag", "Van", "Tot", "Nodig",
+                       "Ingepland", "Extra nodig", "Opmerking", "Bus(sen)"]
+        for j, h in enumerate(res_headers):
+            cell = ws.cell(row=row, column=1 + j, value=h)
+            cell.font = HEADER_FONT_WHITE
+            cell.fill = HEADER_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        row += 1
+
+        total_reserve = 0
+        total_planned = 0
+        total_extra = 0
+        for rb in reserves:
+            date_str = match_reserve_day(rb.day, trip_dates)
+            res_loc = normalize_reserve_station(rb.station)
+            # Find reserve trips in rotations matching this requirement
+            matching = [(bid, bt) for bid, bt, t in reserve_in_rot
+                        if t.date_str == date_str
+                        and normalize_location(t.origin_code) == res_loc
+                        and t.departure == rb.start and t.arrival == rb.end]
+            planned = min(len(matching), rb.count)
+            extra = max(0, rb.count - planned)
+            total_reserve += rb.count
+            total_planned += planned
+            total_extra += extra
+            bus_names = ", ".join(bid for bid, _ in matching[:rb.count])
+            values = [rb.station, rb.day, minutes_to_time(rb.start), minutes_to_time(rb.end),
+                      rb.count, planned, extra, rb.remark, bus_names]
+            for j, v in enumerate(values):
+                cell = ws.cell(row=row, column=1 + j, value=v)
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(horizontal="center")
+                if j in (2, 3):
+                    cell.number_format = "HH:MM"
+                if j == 6 and extra > 0:
+                    cell.font = Font(bold=True, color="FF0000")
+                elif j == 6 and extra == 0:
+                    cell.font = Font(bold=True, color="008000")
+            row += 1
+
+        n_real_buses = len(set(r.bus_id for r in rotations if r.real_trips))
+        row += 1
+        summary_items = [
+            ("Totaal reservebussen nodig:", total_reserve),
+            ("Ingepland in busomlopen:", total_planned),
+            ("Extra bussen nodig voor reserve:", total_extra),
+            ("Bussen met ritten:", n_real_buses),
+            ("Totaal vloot (omloop + extra reserve):", n_real_buses + total_extra),
+        ]
+        for label, val in summary_items:
+            ws.cell(row=row, column=1, value=label)
+            ws.cell(row=row, column=1).font = Font(bold=True)
+            ws.cell(row=row, column=2, value=val)
+            ws.cell(row=row, column=2).font = Font(bold=True)
+            row += 1
+
+    row += 2
 
     # --- Section 4: Optimalisatie parameters ---
     ws.cell(row=row, column=1, value="4. Optimalisatie parameters & toelichting")
@@ -1305,8 +1749,8 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
     ws.cell(row=row, column=1).font = Font(bold=True, size=12)
     row += 1
 
-    total_input = len(all_trips)
-    total_assigned = sum(len(r.trips) for r in rotations)
+    total_input = real_trip_count
+    total_assigned = sum(len(r.real_trips) for r in rotations)
     ws.cell(row=row, column=1, value="Totaal ritten in invoer:")
     ws.cell(row=row, column=2, value=total_input)
     row += 1
@@ -1681,8 +2125,8 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
     ws.cell(row=row, column=1, value=f"Algoritme: {ALGORITHMS[algorithm][0]}")
     row += 2
 
-    # Get bus types present in data
-    active_types = sorted(set(t.bus_type for t in all_trips))
+    # Get bus types present in real trips only
+    active_types = sorted(set(t.bus_type for t in all_trips if not t.is_reserve))
     # Test values from 2 to max(base+4, 15)
     max_test = max(max(base_turnaround_map.get(bt, 8) for bt in active_types) + 4, 15)
     test_values = list(range(2, max_test + 1))
@@ -1717,7 +2161,7 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
             test_map = dict(base_turnaround_map)
             test_map[bus_type] = tv
             rots = optimize_rotations(all_trips, test_map, algorithm=algorithm)
-            bt_rots = [r for r in rots if r.bus_type == bus_type]
+            bt_rots = [r for r in rots if r.bus_type == bus_type and r.real_trips]
             n_buses = len(bt_rots)
             ride = sum(r.total_ride_minutes for r in bt_rots)
             dienst = sum(r.total_dienst_minutes for r in bt_rots)
@@ -1814,8 +2258,15 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
 
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
                     turnaround_map: dict = None, algorithm: str = "greedy",
-                    include_sensitivity: bool = False):
-    """Generate the complete output Excel workbook."""
+                    include_sensitivity: bool = False, output_mode: int = 1):
+    """Generate the complete output Excel workbook.
+
+    output_mode:
+        1 = baseline per dienst (no reserves)
+        2 = per dienst + optimal idle reserve matching
+        3 = per dienst + reserve phantom trips
+        4 = gecombineerd + reserve phantom trips + sensitivity
+    """
     wb = openpyxl.Workbook()
     # Remove default sheet
     wb.remove(wb.active)
@@ -1827,7 +2278,8 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
     write_overzicht_sheet(wb, rotations, all_trips)
 
     # Tab 3: Berekeningen
-    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map, algorithm)
+    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map, algorithm,
+                             output_mode=output_mode)
 
     # Tab 4: Overzicht Businzet
     write_businzet_sheet(wb, rotations, all_trips, reserves)
@@ -1906,7 +2358,7 @@ def main():
     print(f"Busomloop Optimizer")
     print(f"{'='*60}")
     print(f"Invoer:        {args.input_file}")
-    print(f"Uitvoer:       {output_base}_baseline.xlsx + {output_base}_gecombineerd.xlsx")
+    print(f"Uitvoer:       4 bestanden (zie onder)")
     print()
 
     # ===== PARSE =====
@@ -1955,63 +2407,117 @@ def main():
         print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
     print()
 
-    # ===== BASELINE OUTPUT (per-service, no cross-sheet combining) =====
     algo_name = ALGORITHMS[args.algoritme][0]
-    print(f"Stap 3a: Baseline busomlopen (per tabblad, {algo_name})...")
-    baseline_rotations = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme, per_service=True)
-    n_baseline = len(baseline_rotations)
-    print(f"  {n_baseline} busomlopen (baseline)")
+    total_reserves = sum(r.count for r in reserves)
 
-    baseline_file = f"{output_base}_baseline.xlsx"
-    generate_output(baseline_rotations, all_trips, reserves, baseline_file,
-                    baseline_turnaround, args.algoritme)
-    print(f"  Opgeslagen: {baseline_file}")
+    # Create reserve phantom trips (used by outputs 3 and 4)
+    reserve_trip_list = create_reserve_trips(reserves, all_trips)
+    trips_with_reserves = all_trips + reserve_trip_list
+    print(f"  {len(reserve_trip_list)} reservebus-taken aangemaakt (phantom trips)")
     print()
 
-    # ===== COMBINED OUTPUT (cross-sheet, same turnaround times + sensitivity) =====
-    print(f"Stap 3b: Gecombineerde busomlopen (cross-tabblad, {algo_name})...")
-    combined_rotations = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme)
-    n_combined = len(combined_rotations)
-    print(f"  {n_combined} busomlopen (gecombineerd)")
-
-    # Summary per date+type
-    groups = {}
-    for r in combined_rotations:
-        key = (r.date_str, r.bus_type)
-        groups.setdefault(key, []).append(r)
-    for (date_str, bus_type), rots in sorted(groups.items()):
-        ride = sum(r.total_ride_minutes for r in rots)
-        dienst = sum(r.total_dienst_minutes for r in rots)
-        benutting = (ride / dienst * 100) if dienst > 0 else 0
-        print(f"    {date_str} / {bus_type}: {len(rots)} bussen, "
-              f"{sum(len(r.trips) for r in rots)} ritten, "
-              f"benutting {benutting:.0f}%")
-
-    combined_file = f"{output_base}_gecombineerd.xlsx"
-    print(f"\n  Sensitiviteitsanalyse genereren...")
-    generate_output(combined_rotations, all_trips, reserves, combined_file,
-                    baseline_turnaround, args.algoritme, include_sensitivity=True)
-    print(f"  Opgeslagen: {combined_file}")
-    print()
-
-    # ===== FINAL SUMMARY =====
-    def _summary(label, rots):
-        n = len(rots)
-        trips = sum(len(r.trips) for r in rots)
+    # Helper for summary printing
+    def _summary(label, rots, extra_reserve=0):
+        n_real = len(set(r.bus_id for r in rots if r.real_trips))
+        n_total_rot = len(rots)
+        trips = sum(len(r.real_trips) for r in rots)
+        res_planned = sum(len(r.reserve_trip_list) for r in rots)
         ride = sum(r.total_ride_minutes for r in rots)
         dienst = sum(r.total_dienst_minutes for r in rots)
         benut = (ride / dienst * 100) if dienst > 0 else 0
         print(f"  {label}:")
-        print(f"    Bussen:       {n}")
+        print(f"    Bussen:       {n_real}")
         print(f"    Ritten:       {trips}")
+        if res_planned:
+            print(f"    Reserve ingepland: {res_planned}/{total_reserves}")
         print(f"    Rijtijd:      {ride // 60}u{ride % 60:02d}")
         print(f"    Diensttijd:   {dienst // 60}u{dienst % 60:02d}")
         print(f"    Benutting:    {benut:.1f}%")
+        if extra_reserve > 0:
+            print(f"    Extra reserve: {extra_reserve}")
+            print(f"    Totaal vloot:  {n_real + extra_reserve}")
+        return n_real, extra_reserve
 
+    # ===================================================================
+    # OUTPUT 1: Per dienst, geen reserves
+    # ===================================================================
+    print(f"Stap 3a: Output 1 - Per dienst, geen reserves ({algo_name})...")
+    rot1 = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme, per_service=True)
+    print(f"  {len(rot1)} busomlopen")
+
+    file1 = f"{output_base}_1_per_dienst.xlsx"
+    generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, args.algoritme,
+                    output_mode=1)
+    print(f"  Opgeslagen: {file1}")
+    print()
+
+    # ===================================================================
+    # OUTPUT 2: Per dienst + optimale idle reserve matching
+    # ===================================================================
+    print(f"Stap 3b: Output 2 - Per dienst + optimale reserve matching ({algo_name})...")
+    # Same rotations as output 1, but with optimal idle matching in the report
+    file2 = f"{output_base}_2_per_dienst_reservematch.xlsx"
+    generate_output(rot1, all_trips, reserves, file2, baseline_turnaround, args.algoritme,
+                    output_mode=2)
+    print(f"  Opgeslagen: {file2}")
+
+    # Compute idle matching stats for summary
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+    idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
+    idle_covered = sum(min(c["covered"], c["required"]) for c in idle_cov)
+    idle_extra = sum(c["shortfall"] for c in idle_cov)
+    print(f"  Reserve dekking: {idle_covered}/{total_reserves} gedekt, {idle_extra} extra nodig")
+    print(f"  Totaal vloot: {len(rot1) + idle_extra}")
+    print()
+
+    # ===================================================================
+    # OUTPUT 3: Per dienst + reserves ingepland (phantom trips, service constraint)
+    # ===================================================================
+    print(f"Stap 3c: Output 3 - Per dienst + reserves ingepland ({algo_name})...")
+    rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                              algorithm=args.algoritme, service_constraint=True)
+    n3_real = len(set(r.bus_id for r in rot3 if r.real_trips))
+    n3_res_planned = sum(len(r.reserve_trip_list) for r in rot3)
+    n3_extra = max(0, total_reserves - n3_res_planned)
+    print(f"  {n3_real} busomlopen (met ritten)")
+    print(f"  {n3_res_planned}/{total_reserves} reserves ingepland, {n3_extra} extra nodig")
+
+    file3 = f"{output_base}_3_dienst_met_reserve.xlsx"
+    generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, args.algoritme,
+                    output_mode=3)
+    print(f"  Opgeslagen: {file3}")
+    print()
+
+    # ===================================================================
+    # OUTPUT 4: Gecombineerd + reserves ingepland + sensitiviteit
+    # ===================================================================
+    print(f"Stap 3d: Output 4 - Gecombineerd + reserves ingepland + sensitiviteit ({algo_name})...")
+    rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround, algorithm=args.algoritme)
+    n4_real = len(set(r.bus_id for r in rot4 if r.real_trips))
+    n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
+    n4_extra = max(0, total_reserves - n4_res_planned)
+    print(f"  {n4_real} busomlopen (met ritten)")
+    print(f"  {n4_res_planned}/{total_reserves} reserves ingepland, {n4_extra} extra nodig")
+
+    file4 = f"{output_base}_4_gecombineerd_met_reserve.xlsx"
+    print(f"  Sensitiviteitsanalyse genereren...")
+    generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, args.algoritme,
+                    include_sensitivity=True, output_mode=4)
+    print(f"  Opgeslagen: {file4}")
+    print()
+
+    # ===== FINAL SUMMARY =====
     print(f"Vergelijking:")
-    _summary("Baseline (per tabblad)", baseline_rotations)
-    _summary("Gecombineerd (cross-tabblad)", combined_rotations)
-    print(f"  Reservebussen:    {sum(r.count for r in reserves)}")
+    print(f"{'='*60}")
+    _summary("1. Per dienst (baseline)", rot1, idle_extra)
+    print()
+    _summary("2. Per dienst + idle reserve matching", rot1, idle_extra)
+    print()
+    _summary("3. Per dienst + reserves ingepland", rot3, n3_extra)
+    print()
+    _summary("4. Gecombineerd + reserves ingepland", rot4, n4_extra)
+    print()
+    print(f"  Reservebussen totaal nodig: {total_reserves}")
     print()
     print("Klaar!")
 
