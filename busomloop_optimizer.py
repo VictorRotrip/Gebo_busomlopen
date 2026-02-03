@@ -7,7 +7,7 @@ Leest het invoer-Excel bestand (Bijlage J) in en genereert:
   3. Berekeningen en optimalisatie-details
 
 Gebruik:
-    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>] [--min-keer-min 8]
+    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>] [--keer-dd 15] [--keer-tc 8] [--keer-taxi 5]
 """
 
 import argparse
@@ -366,7 +366,13 @@ def parse_all_sheets(input_file: str):
 # Optimizer - Greedy best-fit bus chaining
 # ---------------------------------------------------------------------------
 
-MIN_TURNAROUND = 8  # minimum minutes between arrival and next departure
+# Default minimum turnaround times per bus type (minutes)
+MIN_TURNAROUND_DEFAULTS = {
+    "Dubbeldekker": 15,
+    "Touringcar": 8,
+    "Taxibus": 5,
+}
+MIN_TURNAROUND_FALLBACK = 8  # fallback for unknown bus types
 
 
 def normalize_location(code: str) -> str:
@@ -393,7 +399,7 @@ def normalize_location(code: str) -> str:
     return mapping.get(code, code)
 
 
-def can_connect(prev_trip: Trip, next_trip: Trip, min_turnaround: int) -> bool:
+def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict) -> bool:
     """Check if a bus finishing prev_trip can start next_trip."""
     # Must be same bus type
     if prev_trip.bus_type != next_trip.bus_type:
@@ -404,18 +410,22 @@ def can_connect(prev_trip: Trip, next_trip: Trip, min_turnaround: int) -> bool:
     # Location must match: prev destination = next origin
     if normalize_location(prev_trip.dest_code) != normalize_location(next_trip.origin_code):
         return False
-    # Timing: enough turnaround
+    # Timing: enough turnaround (per bus type)
+    min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
     gap = next_trip.departure - prev_trip.arrival
     if gap < min_turnaround:
         return False
     return True
 
 
-def optimize_rotations(trips: list, min_turnaround: int = MIN_TURNAROUND) -> list:
+def optimize_rotations(trips: list, turnaround_map: dict = None) -> list:
     """
     Greedy best-fit algorithm to chain trips into bus rotations.
     Groups by (date, bus_type) and minimizes number of buses.
     """
+    if turnaround_map is None:
+        turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
+
     # Group trips by date + bus type
     groups = {}
     for t in trips:
@@ -440,7 +450,7 @@ def optimize_rotations(trips: list, min_turnaround: int = MIN_TURNAROUND) -> lis
 
             for bus in active_buses:
                 last = bus.trips[-1]
-                if can_connect(last, trip, min_turnaround):
+                if can_connect(last, trip, turnaround_map):
                     gap = trip.departure - last.arrival
                     if gap < best_gap:
                         best_gap = gap
@@ -728,10 +738,12 @@ def write_overzicht_sheet(wb_out, rotations: list, all_trips: list):
     ws.freeze_panes = "A4"
 
 
-def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list):
+def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None):
     """
     Tab 3: Berekeningen - Calculations and KPIs.
     """
+    if turnaround_map is None:
+        turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
     ws = wb_out.create_sheet(title="Berekeningen")
 
     row = 1
@@ -903,7 +915,7 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
 
     params = [
         ("Algoritme", "Greedy best-fit bus chaining"),
-        ("Minimum keertijd", f"{MIN_TURNAROUND} minuten"),
+        ("Minimum keertijd", ", ".join(f"{bt}: {mins} min" for bt, mins in turnaround_map.items())),
         ("Doel", "Minimaliseer aantal bussen, daarna minimaliseer wachttijd"),
         ("Locatie-matching", "Bus eindlocatie moet gelijk zijn aan volgende rit startlocatie"),
         ("Bustype-constraint", "Bussen worden alleen ingezet op ritten met hetzelfde bustype"),
@@ -1173,7 +1185,7 @@ def write_businzet_sheet(wb_out, rotations: list, all_trips: list, reserves: lis
         ws.column_dimensions[get_column_letter(c)].width = 14
 
 
-def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str):
+def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str, turnaround_map: dict = None):
     """Generate the complete output Excel workbook."""
     wb = openpyxl.Workbook()
     # Remove default sheet
@@ -1186,7 +1198,7 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
     write_overzicht_sheet(wb, rotations, all_trips)
 
     # Tab 3: Berekeningen
-    write_berekeningen_sheet(wb, rotations, all_trips, reserves)
+    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map)
 
     # Tab 4: Overzicht Businzet
     write_businzet_sheet(wb, rotations, all_trips, reserves)
@@ -1213,23 +1225,39 @@ def main():
         help="Uitvoer Excel bestand (standaard: busomloop_output.xlsx)",
     )
     parser.add_argument(
-        "--min-keer-min", "-k",
+        "--keer-dd",
         type=int,
-        default=MIN_TURNAROUND,
-        help=f"Minimum keertijd in minuten (standaard: {MIN_TURNAROUND})",
+        default=MIN_TURNAROUND_DEFAULTS["Dubbeldekker"],
+        help=f"Keertijd dubbeldekker in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Dubbeldekker']})",
+    )
+    parser.add_argument(
+        "--keer-tc",
+        type=int,
+        default=MIN_TURNAROUND_DEFAULTS["Touringcar"],
+        help=f"Keertijd touringcar in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Touringcar']})",
+    )
+    parser.add_argument(
+        "--keer-taxi",
+        type=int,
+        default=MIN_TURNAROUND_DEFAULTS["Taxibus"],
+        help=f"Keertijd taxibus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Taxibus']})",
     )
     args = parser.parse_args()
 
     if args.output is None:
         args.output = "busomloop_output.xlsx"
 
-    min_turnaround = args.min_keer_min
+    turnaround_map = {
+        "Dubbeldekker": args.keer_dd,
+        "Touringcar": args.keer_tc,
+        "Taxibus": args.keer_taxi,
+    }
 
     print(f"Busomloop Optimizer")
     print(f"{'='*50}")
     print(f"Invoer:        {args.input_file}")
     print(f"Uitvoer:       {args.output}")
-    print(f"Min keertijd:  {min_turnaround} minuten")
+    print(f"Keertijden:    DD={turnaround_map['Dubbeldekker']}min, TC={turnaround_map['Touringcar']}min, Taxi={turnaround_map['Taxibus']}min")
     print()
 
     # Parse
@@ -1249,7 +1277,7 @@ def main():
 
     # Optimize
     print("Stap 2: Busomlopen optimaliseren...")
-    rotations = optimize_rotations(all_trips, min_turnaround)
+    rotations = optimize_rotations(all_trips, turnaround_map)
     print(f"  {len(rotations)} busomlopen gegenereerd")
 
     # Summary per date+type
@@ -1268,7 +1296,7 @@ def main():
 
     # Generate output
     print("Stap 3: Uitvoer genereren...")
-    output = generate_output(rotations, all_trips, reserves, args.output)
+    output = generate_output(rotations, all_trips, reserves, args.output, turnaround_map)
     print(f"  Uitvoer opgeslagen: {output}")
     print()
 
