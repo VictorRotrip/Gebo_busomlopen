@@ -14,13 +14,18 @@ without hardcoded station lists.
 
 Usage:
     python google_maps_distances.py --input casus.xlsx --key API_KEY
-    python google_maps_distances.py --input casus.xlsx --from-cache deadhead_matrix.json
+    python google_maps_distances.py --input casus.xlsx --verify        # check addresses first
+    python google_maps_distances.py --input casus.xlsx                 # uses key from .env
     python google_maps_distances.py --from-cache deadhead_matrix.json --validate output.xlsx
+
+API key can be provided via --key or in a .env file:
+    GOOGLE_MAPS_API_KEY=AIza...
 """
 
 import argparse
 import datetime
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,9 +33,24 @@ from pathlib import Path
 import requests
 
 API_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
-
-
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+
+def load_dotenv():
+    """Load .env file from the script's directory into os.environ."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                os.environ.setdefault(key, value)
 
 
 def build_station_addresses(registry: dict, halts: dict = None) -> dict:
@@ -700,7 +720,7 @@ def main():
                         help="Input Excel file (same as busomloop_optimizer.py). "
                              "Required when using --key to fetch new distances.")
     parser.add_argument("--key", default=None,
-                        help="Google Maps API key")
+                        help="Google Maps API key (of stel GOOGLE_MAPS_API_KEY in .env in)")
     parser.add_argument("--output", default="afstanden_stations.xlsx",
                         help="Output Excel file (default: afstanden_stations.xlsx)")
     parser.add_argument("--json-output", default="deadhead_matrix.json",
@@ -714,6 +734,11 @@ def main():
                              "Laat zien wat Google Maps per station oplost, zodat je kunt "
                              "controleren of de locaties kloppen voordat je de matrix ophaalt.")
     args = parser.parse_args()
+
+    # Load API key from .env if not provided on command line
+    load_dotenv()
+    if not args.key:
+        args.key = os.environ.get("GOOGLE_MAPS_API_KEY")
 
     # Determine station list
     if args.input:
@@ -741,7 +766,7 @@ def main():
     # Verify-only mode: geocode addresses and show results, then exit
     if args.verify:
         if not args.key:
-            print("\nFOUT: --verify vereist --key API_KEY")
+            print("\nFOUT: --verify vereist een API key (--key of GOOGLE_MAPS_API_KEY in .env)")
             sys.exit(1)
         if not args.input:
             print("\nFOUT: --verify vereist --input EXCEL_BESTAND")
@@ -766,6 +791,7 @@ def main():
         save_deadhead_json(matrix, locations, args.json_output)
     else:
         print("\nFOUT: Geef --key API_KEY of --from-cache BESTAND op")
+        print("      (of stel GOOGLE_MAPS_API_KEY in .env in)")
         sys.exit(1)
 
     # Trip validation
