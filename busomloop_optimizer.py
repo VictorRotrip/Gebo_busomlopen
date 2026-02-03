@@ -1704,14 +1704,18 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
                     cell.font = Font(bold=True, color="008000")
             row += 1
 
-        n_real_buses = len(set(r.bus_id for r in rotations if r.real_trips))
+        n_total_buses = len(rotations)
+        n_with_trips = len([r for r in rotations if r.real_trips])
+        n_reserve_only = len([r for r in rotations if not r.real_trips and r.reserve_trip_list])
         row += 1
         summary_items = [
             ("Totaal reservebussen nodig:", total_reserve),
             ("Ingepland in busomlopen:", total_planned),
             ("Extra bussen nodig voor reserve:", total_extra),
-            ("Bussen met ritten:", n_real_buses),
-            ("Totaal vloot (omloop + extra reserve):", n_real_buses + total_extra),
+            ("Bussen met ritten:", n_with_trips),
+            ("Bussen alleen reserve:", n_reserve_only),
+            ("Totaal bussen (optimizer):", n_total_buses),
+            ("Totaal vloot (incl. extra reserve):", n_total_buses + total_extra),
         ]
         for label, val in summary_items:
             ws.cell(row=row, column=1, value=label)
@@ -2042,13 +2046,13 @@ def _write_algo_examples(ws, row):
     row += 1
     greedy_lines = [
         "Het algoritme loopt de ritten af op vertrektijd en koppelt elke rit aan de bus",
-        "die het kortst stilstaat maar wel op de juiste plek staat.",
+        "met de kleinste wachttijd tussen zijn vorige aankomst en het nieuwe potentiële vertrek.",
         "",
         "Stap 1: Rit 1 (Ut→Ed 06:00-06:42) → geen bus beschikbaar → Bus A",
         "Stap 2: Rit 2 (Ed→Ut 06:50-07:32) → Bus A staat in Ede, wacht 8 min → Bus A",
         "Stap 3: Rit 3 (Ut→Ed 07:00-07:42) → Bus A is onderweg → geen bus → Bus B",
         "Stap 4: Rit 4 (Ed→Ut 07:50-08:32) → Bus A in Ut (wacht 18 min), Bus B in Ede (wacht 8 min)",
-        "        → Bus B (kortste wachttijd) → Bus B",
+        "        → Bus B (kleinste wachttijd) → Bus B",
         "",
         "Resultaat: 2 bussen. Bus A: Rit 1→2 | Bus B: Rit 3→4",
         "Voordeel: Snel, werkt goed in de praktijk. Nadeel: vindt niet altijd het absolute minimum.",
@@ -2486,17 +2490,20 @@ def main():
         print(f"  Output 3 - Per dienst + reserves ingepland...")
         rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                   algorithm=algo_key, service_constraint=True)
-        n3_real = len(set(r.bus_id for r in rot3 if r.real_trips))
+        n3_total = len(rot3)
+        n3_with_trips = len([r for r in rot3 if r.real_trips])
+        n3_reserve_only = len([r for r in rot3 if not r.real_trips and r.reserve_trip_list])
         n3_res_planned = sum(len(r.reserve_trip_list) for r in rot3)
         n3_extra = max(0, total_reserves - n3_res_planned)
-        print(f"    {n3_real} bussen, {n3_res_planned}/{total_reserves} reserves ingepland")
+        print(f"    {n3_total} bussen ({n3_with_trips} met ritten, {n3_reserve_only} alleen reserve)")
+        print(f"    {n3_res_planned}/{total_reserves} reserves ingepland, {n3_extra} extra nodig")
 
         file3 = f"{output_base}_{algo_short}_3_dienst_met_reserve.xlsx"
         generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, algo_key,
                         output_mode=3)
         print(f"    -> {file3}")
 
-        algo_results[3] = {"rotations": rot3, "buses": n3_real, "file": file3,
+        algo_results[3] = {"rotations": rot3, "buses": n3_total, "file": file3,
                            "reserve_planned": n3_res_planned, "extra_reserve": n3_extra}
 
         # ---------------------------------------------------------------
@@ -2504,17 +2511,20 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 4 - Gecombineerd + reserves + sensitiviteit...")
         rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround, algorithm=algo_key)
-        n4_real = len(set(r.bus_id for r in rot4 if r.real_trips))
+        n4_total = len(rot4)
+        n4_with_trips = len([r for r in rot4 if r.real_trips])
+        n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
         n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
         n4_extra = max(0, total_reserves - n4_res_planned)
-        print(f"    {n4_real} bussen, {n4_res_planned}/{total_reserves} reserves ingepland")
+        print(f"    {n4_total} bussen ({n4_with_trips} met ritten, {n4_reserve_only} alleen reserve)")
+        print(f"    {n4_res_planned}/{total_reserves} reserves ingepland, {n4_extra} extra nodig")
 
         file4 = f"{output_base}_{algo_short}_4_gecombineerd_met_reserve.xlsx"
         generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
                         include_sensitivity=True, output_mode=4)
         print(f"    -> {file4}")
 
-        algo_results[4] = {"rotations": rot4, "buses": n4_real, "file": file4,
+        algo_results[4] = {"rotations": rot4, "buses": n4_total, "file": file4,
                            "reserve_planned": n4_res_planned, "extra_reserve": n4_extra}
 
         all_results[algo_key] = algo_results
