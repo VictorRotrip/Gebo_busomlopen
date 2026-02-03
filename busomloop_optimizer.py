@@ -18,6 +18,7 @@ import argparse
 import datetime
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import openpyxl
@@ -508,61 +509,109 @@ def detect_turnaround_per_service(trips: list) -> dict:
 
 
 def normalize_location(code: str) -> str:
-    """Normalize station codes for matching (e.g. same city = same location)."""
+    """Normalize station codes for matching (e.g. same city = same location).
+
+    Uses the dynamically built STATION_REGISTRY if available, otherwise
+    falls back to the code itself (lowercased).
+    """
     code = code.strip().lower()
-    # Map variants to canonical form
-    # Station codes from NS TVV data (case-insensitive)
-    mapping = {
-        "ah": "arnhem", "ah90": "arnhem", "ah92": "arnhem",
-        "amf": "amersfoort", "amf91": "amersfoort",
-        "bhv": "bilthoven", "bhv90": "bilthoven",
-        "bkl": "breukelen", "bkl90": "breukelen",
-        "bnk": "bunnik", "bnk90": "bunnik",
-        "db": "driebergen", "db90": "driebergen",
-        "dld": "den_dolder", "dld90": "den_dolder",
-        "ed": "ede", "ed93": "ede",
-        "gdm": "geldermalsen",
-        "hor": "hollandsche_rading", "hor90": "hollandsche_rading",
-        "htn": "houten", "htn90": "houten",
-        "hvs": "hilversum", "hvs90": "hilversum", "hvs91": "hilversum",
-        "hvsp": "hilversum_sportpark", "hvsp91": "hilversum_sportpark",
-        "klp": "veenendaal_klomp", "klp90": "veenendaal_klomp",
-        "mas": "maarssen", "mas90": "maarssen",
-        "mrn": "maarn", "mrn90": "maarn", "mrn91": "maarn",
-        "rhn": "rhenen", "rhn90": "rhenen",
-        "ut": "utrecht", "ut92": "utrecht",
-        "utln": "utrecht_lunetten", "utln90": "utrecht_lunetten",
-        "utlr": "utrecht_leidsche_rijn", "utlr90": "utrecht_leidsche_rijn",
-        "uto": "utrecht_overvecht", "uto90": "utrecht_overvecht",
-        "utt": "utrecht_terwijde", "utt90": "utrecht_terwijde",
-        "utvr": "utrecht_vaartsche_rijn", "utvr91": "utrecht_vaartsche_rijn",
-        "utzl": "utrecht_zuilen", "utzl90": "utrecht_zuilen",
-        "vndc": "veenendaal_centrum",
-        "vndw": "veenendaal_west",
-        "vtn": "vleuten", "vtn90": "vleuten",
-        "wd": "woerden", "wd90": "woerden",
-    }
-    return mapping.get(code, code)
+    # Look up in dynamic registry first
+    if code in _STATION_CODE_TO_CANONICAL:
+        return _STATION_CODE_TO_CANONICAL[code]
+    return code
 
 
 def normalize_reserve_station(station_name: str) -> str:
-    """Normalize a reserve bus station name to match normalize_location output."""
+    """Normalize a reserve bus station name to match normalize_location output.
+
+    Uses the dynamically built STATION_REGISTRY if available.
+    """
     name = station_name.strip().lower()
-    mapping = {
-        "driebergen-zeist": "driebergen",
-        "ede-wageningen": "ede",
-        "utrecht centraal": "utrecht",
-        "veenendaal west": "veenendaal_west",
-        "veenendaal-de klomp": "veenendaal_klomp",
-        "arnhem centraal": "arnhem",
-        "amersfoort centraal": "amersfoort",
-        "breukelen": "breukelen",
-        "houten": "houten",
-        "maarn": "maarn",
-        "rhenen": "rhenen",
-        "woerden": "woerden",
-    }
-    return mapping.get(name, name)
+    if name in _STATION_NAME_TO_CANONICAL:
+        return _STATION_NAME_TO_CANONICAL[name]
+    # Fallback: clean up to a slug-like form
+    return _name_to_canonical(name)
+
+
+def _name_to_canonical(name: str) -> str:
+    """Convert a station name to a canonical key (lowercase, underscored)."""
+    # "Driebergen-Zeist" -> "driebergen-zeist"
+    # "Utrecht Centraal" -> "utrecht centraal"
+    return name.strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Station registry - built dynamically from input data
+# ---------------------------------------------------------------------------
+# Maps: station_code (lowercase) -> canonical key
+_STATION_CODE_TO_CANONICAL: dict = {}
+# Maps: station_name (lowercase) -> canonical key
+_STATION_NAME_TO_CANONICAL: dict = {}
+# Maps: canonical key -> display name (for output/Google Maps)
+_CANONICAL_TO_DISPLAY: dict = {}
+# Maps: canonical key -> set of halt names (for Google Maps address building)
+_CANONICAL_TO_HALTS: dict = {}
+
+
+def build_station_registry(all_trips: list, reserves: list = None):
+    """Build the station registry from parsed trip data.
+
+    This populates the module-level lookup dicts so that normalize_location()
+    and normalize_reserve_station() work correctly.
+
+    Must be called after parse_all_sheets() and before optimize_rotations().
+    """
+    _STATION_CODE_TO_CANONICAL.clear()
+    _STATION_NAME_TO_CANONICAL.clear()
+    _CANONICAL_TO_DISPLAY.clear()
+    _CANONICAL_TO_HALTS.clear()
+
+    def _register(code: str, name: str, halt: str = ""):
+        if not code or not name:
+            return
+        code_lower = code.strip().lower()
+        name_clean = name.strip()
+        canonical = _name_to_canonical(name_clean)
+        _STATION_CODE_TO_CANONICAL[code_lower] = canonical
+        _STATION_NAME_TO_CANONICAL[canonical] = canonical
+        _CANONICAL_TO_DISPLAY[canonical] = name_clean
+        if halt and halt.strip():
+            _CANONICAL_TO_HALTS.setdefault(canonical, set()).add(halt.strip())
+
+    # Collect station code -> name -> halt mappings from all trip stops
+    for t in all_trips:
+        _register(t.origin_code, t.origin_name, t.origin_halt)
+        _register(t.dest_code, t.dest_name, t.dest_halt)
+
+        # Also register intermediate stops if available
+        if hasattr(t, 'stops') and t.stops:
+            for stop in t.stops:
+                s_code = stop[0] if len(stop) > 0 else ""
+                s_name = stop[1] if len(stop) > 1 else ""
+                s_halt = stop[3] if len(stop) > 3 else ""
+                _register(s_code, s_name, s_halt)
+
+    # Register reserve bus station names (no halt info available)
+    if reserves:
+        for rb in reserves:
+            if rb.station:
+                name_clean = rb.station.strip()
+                canonical = _name_to_canonical(name_clean)
+                _STATION_NAME_TO_CANONICAL[canonical] = canonical
+                if canonical not in _CANONICAL_TO_DISPLAY:
+                    _CANONICAL_TO_DISPLAY[canonical] = name_clean
+
+    return dict(_CANONICAL_TO_DISPLAY)  # return for external use
+
+
+def get_station_registry() -> dict:
+    """Return the current station registry: {canonical_key: display_name}."""
+    return dict(_CANONICAL_TO_DISPLAY)
+
+
+def get_station_halts() -> dict:
+    """Return halt info per station: {canonical_key: set of halt names}."""
+    return {k: set(v) for k, v in _CANONICAL_TO_HALTS.items()}
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
@@ -2386,8 +2435,19 @@ def main():
     deadhead_matrix = None
     if args.deadhead:
         import json
-        with open(args.deadhead) as f:
-            deadhead_matrix = json.load(f)
+        dh_path = Path(args.deadhead)
+        if not dh_path.exists():
+            print(f"WAARSCHUWING: Deadhead bestand '{args.deadhead}' niet gevonden, "
+                  "wordt overgeslagen (alleen directe verbindingen)")
+        else:
+            try:
+                with open(dh_path) as f:
+                    deadhead_matrix = json.load(f)
+                dh_locs = len(deadhead_matrix)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"WAARSCHUWING: Deadhead bestand kon niet geladen worden: {e}")
+                print("  Wordt overgeslagen (alleen directe verbindingen)")
+    if deadhead_matrix:
         dh_locs = len(deadhead_matrix)
     else:
         dh_locs = 0
@@ -2409,6 +2469,24 @@ def main():
     print(f"  {len(sheet_names) - 1} dienstbladen gevonden")
     print(f"  {len(all_trips)} ritten geparsed (inclusief multipliciteit)")
     print(f"  {len(reserves)} reservebus-regels gevonden")
+
+    # Build dynamic station registry from parsed data
+    station_reg = build_station_registry(all_trips, reserves)
+    print(f"  {len(station_reg)} unieke stations geregistreerd: "
+          + ", ".join(sorted(station_reg.values())))
+
+    # Check deadhead coverage: warn about trip endpoint stations missing from deadhead matrix
+    if deadhead_matrix:
+        dh_keys = set(deadhead_matrix.keys())
+        endpoint_locs = set()
+        for t in all_trips:
+            endpoint_locs.add(normalize_location(t.origin_code))
+            endpoint_locs.add(normalize_location(t.dest_code))
+        missing = endpoint_locs - dh_keys
+        if missing:
+            print(f"  WAARSCHUWING: {len(missing)} ritstation(s) ontbreken in deadhead matrix: "
+                  + ", ".join(sorted(missing)))
+            print(f"  Lege ritten van/naar deze stations zijn niet mogelijk.")
 
     by_type = {}
     for t in all_trips:
