@@ -608,101 +608,6 @@ def get_station_registry() -> dict:
     return dict(_CANONICAL_TO_DISPLAY)
 
 
-def remap_deadhead_matrix(deadhead_matrix: dict) -> dict:
-    """Remap deadhead matrix keys to match the current station registry.
-
-    The cached deadhead_matrix.json may use old-style keys (e.g. "arnhem",
-    "ede") while the dynamic registry produces new canonical keys (e.g.
-    "arnhem centraal", "ede-wageningen"). This function tries to match
-    old keys to current canonical keys by fuzzy matching against display names.
-
-    Returns a new dict with remapped keys, plus warnings for unmatched keys.
-    """
-    if not deadhead_matrix:
-        return deadhead_matrix
-
-    registry = get_station_registry()  # {canonical -> display}
-    all_keys = set()
-    for o in deadhead_matrix:
-        all_keys.add(o)
-        for d in deadhead_matrix[o]:
-            all_keys.add(d)
-
-    # Check if keys already match the registry
-    registry_keys = set(registry.keys())
-    if all_keys <= registry_keys:
-        return deadhead_matrix  # already compatible
-
-    # Build mapping: old_key -> new_canonical
-    key_map = {}
-    for old_key in all_keys:
-        if old_key in registry_keys:
-            key_map[old_key] = old_key
-            continue
-
-        # Try matching: old key might be a prefix or simplified version of canonical
-        # e.g. "arnhem" should match "arnhem centraal", "ede" -> "ede-wageningen"
-        candidates = []
-        old_clean = old_key.replace("_", " ").replace("-", " ").strip().lower()
-        old_words = set(old_clean.split())
-        for canonical, display in registry.items():
-            can_clean = canonical.replace("-", " ").strip().lower()
-            disp_clean = display.replace("-", " ").strip().lower()
-            # Exact match after normalization
-            if old_clean == can_clean or old_clean == disp_clean:
-                candidates = [(canonical, 0)]
-                break
-            # Old key with underscores matches (e.g. "utrecht_overvecht" -> "utrecht overvecht")
-            if old_clean == can_clean.replace(" ", "_") or old_clean == can_clean.replace(" ", ""):
-                candidates = [(canonical, 0)]
-                break
-            # Old key is a prefix of canonical (e.g. "arnhem" in "arnhem centraal")
-            if can_clean.startswith(old_clean + " "):
-                # Prefer "X centraal" when old key is just "X" (main station heuristic)
-                suffix = can_clean[len(old_clean):].strip()
-                penalty = len(suffix)
-                if suffix == "centraal":
-                    penalty = -1  # highest priority for main station
-                candidates.append((canonical, penalty))
-            # All old words appear in canonical (e.g. "veenendaal_klomp" → "veenendaal-de klomp")
-            elif old_words and old_words <= set(can_clean.split()):
-                extra_words = len(set(can_clean.split()) - old_words)
-                candidates.append((canonical, extra_words + 100))  # lower priority than prefix
-
-        if candidates:
-            # Pick the closest match (lowest penalty)
-            candidates.sort(key=lambda x: x[1])
-            key_map[old_key] = candidates[0][0]
-        else:
-            # No match found - keep as-is and warn
-            key_map[old_key] = old_key
-            print(f"  WAARSCHUWING: deadhead sleutel '{old_key}' niet gevonden in stationsregister")
-
-    # Check if remapping would produce duplicates
-    mapped_origins = set()
-    for old_key in deadhead_matrix:
-        new_key = key_map.get(old_key, old_key)
-        if new_key in mapped_origins:
-            print(f"  WAARSCHUWING: deadhead remapping conflict - '{old_key}' en een andere sleutel "
-                  f"mappen beide naar '{new_key}'")
-        mapped_origins.add(new_key)
-
-    # Build remapped matrix
-    new_matrix = {}
-    for o_old, dests in deadhead_matrix.items():
-        o_new = key_map.get(o_old, o_old)
-        new_matrix[o_new] = {}
-        for d_old, val in dests.items():
-            d_new = key_map.get(d_old, d_old)
-            new_matrix[o_new][d_new] = val
-
-    remapped = sum(1 for k, v in key_map.items() if k != v)
-    if remapped > 0:
-        print(f"  {remapped} deadhead sleutels gehermapt naar nieuwe canonieke namen")
-
-    return new_matrix
-
-
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
     """Match a reserve day string to a trip date_str.
     E.g. 'donderdag 11 juni' -> 'do 11-06-2026'
@@ -2564,10 +2469,8 @@ def main():
     print(f"  {len(station_reg)} unieke stations geregistreerd: "
           + ", ".join(sorted(station_reg.values())))
 
-    # Remap deadhead matrix keys to match current station registry
+    # Check deadhead coverage: warn about trip endpoint stations missing from deadhead matrix
     if deadhead_matrix:
-        deadhead_matrix = remap_deadhead_matrix(deadhead_matrix)
-        # Check coverage: warn about trip endpoint stations missing from deadhead matrix
         dh_keys = set(deadhead_matrix.keys())
         endpoint_locs = set()
         for t in all_trips:

@@ -627,35 +627,7 @@ def main():
     if args.from_cache:
         print(f"\nLoading cached matrix from {args.from_cache}...")
         matrix = load_matrix_from_cache(args.from_cache)
-
-        # If we have a registry from input, remap cache keys to match
-        if args.input:
-            from busomloop_optimizer import remap_deadhead_matrix, get_station_registry
-            cache_keys = set()
-            for o, dests in matrix.items():
-                cache_keys.add(o)
-                for d in dests:
-                    cache_keys.add(d)
-            # Only remap if keys don't match
-            # Build a flat matrix for remapping
-            flat_cache = {}
-            for (o, d), vals in matrix.items():
-                if o not in flat_cache:
-                    flat_cache[o] = {}
-                flat_cache[o][d] = vals.get("duration_min") if vals.get("duration_min") is not None else 0
-            remapped = remap_deadhead_matrix(flat_cache)
-            # Rebuild tuple-keyed matrix with remapped keys
-            new_matrix = {}
-            for o, dests in remapped.items():
-                for d, val in dests.items():
-                    old_entry = matrix.get((o, d))
-                    if old_entry:
-                        new_matrix[(o, d)] = old_entry
-                    else:
-                        new_matrix[(o, d)] = {"duration_min": val, "distance_km": None,
-                                              "duration_s": None, "distance_m": None}
-            matrix = new_matrix
-            locations = sorted(set(o for o, d in matrix.keys()))
+        locations = sorted(set(o for o, d in matrix.keys()))
 
     elif args.key:
         if not args.input:
