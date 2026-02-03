@@ -2042,13 +2042,13 @@ def _write_algo_examples(ws, row):
     row += 1
     greedy_lines = [
         "Het algoritme loopt de ritten af op vertrektijd en koppelt elke rit aan de bus",
-        "die het kortst stilstaat maar wel op de juiste plek staat.",
+        "met de kleinste wachttijd tussen zijn vorige aankomst en het nieuwe potentiële vertrek.",
         "",
         "Stap 1: Rit 1 (Ut→Ed 06:00-06:42) → geen bus beschikbaar → Bus A",
         "Stap 2: Rit 2 (Ed→Ut 06:50-07:32) → Bus A staat in Ede, wacht 8 min → Bus A",
         "Stap 3: Rit 3 (Ut→Ed 07:00-07:42) → Bus A is onderweg → geen bus → Bus B",
         "Stap 4: Rit 4 (Ed→Ut 07:50-08:32) → Bus A in Ut (wacht 18 min), Bus B in Ede (wacht 8 min)",
-        "        → Bus B (kortste wachttijd) → Bus B",
+        "        → Bus B (kleinste wachttijd) → Bus B",
         "",
         "Resultaat: 2 bussen. Bus A: Rit 1→2 | Bus B: Rit 3→4",
         "Voordeel: Snel, werkt goed in de praktijk. Nadeel: vindt niet altijd het absolute minimum.",
