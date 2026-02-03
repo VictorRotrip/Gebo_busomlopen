@@ -511,22 +511,35 @@ def normalize_location(code: str) -> str:
     """Normalize station codes for matching (e.g. same city = same location)."""
     code = code.strip().lower()
     # Map variants to canonical form
+    # Station codes from NS TVV data (case-insensitive)
     mapping = {
         "ah": "arnhem", "ah90": "arnhem", "ah92": "arnhem",
-        "ed": "ede", "ed93": "ede",
-        "ut": "utrecht", "ut92": "utrecht", "uto": "utrecht_overvecht",
-        "db": "driebergen", "db90": "driebergen",
-        "klp": "veenendaal_klomp", "klp90": "veenendaal_klomp",
-        "rhn": "rhenen", "rhn90": "rhenen",
-        "vdn": "veenendaal", "vdnc": "veenendaal_centrum",
-        "vdnw": "veenendaal_west",
-        "mrn": "maarn", "mrn90": "maarn", "mrn91": "maarn",
         "amf": "amersfoort", "amf91": "amersfoort",
         "bhv": "bilthoven", "bhv90": "bilthoven",
-        "dld": "den_dolder", "dld90": "den_dolder",
         "bkl": "breukelen", "bkl90": "breukelen",
+        "bnk": "bunnik", "bnk90": "bunnik",
+        "db": "driebergen", "db90": "driebergen",
+        "dld": "den_dolder", "dld90": "den_dolder",
+        "ed": "ede", "ed93": "ede",
+        "gdm": "geldermalsen",
+        "hor": "hollandsche_rading", "hor90": "hollandsche_rading",
         "htn": "houten", "htn90": "houten",
-        "hvs": "houten_vinex", "gdm": "geldermalsen",
+        "hvs": "hilversum", "hvs90": "hilversum", "hvs91": "hilversum",
+        "hvsp": "hilversum_sportpark", "hvsp91": "hilversum_sportpark",
+        "klp": "veenendaal_klomp", "klp90": "veenendaal_klomp",
+        "mas": "maarssen", "mas90": "maarssen",
+        "mrn": "maarn", "mrn90": "maarn", "mrn91": "maarn",
+        "rhn": "rhenen", "rhn90": "rhenen",
+        "ut": "utrecht", "ut92": "utrecht",
+        "utln": "utrecht_lunetten", "utln90": "utrecht_lunetten",
+        "utlr": "utrecht_leidsche_rijn", "utlr90": "utrecht_leidsche_rijn",
+        "uto": "utrecht_overvecht", "uto90": "utrecht_overvecht",
+        "utt": "utrecht_terwijde", "utt90": "utrecht_terwijde",
+        "utvr": "utrecht_vaartsche_rijn", "utvr91": "utrecht_vaartsche_rijn",
+        "utzl": "utrecht_zuilen", "utzl90": "utrecht_zuilen",
+        "vndc": "veenendaal_centrum",
+        "vndw": "veenendaal_west",
+        "vtn": "vleuten", "vtn90": "vleuten",
         "wd": "woerden", "wd90": "woerden",
     }
     return mapping.get(code, code)
@@ -827,35 +840,57 @@ def create_reserve_trips(reserves: list, all_trips: list) -> list:
 
 
 def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
-                service_constraint: bool = False) -> bool:
+                service_constraint: bool = False,
+                deadhead_matrix: dict = None) -> tuple:
     """Check if a bus finishing prev_trip can start next_trip.
 
     If service_constraint=True, two real (non-reserve) trips must belong to
     the same service.  Reserve trips can bridge different services.
+
+    deadhead_matrix: optional dict {origin: {dest: minutes}} for repositioning.
+    If provided, allows connections where dest != origin if the bus can drive
+    there in time (deadhead).
+
+    Returns (connectable: bool, deadhead_time: float).
+    deadhead_time is 0 if same location, or the driving time in minutes if
+    the bus needs to reposition. Returns (False, 0) if not connectable.
     """
     # Must be same bus type
     if prev_trip.bus_type != next_trip.bus_type:
-        return False
+        return False, 0
     # Must be same date
     if prev_trip.date_str != next_trip.date_str:
-        return False
+        return False, 0
     # Service constraint: real-to-real must be same service
     if service_constraint:
         if not prev_trip.is_reserve and not next_trip.is_reserve:
             if prev_trip.service != next_trip.service:
-                return False
-    # Location must match: prev destination = next origin
-    if normalize_location(prev_trip.dest_code) != normalize_location(next_trip.origin_code):
-        return False
+                return False, 0
+
+    dest_loc = normalize_location(prev_trip.dest_code)
+    orig_loc = normalize_location(next_trip.origin_code)
+    deadhead_time = 0.0
+
+    if dest_loc != orig_loc:
+        # Different locations: check if deadhead is possible
+        if deadhead_matrix is None:
+            return False, 0
+        dh = deadhead_matrix.get(dest_loc, {}).get(orig_loc)
+        if dh is None:
+            return False, 0
+        deadhead_time = dh
+
     # Timing: reserve trips need 0 turnaround (bus just stays at station)
     if prev_trip.is_reserve or next_trip.is_reserve:
         min_turnaround = 0
     else:
         min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+
     gap = next_trip.departure - prev_trip.arrival
-    if gap < min_turnaround:
-        return False
-    return True
+    # Gap must accommodate both deadhead driving and turnaround time
+    if gap < deadhead_time + min_turnaround:
+        return False, 0
+    return True, deadhead_time
 
 
 def _group_trips(trips, turnaround_map):
@@ -888,7 +923,8 @@ def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
 # Algorithm 1: Greedy best-fit
 # ---------------------------------------------------------------------------
 
-def _optimize_greedy(group_trips, turnaround_map, service_constraint=False):
+def _optimize_greedy(group_trips, turnaround_map, service_constraint=False,
+                     deadhead_matrix=None):
     """Greedy best-fit: assign each trip to the bus with shortest idle time."""
     group_trips.sort(key=lambda t: (t.departure, t.arrival))
     buses = []  # list of lists of trip indices
@@ -899,7 +935,9 @@ def _optimize_greedy(group_trips, turnaround_map, service_constraint=False):
 
         for bus in buses:
             last = group_trips[bus[-1]]
-            if can_connect(last, trip, turnaround_map, service_constraint):
+            ok, _dh = can_connect(last, trip, turnaround_map, service_constraint,
+                                  deadhead_matrix)
+            if ok:
                 gap = trip.departure - last.arrival
                 if gap < best_gap:
                     best_gap = gap
@@ -914,8 +952,7 @@ def _optimize_greedy(group_trips, turnaround_map, service_constraint=False):
 
 
 # ---------------------------------------------------------------------------
-# Algorithm 2: Maximum bipartite matching (Hopcroft-Karp)
-#   Minimizes number of buses (= trips - max matching).
+# Bipartite matching helpers (used by min-cost and reserve idle matching)
 # ---------------------------------------------------------------------------
 
 def _hopcroft_karp(adj, n_left, n_right):
@@ -988,46 +1025,36 @@ def _matching_to_chains(n, match_l):
     return chains
 
 
-def _optimize_matching(group_trips, turnaround_map, service_constraint=False):
-    """Maximum bipartite matching via Hopcroft-Karp. Minimizes bus count."""
-    group_trips.sort(key=lambda t: (t.departure, t.arrival))
-    n = len(group_trips)
-
-    # Build adjacency: trip i can be followed by trip j
-    adj = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if can_connect(group_trips[i], group_trips[j], turnaround_map, service_constraint):
-                adj[i].append(j)
-
-    match_l, _ = _hopcroft_karp(adj, n, n)
-    return _matching_to_chains(n, match_l)
-
-
 # ---------------------------------------------------------------------------
-# Algorithm 3: Minimum-cost maximum matching (successive shortest path)
+# Algorithm 2: Minimum-cost maximum matching (successive shortest path)
 #   Minimizes buses first, then minimizes total idle time.
 # ---------------------------------------------------------------------------
 
-def _optimize_mincost(group_trips, turnaround_map, service_constraint=False):
+def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
+                      deadhead_matrix=None):
     """
     Min-cost max matching via successive shortest path (SPFA).
-    Minimizes number of buses (primary) and total idle time (secondary).
+    Minimizes number of buses (primary) and total deadhead+idle time (secondary).
     """
     from collections import deque
 
     group_trips.sort(key=lambda t: (t.departure, t.arrival))
     n = len(group_trips)
 
-    # Build adjacency with costs (idle time)
+    # Build adjacency with costs
+    # Cost = deadhead time (penalizes empty driving) + idle time
     adj = [[] for _ in range(n)]
     cost_map = {}
     for i in range(n):
         for j in range(i + 1, n):
-            if can_connect(group_trips[i], group_trips[j], turnaround_map, service_constraint):
+            ok, dh = can_connect(group_trips[i], group_trips[j], turnaround_map,
+                                 service_constraint, deadhead_matrix)
+            if ok:
                 idle = group_trips[j].departure - group_trips[i].arrival
+                # Weight deadhead more heavily: it costs fuel and driver time
+                cost = dh * 2 + idle if dh > 0 else idle
                 adj[i].append(j)
-                cost_map[(i, j)] = idle
+                cost_map[(i, j)] = cost
 
     # Successive shortest path: find augmenting paths in order of increasing cost
     # Model as flow network with residual graph
@@ -1116,7 +1143,6 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False):
 
 ALGORITHMS = {
     "greedy": ("Greedy best-fit", _optimize_greedy),
-    "matching": ("Maximum bipartite matching (Hopcroft-Karp)", _optimize_matching),
     "mincost": ("Min-cost maximum matching (SPFA)", _optimize_mincost),
 }
 
@@ -1124,7 +1150,8 @@ ALGORITHMS = {
 def optimize_rotations(trips: list, turnaround_map: dict = None,
                        algorithm: str = "greedy",
                        per_service: bool = False,
-                       service_constraint: bool = False) -> list:
+                       service_constraint: bool = False,
+                       deadhead_matrix: dict = None) -> list:
     """
     Optimize bus rotations using the specified algorithm.
 
@@ -1132,6 +1159,7 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
     If per_service=False, chains across all services (cross-tab optimization).
     If service_constraint=True (only when per_service=False), real-to-real trip
     connections must be within the same service; reserve trips can bridge services.
+    deadhead_matrix: optional {origin: {dest: minutes}} for repositioning trips.
     """
     groups, turnaround_map = _group_trips(trips, turnaround_map)
     algo_name, algo_func = ALGORITHMS[algorithm]
@@ -1149,7 +1177,9 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
         rotation_counter = 0
         for key, group_trips in sorted(new_groups.items()):
             date_str, bus_type = key[0], key[1]
-            chains = algo_func(group_trips, turnaround_map, service_constraint=False)
+            chains = algo_func(group_trips, turnaround_map,
+                               service_constraint=False,
+                               deadhead_matrix=deadhead_matrix)
             rotations, rotation_counter = _build_rotations(
                 group_trips, date_str, bus_type, chains, rotation_counter
             )
@@ -1160,7 +1190,9 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
     rotation_counter = 0
 
     for (date_str, bus_type), group_trips in sorted(groups.items()):
-        chains = algo_func(group_trips, turnaround_map, service_constraint=service_constraint)
+        chains = algo_func(group_trips, turnaround_map,
+                           service_constraint=service_constraint,
+                           deadhead_matrix=deadhead_matrix)
         rotations, rotation_counter = _build_rotations(
             group_trips, date_str, bus_type, chains, rotation_counter
         )
@@ -2062,46 +2094,27 @@ def _write_algo_examples(ws, row):
         row += 1
     row += 1
 
-    # --- MATCHING ---
-    ws.cell(row=row, column=1, value="B) Bipartite matching (\"wiskundig optimaal minimum bussen\")")
+    # --- MINCOST ---
+    ws.cell(row=row, column=1, value="B) Min-cost matching (\"optimaal bussen + minimale wachttijd\")")
     ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
     row += 1
-    matching_lines = [
-        "Het algoritme bouwt een netwerk van alle mogelijke koppelingen tussen ritten",
-        "en vindt wiskundig het maximum aantal koppelingen → het minimum aantal bussen.",
+    mincost_lines = [
+        "Bouwt een netwerk van alle mogelijke koppelingen tussen ritten en vindt",
+        "de verdeling met het minimum aantal bussen EN de minste totale wachttijd.",
         "",
         "Mogelijke koppelingen (aankomstlocatie = vertreklocatie, genoeg keertijd):",
         "  Rit 1 (aankomst Ede 06:42) → Rit 2 (vertrek Ede 06:50): gap 8 min ✓",
         "  Rit 1 (aankomst Ede 06:42) → Rit 4 (vertrek Ede 07:50): gap 68 min ✓",
-        "  Rit 2 (aankomst Ut 07:32) → geen rit vertrekt uit Ut na 07:32",
         "  Rit 3 (aankomst Ede 07:42) → Rit 4 (vertrek Ede 07:50): gap 8 min ✓",
-        "",
-        "Maximale matching: Rit 1→Rit 2, Rit 3→Rit 4 (2 koppelingen)",
-        "Bussen nodig = 4 ritten - 2 koppelingen = 2 bussen",
-        "",
-        "Resultaat: 2 bussen (gegarandeerd optimaal). Nadeel: optimaliseert niet op wachttijd.",
-    ]
-    for line in matching_lines:
-        ws.cell(row=row, column=1, value=line)
-        row += 1
-    row += 1
-
-    # --- MINCOST ---
-    ws.cell(row=row, column=1, value="C) Min-cost matching (\"optimaal bussen + minimale wachttijd\")")
-    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
-    row += 1
-    mincost_lines = [
-        "Zoals matching, maar bij gelijke aantallen bussen kiest het de verdeling",
-        "met de minste totale wachttijd.",
         "",
         "Mogelijke oplossingen met 2 bussen:",
         "  Optie 1: Bus A: Rit 1→2 (wacht 8 min) | Bus B: Rit 3→4 (wacht 8 min)  → totaal 16 min wacht",
         "  Optie 2: Bus A: Rit 1→4 (wacht 68 min) | Bus B: Rit 3 | Bus C: Rit 2   → 3 bussen, slechter",
         "",
         "Min-cost kiest Optie 1: 2 bussen, 16 minuten totale wachttijd.",
-        "Dit is het beste van beide werelden: minimum bussen EN minimum wachttijd.",
         "",
-        "Resultaat: 2 bussen, 16 min wacht. Dit is de meest volledige optimalisatie.",
+        "NB: Zonder deadhead (huidig model) geeft greedy altijd hetzelfde resultaat.",
+        "Min-cost is noodzakelijk als deadhead/repositionering wordt toegevoegd.",
     ]
     for line in mincost_lines:
         ws.cell(row=row, column=1, value=line)
@@ -2317,9 +2330,9 @@ def main():
         "--algoritme", "-a",
         choices=list(ALGORITHMS.keys()) + ["all"],
         default="all",
-        help="Optimalisatie-algoritme: greedy (snel, heuristisch), "
-             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd), "
-             "all (alle drie). Standaard: all",
+        help="Optimalisatie-algoritme: greedy (snel, optimaal zonder deadhead), "
+             "mincost (optimaal min. bussen + min. wachttijd, ook met deadhead), "
+             "all (beide). Standaard: all",
     )
     parser.add_argument(
         "--keer-dd",
@@ -2351,6 +2364,13 @@ def main():
         default=None,
         help=f"Keertijd taxibus in minuten (standaard: auto-detect uit data)",
     )
+    parser.add_argument(
+        "--deadhead",
+        default=None,
+        help="JSON bestand met deadhead matrix (rijtijden tussen stations). "
+             "Gegenereerd door google_maps_distances.py. "
+             "Als opgegeven, mogen bussen lege ritten maken tussen stations.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -2362,10 +2382,24 @@ def main():
     algos = list(ALGORITHMS.keys()) if args.algoritme == "all" else [args.algoritme]
     n_files = len(algos) * 4
 
+    # Load deadhead matrix if provided
+    deadhead_matrix = None
+    if args.deadhead:
+        import json
+        with open(args.deadhead) as f:
+            deadhead_matrix = json.load(f)
+        dh_locs = len(deadhead_matrix)
+    else:
+        dh_locs = 0
+
     print(f"Busomloop Optimizer")
     print(f"{'='*60}")
     print(f"Invoer:        {args.input_file}")
     print(f"Algoritme(s):  {', '.join(algos)}")
+    if deadhead_matrix:
+        print(f"Deadhead:      {args.deadhead} ({dh_locs} locaties)")
+    else:
+        print(f"Deadhead:      niet opgegeven (alleen directe verbindingen)")
     print(f"Uitvoer:       {n_files} bestanden (4 outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
     print()
 
@@ -2439,7 +2473,7 @@ def main():
 
     for algo_idx, algo_key in enumerate(algo_keys):
         algo_name = ALGORITHMS[algo_key][0]
-        algo_short = {"greedy": "greedy", "matching": "matching", "mincost": "mincost"}[algo_key]
+        algo_short = {"greedy": "greedy", "mincost": "mincost"}[algo_key]
 
         if len(algo_keys) > 1:
             print(f"{'='*60}")
@@ -2455,7 +2489,8 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 1 - Per dienst, geen reserves...")
         rot1 = optimize_rotations(all_trips, baseline_turnaround,
-                                  algorithm=algo_key, per_service=True)
+                                  algorithm=algo_key, per_service=True,
+                                  deadhead_matrix=deadhead_matrix)
         n1 = len(rot1)
         print(f"    {n1} busomlopen")
 
@@ -2489,7 +2524,8 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 3 - Per dienst + reserves ingepland...")
         rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                                  algorithm=algo_key, service_constraint=True)
+                                  algorithm=algo_key, service_constraint=True,
+                                  deadhead_matrix=deadhead_matrix)
         n3_total = len(rot3)
         n3_with_trips = len([r for r in rot3 if r.real_trips])
         n3_reserve_only = len([r for r in rot3 if not r.real_trips and r.reserve_trip_list])
@@ -2510,7 +2546,9 @@ def main():
         # OUTPUT 4: Gecombineerd + reserves ingepland + sensitiviteit
         # ---------------------------------------------------------------
         print(f"  Output 4 - Gecombineerd + reserves + sensitiviteit...")
-        rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround, algorithm=algo_key)
+        rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                  algorithm=algo_key,
+                                  deadhead_matrix=deadhead_matrix)
         n4_total = len(rot4)
         n4_with_trips = len([r for r in rot4 if r.real_trips])
         n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
@@ -2544,7 +2582,7 @@ def main():
 
     # Header
     cw = 14  # column width per algorithm
-    algo_short_names = {"greedy": "Greedy", "matching": "Matching", "mincost": "Min-cost"}
+    algo_short_names = {"greedy": "Greedy", "mincost": "Min-cost"}
     print(f"{'Output':<40s}", end="")
     for ak in algo_keys:
         print(f" {algo_short_names.get(ak, ak):>{cw}s}", end="")
