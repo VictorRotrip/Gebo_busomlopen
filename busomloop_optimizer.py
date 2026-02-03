@@ -495,59 +495,287 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict) -> bool:
     return True
 
 
-def optimize_rotations(trips: list, turnaround_map: dict = None) -> list:
-    """
-    Greedy best-fit algorithm to chain trips into bus rotations.
-    Groups by (date, bus_type) and minimizes number of buses.
-    """
+def _group_trips(trips, turnaround_map):
+    """Common setup: group trips by (date, bus_type), build compatibility edges."""
     if turnaround_map is None:
         turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
-
-    # Group trips by date + bus type
     groups = {}
     for t in trips:
         key = (t.date_str, t.bus_type)
         groups.setdefault(key, []).append(t)
+    return groups, turnaround_map
+
+
+def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
+    """Convert list of trip-index chains into BusRotation objects."""
+    rotations = []
+    for chain in chains:
+        rotation_counter += 1
+        bus_id = f"{bus_type[:2].upper()}-{date_str.split()[0].upper()}-{rotation_counter:03d}"
+        rotations.append(BusRotation(
+            bus_id=bus_id,
+            bus_type=bus_type,
+            date_str=date_str,
+            trips=[group_trips[i] for i in chain],
+        ))
+    return rotations, rotation_counter
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 1: Greedy best-fit
+# ---------------------------------------------------------------------------
+
+def _optimize_greedy(group_trips, turnaround_map):
+    """Greedy best-fit: assign each trip to the bus with shortest idle time."""
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    buses = []  # list of lists of trip indices
+
+    for idx, trip in enumerate(group_trips):
+        best_bus = None
+        best_gap = float('inf')
+
+        for bus in buses:
+            last = group_trips[bus[-1]]
+            if can_connect(last, trip, turnaround_map):
+                gap = trip.departure - last.arrival
+                if gap < best_gap:
+                    best_gap = gap
+                    best_bus = bus
+
+        if best_bus is not None:
+            best_bus.append(idx)
+        else:
+            buses.append([idx])
+
+    return buses
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 2: Maximum bipartite matching (Hopcroft-Karp)
+#   Minimizes number of buses (= trips - max matching).
+# ---------------------------------------------------------------------------
+
+def _hopcroft_karp(adj, n_left, n_right):
+    """
+    Hopcroft-Karp algorithm for maximum bipartite matching.
+    adj[u] = list of right-side nodes that left-side node u can match to.
+    Returns (match_l, match_r) where match_l[u] = matched right node or -1.
+    """
+    from collections import deque
+
+    match_l = [-1] * n_left
+    match_r = [-1] * n_right
+
+    def bfs():
+        dist = [0] * n_left
+        queue = deque()
+        for u in range(n_left):
+            if match_l[u] == -1:
+                dist[u] = 0
+                queue.append(u)
+            else:
+                dist[u] = float('inf')
+        found = False
+        while queue:
+            u = queue.popleft()
+            for v in adj[u]:
+                w = match_r[v]
+                if w == -1:
+                    found = True
+                elif dist[w] == float('inf'):
+                    dist[w] = dist[u] + 1
+                    queue.append(w)
+        return found, dist
+
+    def dfs(u, dist):
+        for v in adj[u]:
+            w = match_r[v]
+            if w == -1 or (dist[w] == dist[u] + 1 and dfs(w, dist)):
+                match_l[u] = v
+                match_r[v] = u
+                return True
+        dist[u] = float('inf')
+        return False
+
+    while True:
+        found, dist = bfs()
+        if not found:
+            break
+        for u in range(n_left):
+            if match_l[u] == -1:
+                dfs(u, dist)
+
+    return match_l, match_r
+
+
+def _matching_to_chains(n, match_l):
+    """Convert a matching into chains of trip indices."""
+    # match_l[i] = j means trip i is followed by trip j
+    matched_targets = set(v for v in match_l if v != -1)
+    chains = []
+    for i in range(n):
+        if i not in matched_targets:
+            # i is the start of a chain
+            chain = [i]
+            current = i
+            while match_l[current] != -1:
+                current = match_l[current]
+                chain.append(current)
+            chains.append(chain)
+    return chains
+
+
+def _optimize_matching(group_trips, turnaround_map):
+    """Maximum bipartite matching via Hopcroft-Karp. Minimizes bus count."""
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    n = len(group_trips)
+
+    # Build adjacency: trip i can be followed by trip j
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+                adj[i].append(j)
+
+    match_l, _ = _hopcroft_karp(adj, n, n)
+    return _matching_to_chains(n, match_l)
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 3: Minimum-cost maximum matching (successive shortest path)
+#   Minimizes buses first, then minimizes total idle time.
+# ---------------------------------------------------------------------------
+
+def _optimize_mincost(group_trips, turnaround_map):
+    """
+    Min-cost max matching via successive shortest path (SPFA).
+    Minimizes number of buses (primary) and total idle time (secondary).
+    """
+    from collections import deque
+
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    n = len(group_trips)
+
+    # Build adjacency with costs (idle time)
+    adj = [[] for _ in range(n)]
+    cost_map = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+                idle = group_trips[j].departure - group_trips[i].arrival
+                adj[i].append(j)
+                cost_map[(i, j)] = idle
+
+    # Successive shortest path: find augmenting paths in order of increasing cost
+    # Model as flow network with residual graph
+    # match_l[i] = j means left i matched to right j
+    match_l = [-1] * n
+    match_r = [-1] * n
+
+    def spfa_augment():
+        """Find minimum-cost augmenting path using SPFA."""
+        dist = [float('inf')] * n  # distance to right-side node j
+        prev_l = [-1] * n  # previous left node on path to right j
+        in_queue = [False] * n
+        queue = deque()
+
+        # Start from all unmatched left nodes
+        # dist_left[u] = 0 for unmatched u
+        dist_left = [float('inf')] * n
+        for u in range(n):
+            if match_l[u] == -1:
+                dist_left[u] = 0
+                # Relax edges from u
+                for v in adj[u]:
+                    c = cost_map[(u, v)]
+                    if c < dist[v]:
+                        dist[v] = c
+                        prev_l[v] = u
+                        if not in_queue[v]:
+                            queue.append(v)
+                            in_queue[v] = True
+
+        # SPFA: relax through alternating paths
+        while queue:
+            v = queue.popleft()
+            in_queue[v] = False
+
+            # v is a right-side node, matched to w = match_r[v]
+            w = match_r[v]
+            if w == -1:
+                continue  # free node, potential augmenting path end
+
+            # Relax from w (go through the matched edge, then to new right nodes)
+            new_dist_w = dist[v]  # cost to reach w through v's matched edge (0 cost)
+            if new_dist_w < dist_left[w]:
+                dist_left[w] = new_dist_w
+                for v2 in adj[w]:
+                    c = new_dist_w + cost_map[(w, v2)]
+                    if c < dist[v2]:
+                        dist[v2] = c
+                        prev_l[v2] = w
+                        if not in_queue[v2]:
+                            queue.append(v2)
+                            in_queue[v2] = True
+
+        # Find the free right-side node with minimum distance
+        best_v = -1
+        best_d = float('inf')
+        for v in range(n):
+            if match_r[v] == -1 and dist[v] < best_d:
+                best_d = dist[v]
+                best_v = v
+
+        if best_v == -1:
+            return False  # no augmenting path
+
+        # Trace back and augment
+        v = best_v
+        while v != -1:
+            u = prev_l[v]
+            old_v = match_l[u]
+            match_l[u] = v
+            match_r[v] = u
+            v = old_v
+
+        return True
+
+    # Find all augmenting paths
+    while spfa_augment():
+        pass
+
+    return _matching_to_chains(n, match_l)
+
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+ALGORITHMS = {
+    "greedy": ("Greedy best-fit", _optimize_greedy),
+    "matching": ("Maximum bipartite matching (Hopcroft-Karp)", _optimize_matching),
+    "mincost": ("Min-cost maximum matching (SPFA)", _optimize_mincost),
+}
+
+
+def optimize_rotations(trips: list, turnaround_map: dict = None,
+                       algorithm: str = "greedy") -> list:
+    """
+    Optimize bus rotations using the specified algorithm.
+    Groups by (date, bus_type) and minimizes number of buses.
+    """
+    groups, turnaround_map = _group_trips(trips, turnaround_map)
+    algo_name, algo_func = ALGORITHMS[algorithm]
 
     all_rotations = []
     rotation_counter = 0
 
     for (date_str, bus_type), group_trips in sorted(groups.items()):
-        # Sort trips by departure time
-        group_trips.sort(key=lambda t: (t.departure, t.arrival))
-
-        # Active buses: list of BusRotation, each with last trip info
-        active_buses = []
-
-        for trip in group_trips:
-            # Find best available bus: the one whose last trip ends latest
-            # but still allows connection (minimize idle)
-            best_bus = None
-            best_gap = float('inf')
-
-            for bus in active_buses:
-                last = bus.trips[-1]
-                if can_connect(last, trip, turnaround_map):
-                    gap = trip.departure - last.arrival
-                    if gap < best_gap:
-                        best_gap = gap
-                        best_bus = bus
-
-            if best_bus is not None:
-                best_bus.trips.append(trip)
-            else:
-                # Need a new bus
-                rotation_counter += 1
-                bus_id = f"{bus_type[:2].upper()}-{date_str.split()[0].upper()}-{rotation_counter:03d}"
-                new_bus = BusRotation(
-                    bus_id=bus_id,
-                    bus_type=bus_type,
-                    date_str=date_str,
-                    trips=[trip],
-                )
-                active_buses.append(new_bus)
-
-        all_rotations.extend(active_buses)
+        chains = algo_func(group_trips, turnaround_map)
+        rotations, rotation_counter = _build_rotations(
+            group_trips, date_str, bus_type, chains, rotation_counter
+        )
+        all_rotations.extend(rotations)
 
     return all_rotations
 
@@ -815,7 +1043,7 @@ def write_overzicht_sheet(wb_out, rotations: list, all_trips: list):
     ws.freeze_panes = "A4"
 
 
-def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None):
+def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None, algorithm: str = "greedy"):
     """
     Tab 3: Berekeningen - Calculations and KPIs.
     """
@@ -991,7 +1219,7 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
     row += 1
 
     params = [
-        ("Algoritme", "Greedy best-fit bus chaining"),
+        ("Algoritme", ALGORITHMS[algorithm][0]),
         ("Minimum keertijd", ", ".join(f"{bt}: {mins} min" for bt, mins in turnaround_map.items())),
         ("Doel", "Minimaliseer aantal bussen, daarna minimaliseer wachttijd"),
         ("Locatie-matching", "Bus eindlocatie moet gelijk zijn aan volgende rit startlocatie"),
@@ -1262,7 +1490,7 @@ def write_businzet_sheet(wb_out, rotations: list, all_trips: list, reserves: lis
         ws.column_dimensions[get_column_letter(c)].width = 14
 
 
-def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str, turnaround_map: dict = None):
+def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str, turnaround_map: dict = None, algorithm: str = "greedy"):
     """Generate the complete output Excel workbook."""
     wb = openpyxl.Workbook()
     # Remove default sheet
@@ -1275,7 +1503,7 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
     write_overzicht_sheet(wb, rotations, all_trips)
 
     # Tab 3: Berekeningen
-    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map)
+    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map, algorithm)
 
     # Tab 4: Overzicht Businzet
     write_businzet_sheet(wb, rotations, all_trips, reserves)
@@ -1300,6 +1528,14 @@ def main():
         "--output", "-o",
         default=None,
         help="Uitvoer Excel bestand (standaard: busomloop_output.xlsx)",
+    )
+    parser.add_argument(
+        "--algoritme", "-a",
+        choices=list(ALGORITHMS.keys()),
+        default="greedy",
+        help="Optimalisatie-algoritme: greedy (snel, heuristisch), "
+             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd). "
+             "Standaard: greedy",
     )
     parser.add_argument(
         "--keer-dd",
@@ -1386,8 +1622,9 @@ def main():
     print()
 
     # Optimize
-    print("Stap 2: Busomlopen optimaliseren...")
-    rotations = optimize_rotations(all_trips, turnaround_map)
+    algo_name = ALGORITHMS[args.algoritme][0]
+    print(f"Stap 2: Busomlopen optimaliseren ({algo_name})...")
+    rotations = optimize_rotations(all_trips, turnaround_map, algorithm=args.algoritme)
     print(f"  {len(rotations)} busomlopen gegenereerd")
 
     # Summary per date+type
@@ -1406,7 +1643,7 @@ def main():
 
     # Generate output
     print("Stap 3: Uitvoer genereren...")
-    output = generate_output(rotations, all_trips, reserves, args.output, turnaround_map)
+    output = generate_output(rotations, all_trips, reserves, args.output, turnaround_map, args.algoritme)
     print(f"  Uitvoer opgeslagen: {output}")
     print()
 
