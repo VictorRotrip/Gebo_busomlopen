@@ -400,25 +400,32 @@ MIN_TURNAROUND_FALLBACK = 8  # fallback for unknown bus types
 MIN_TURNAROUND_FLOOR = 2     # absolute minimum turnaround (minutes)
 
 
-def detect_turnaround_times(trips: list) -> dict:
+def detect_turnaround_times(trips: list, within_service_only: bool = False) -> dict:
     """
     Auto-detect minimum turnaround time per bus type from the trip data.
 
-    For each bus type, groups trips by (date, location) and finds the smallest
-    gap between an arriving trip and a departing trip at the same location.
-    That smallest gap is the intended turnaround time for that bus type.
+    If within_service_only=True, only considers trips from the same service
+    (= same Excel tab). This gives a conservative baseline turnaround since
+    it avoids accidental short gaps between unrelated services.
+
+    If within_service_only=False, considers all trips at the same location
+    regardless of service (the original behavior).
 
     Returns dict {bus_type: minutes}, with a floor of MIN_TURNAROUND_FLOOR.
     """
-    # Group arrivals and departures by (bus_type, date, normalized_location)
-    arrivals = {}   # key -> sorted list of arrival times
-    departures = {} # key -> sorted list of departure times
+    # Group arrivals and departures
+    arrivals = {}
+    departures = {}
 
     for t in trips:
         dest_loc = normalize_location(t.dest_code)
         orig_loc = normalize_location(t.origin_code)
-        arr_key = (t.bus_type, t.date_str, dest_loc)
-        dep_key = (t.bus_type, t.date_str, orig_loc)
+        if within_service_only:
+            arr_key = (t.bus_type, t.date_str, dest_loc, t.service)
+            dep_key = (t.bus_type, t.date_str, orig_loc, t.service)
+        else:
+            arr_key = (t.bus_type, t.date_str, dest_loc)
+            dep_key = (t.bus_type, t.date_str, orig_loc)
         arrivals.setdefault(arr_key, []).append(t.arrival)
         departures.setdefault(dep_key, []).append(t.departure)
 
@@ -426,28 +433,63 @@ def detect_turnaround_times(trips: list) -> dict:
     min_gap_per_type = {}
 
     for arr_key, arr_times in arrivals.items():
-        bus_type, date_str, location = arr_key
-        dep_key = (bus_type, date_str, location)
+        bus_type = arr_key[0]
+        dep_key = arr_key  # same key structure
         if dep_key not in departures:
             continue
 
         dep_times = sorted(departures[dep_key])
         for arr_t in arr_times:
-            # Find departures that happen after this arrival (binary search style)
             for dep_t in dep_times:
                 gap = dep_t - arr_t
                 if gap >= MIN_TURNAROUND_FLOOR:
                     if bus_type not in min_gap_per_type or gap < min_gap_per_type[bus_type]:
                         min_gap_per_type[bus_type] = gap
-                    break  # smallest valid gap for this arrival found
+                    break
 
-    # Build result with fallback for types not found in data
     result = {}
     for bus_type in set(t.bus_type for t in trips):
         if bus_type in min_gap_per_type:
             result[bus_type] = min_gap_per_type[bus_type]
         else:
             result[bus_type] = MIN_TURNAROUND_FALLBACK
+
+    return result
+
+
+def detect_turnaround_per_service(trips: list) -> dict:
+    """
+    Detect the minimum turnaround time per service (= per Excel tab).
+    Returns dict {service_name: (bus_type, min_gap_minutes)}.
+    """
+    by_service = {}
+    for t in trips:
+        by_service.setdefault(t.service, []).append(t)
+
+    result = {}
+    for service, svc_trips in by_service.items():
+        bus_type = svc_trips[0].bus_type if svc_trips else "Onbekend"
+        arrivals = {}
+        departures = {}
+        for t in svc_trips:
+            dest_loc = normalize_location(t.dest_code)
+            orig_loc = normalize_location(t.origin_code)
+            arrivals.setdefault(dest_loc, []).append(t.arrival)
+            departures.setdefault(orig_loc, []).append(t.departure)
+
+        min_gap = None
+        for loc, arr_times in arrivals.items():
+            dep_times = departures.get(loc, [])
+            dep_sorted = sorted(dep_times)
+            for arr_t in arr_times:
+                for dep_t in dep_sorted:
+                    gap = dep_t - arr_t
+                    if gap >= MIN_TURNAROUND_FLOOR:
+                        if min_gap is None or gap < min_gap:
+                            min_gap = gap
+                        break
+
+        result[service] = (bus_type, min_gap if min_gap is not None else MIN_TURNAROUND_FALLBACK)
 
     return result
 
@@ -495,59 +537,310 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict) -> bool:
     return True
 
 
-def optimize_rotations(trips: list, turnaround_map: dict = None) -> list:
-    """
-    Greedy best-fit algorithm to chain trips into bus rotations.
-    Groups by (date, bus_type) and minimizes number of buses.
-    """
+def _group_trips(trips, turnaround_map):
+    """Common setup: group trips by (date, bus_type), build compatibility edges."""
     if turnaround_map is None:
         turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
-
-    # Group trips by date + bus type
     groups = {}
     for t in trips:
         key = (t.date_str, t.bus_type)
         groups.setdefault(key, []).append(t)
+    return groups, turnaround_map
+
+
+def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
+    """Convert list of trip-index chains into BusRotation objects."""
+    rotations = []
+    for chain in chains:
+        rotation_counter += 1
+        bus_id = f"{bus_type[:2].upper()}-{date_str.split()[0].upper()}-{rotation_counter:03d}"
+        rotations.append(BusRotation(
+            bus_id=bus_id,
+            bus_type=bus_type,
+            date_str=date_str,
+            trips=[group_trips[i] for i in chain],
+        ))
+    return rotations, rotation_counter
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 1: Greedy best-fit
+# ---------------------------------------------------------------------------
+
+def _optimize_greedy(group_trips, turnaround_map):
+    """Greedy best-fit: assign each trip to the bus with shortest idle time."""
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    buses = []  # list of lists of trip indices
+
+    for idx, trip in enumerate(group_trips):
+        best_bus = None
+        best_gap = float('inf')
+
+        for bus in buses:
+            last = group_trips[bus[-1]]
+            if can_connect(last, trip, turnaround_map):
+                gap = trip.departure - last.arrival
+                if gap < best_gap:
+                    best_gap = gap
+                    best_bus = bus
+
+        if best_bus is not None:
+            best_bus.append(idx)
+        else:
+            buses.append([idx])
+
+    return buses
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 2: Maximum bipartite matching (Hopcroft-Karp)
+#   Minimizes number of buses (= trips - max matching).
+# ---------------------------------------------------------------------------
+
+def _hopcroft_karp(adj, n_left, n_right):
+    """
+    Hopcroft-Karp algorithm for maximum bipartite matching.
+    adj[u] = list of right-side nodes that left-side node u can match to.
+    Returns (match_l, match_r) where match_l[u] = matched right node or -1.
+    """
+    from collections import deque
+
+    match_l = [-1] * n_left
+    match_r = [-1] * n_right
+
+    def bfs():
+        dist = [0] * n_left
+        queue = deque()
+        for u in range(n_left):
+            if match_l[u] == -1:
+                dist[u] = 0
+                queue.append(u)
+            else:
+                dist[u] = float('inf')
+        found = False
+        while queue:
+            u = queue.popleft()
+            for v in adj[u]:
+                w = match_r[v]
+                if w == -1:
+                    found = True
+                elif dist[w] == float('inf'):
+                    dist[w] = dist[u] + 1
+                    queue.append(w)
+        return found, dist
+
+    def dfs(u, dist):
+        for v in adj[u]:
+            w = match_r[v]
+            if w == -1 or (dist[w] == dist[u] + 1 and dfs(w, dist)):
+                match_l[u] = v
+                match_r[v] = u
+                return True
+        dist[u] = float('inf')
+        return False
+
+    while True:
+        found, dist = bfs()
+        if not found:
+            break
+        for u in range(n_left):
+            if match_l[u] == -1:
+                dfs(u, dist)
+
+    return match_l, match_r
+
+
+def _matching_to_chains(n, match_l):
+    """Convert a matching into chains of trip indices."""
+    # match_l[i] = j means trip i is followed by trip j
+    matched_targets = set(v for v in match_l if v != -1)
+    chains = []
+    for i in range(n):
+        if i not in matched_targets:
+            # i is the start of a chain
+            chain = [i]
+            current = i
+            while match_l[current] != -1:
+                current = match_l[current]
+                chain.append(current)
+            chains.append(chain)
+    return chains
+
+
+def _optimize_matching(group_trips, turnaround_map):
+    """Maximum bipartite matching via Hopcroft-Karp. Minimizes bus count."""
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    n = len(group_trips)
+
+    # Build adjacency: trip i can be followed by trip j
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+                adj[i].append(j)
+
+    match_l, _ = _hopcroft_karp(adj, n, n)
+    return _matching_to_chains(n, match_l)
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 3: Minimum-cost maximum matching (successive shortest path)
+#   Minimizes buses first, then minimizes total idle time.
+# ---------------------------------------------------------------------------
+
+def _optimize_mincost(group_trips, turnaround_map):
+    """
+    Min-cost max matching via successive shortest path (SPFA).
+    Minimizes number of buses (primary) and total idle time (secondary).
+    """
+    from collections import deque
+
+    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    n = len(group_trips)
+
+    # Build adjacency with costs (idle time)
+    adj = [[] for _ in range(n)]
+    cost_map = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if can_connect(group_trips[i], group_trips[j], turnaround_map):
+                idle = group_trips[j].departure - group_trips[i].arrival
+                adj[i].append(j)
+                cost_map[(i, j)] = idle
+
+    # Successive shortest path: find augmenting paths in order of increasing cost
+    # Model as flow network with residual graph
+    # match_l[i] = j means left i matched to right j
+    match_l = [-1] * n
+    match_r = [-1] * n
+
+    def spfa_augment():
+        """Find minimum-cost augmenting path using SPFA."""
+        dist = [float('inf')] * n  # distance to right-side node j
+        prev_l = [-1] * n  # previous left node on path to right j
+        in_queue = [False] * n
+        queue = deque()
+
+        # Start from all unmatched left nodes
+        # dist_left[u] = 0 for unmatched u
+        dist_left = [float('inf')] * n
+        for u in range(n):
+            if match_l[u] == -1:
+                dist_left[u] = 0
+                # Relax edges from u
+                for v in adj[u]:
+                    c = cost_map[(u, v)]
+                    if c < dist[v]:
+                        dist[v] = c
+                        prev_l[v] = u
+                        if not in_queue[v]:
+                            queue.append(v)
+                            in_queue[v] = True
+
+        # SPFA: relax through alternating paths
+        while queue:
+            v = queue.popleft()
+            in_queue[v] = False
+
+            # v is a right-side node, matched to w = match_r[v]
+            w = match_r[v]
+            if w == -1:
+                continue  # free node, potential augmenting path end
+
+            # Relax from w (go through the matched edge, then to new right nodes)
+            new_dist_w = dist[v]  # cost to reach w through v's matched edge (0 cost)
+            if new_dist_w < dist_left[w]:
+                dist_left[w] = new_dist_w
+                for v2 in adj[w]:
+                    c = new_dist_w + cost_map[(w, v2)]
+                    if c < dist[v2]:
+                        dist[v2] = c
+                        prev_l[v2] = w
+                        if not in_queue[v2]:
+                            queue.append(v2)
+                            in_queue[v2] = True
+
+        # Find the free right-side node with minimum distance
+        best_v = -1
+        best_d = float('inf')
+        for v in range(n):
+            if match_r[v] == -1 and dist[v] < best_d:
+                best_d = dist[v]
+                best_v = v
+
+        if best_v == -1:
+            return False  # no augmenting path
+
+        # Trace back and augment
+        v = best_v
+        while v != -1:
+            u = prev_l[v]
+            old_v = match_l[u]
+            match_l[u] = v
+            match_r[v] = u
+            v = old_v
+
+        return True
+
+    # Find all augmenting paths
+    while spfa_augment():
+        pass
+
+    return _matching_to_chains(n, match_l)
+
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+ALGORITHMS = {
+    "greedy": ("Greedy best-fit", _optimize_greedy),
+    "matching": ("Maximum bipartite matching (Hopcroft-Karp)", _optimize_matching),
+    "mincost": ("Min-cost maximum matching (SPFA)", _optimize_mincost),
+}
+
+
+def optimize_rotations(trips: list, turnaround_map: dict = None,
+                       algorithm: str = "greedy",
+                       per_service: bool = False) -> list:
+    """
+    Optimize bus rotations using the specified algorithm.
+
+    If per_service=True, only chains trips within the same service (Excel tab).
+    If per_service=False, chains across all services (cross-tab optimization).
+    """
+    groups, turnaround_map = _group_trips(trips, turnaround_map)
+    algo_name, algo_func = ALGORITHMS[algorithm]
+
+    # If per_service, further split groups by service
+    if per_service:
+        new_groups = {}
+        for (date_str, bus_type), group_trips in groups.items():
+            by_svc = {}
+            for t in group_trips:
+                by_svc.setdefault(t.service, []).append(t)
+            for svc, svc_trips in by_svc.items():
+                new_groups[(date_str, bus_type, svc)] = svc_trips
+        all_rotations = []
+        rotation_counter = 0
+        for key, group_trips in sorted(new_groups.items()):
+            date_str, bus_type = key[0], key[1]
+            chains = algo_func(group_trips, turnaround_map)
+            rotations, rotation_counter = _build_rotations(
+                group_trips, date_str, bus_type, chains, rotation_counter
+            )
+            all_rotations.extend(rotations)
+        return all_rotations
 
     all_rotations = []
     rotation_counter = 0
 
     for (date_str, bus_type), group_trips in sorted(groups.items()):
-        # Sort trips by departure time
-        group_trips.sort(key=lambda t: (t.departure, t.arrival))
-
-        # Active buses: list of BusRotation, each with last trip info
-        active_buses = []
-
-        for trip in group_trips:
-            # Find best available bus: the one whose last trip ends latest
-            # but still allows connection (minimize idle)
-            best_bus = None
-            best_gap = float('inf')
-
-            for bus in active_buses:
-                last = bus.trips[-1]
-                if can_connect(last, trip, turnaround_map):
-                    gap = trip.departure - last.arrival
-                    if gap < best_gap:
-                        best_gap = gap
-                        best_bus = bus
-
-            if best_bus is not None:
-                best_bus.trips.append(trip)
-            else:
-                # Need a new bus
-                rotation_counter += 1
-                bus_id = f"{bus_type[:2].upper()}-{date_str.split()[0].upper()}-{rotation_counter:03d}"
-                new_bus = BusRotation(
-                    bus_id=bus_id,
-                    bus_type=bus_type,
-                    date_str=date_str,
-                    trips=[trip],
-                )
-                active_buses.append(new_bus)
-
-        all_rotations.extend(active_buses)
+        chains = algo_func(group_trips, turnaround_map)
+        rotations, rotation_counter = _build_rotations(
+            group_trips, date_str, bus_type, chains, rotation_counter
+        )
+        all_rotations.extend(rotations)
 
     return all_rotations
 
@@ -815,7 +1108,7 @@ def write_overzicht_sheet(wb_out, rotations: list, all_trips: list):
     ws.freeze_panes = "A4"
 
 
-def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None):
+def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves: list, turnaround_map: dict = None, algorithm: str = "greedy"):
     """
     Tab 3: Berekeningen - Calculations and KPIs.
     """
@@ -991,7 +1284,7 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
     row += 1
 
     params = [
-        ("Algoritme", "Greedy best-fit bus chaining"),
+        ("Algoritme", ALGORITHMS[algorithm][0]),
         ("Minimum keertijd", ", ".join(f"{bt}: {mins} min" for bt, mins in turnaround_map.items())),
         ("Doel", "Minimaliseer aantal bussen, daarna minimaliseer wachttijd"),
         ("Locatie-matching", "Bus eindlocatie moet gelijk zijn aan volgende rit startlocatie"),
@@ -1026,10 +1319,15 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
         ws.cell(row=row, column=2).font = Font(bold=True, color="FF0000")
     row += 1
 
-    # Column widths
-    widths = [22, 16, 18, 28, 28, 14, 14, 16, 14, 16, 14, 14]
+    row += 2
+
+    # --- Section 6: Algorithm examples ---
+    row = _write_algo_examples(ws, row)
+
+    # Column widths (don't override col A width set by _write_algo_examples)
+    widths = [None, 16, 18, 28, 28, 14, 14, 16, 14, 16, 14, 14]
     for j, w in enumerate(widths):
-        if j < 12:
+        if w is not None and j < 12:
             ws.column_dimensions[get_column_letter(1 + j)].width = w
 
 
@@ -1262,7 +1560,261 @@ def write_businzet_sheet(wb_out, rotations: list, all_trips: list, reserves: lis
         ws.column_dimensions[get_column_letter(c)].width = 14
 
 
-def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str, turnaround_map: dict = None):
+def _write_algo_examples(ws, row):
+    """Write simple, accessible algorithm examples to a worksheet."""
+    ws.cell(row=row, column=1, value="6. Hoe werken de algoritmes? (voorbeelden)")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 2
+
+    # Example scenario
+    ws.cell(row=row, column=1, value="Stel: 4 ritten op dezelfde dag, allemaal Touringcar, minimale keertijd = 8 minuten")
+    ws.cell(row=row, column=1).font = Font(italic=True)
+    row += 1
+
+    example_headers = ["Rit", "Van", "Naar", "Vertrek", "Aankomst"]
+    for j, h in enumerate(example_headers):
+        c = ws.cell(row=row, column=1 + j, value=h)
+        c.font = Font(bold=True)
+        c.fill = PatternFill("solid", fgColor="D9E1F2")
+        c.border = THIN_BORDER
+    row += 1
+
+    example_trips = [
+        ("Rit 1", "Utrecht", "Ede", "06:00", "06:42"),
+        ("Rit 2", "Ede", "Utrecht", "06:50", "07:32"),
+        ("Rit 3", "Utrecht", "Ede", "07:00", "07:42"),
+        ("Rit 4", "Ede", "Utrecht", "07:50", "08:32"),
+    ]
+    for vals in example_trips:
+        for j, v in enumerate(vals):
+            c = ws.cell(row=row, column=1 + j, value=v)
+            c.border = THIN_BORDER
+        row += 1
+    row += 1
+
+    # --- GREEDY ---
+    ws.cell(row=row, column=1, value="A) Greedy best-fit (\"pak de eerste de beste\")")
+    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
+    row += 1
+    greedy_lines = [
+        "Het algoritme loopt de ritten af op vertrektijd en koppelt elke rit aan de bus",
+        "die het kortst stilstaat maar wel op de juiste plek staat.",
+        "",
+        "Stap 1: Rit 1 (Ut→Ed 06:00-06:42) → geen bus beschikbaar → Bus A",
+        "Stap 2: Rit 2 (Ed→Ut 06:50-07:32) → Bus A staat in Ede, wacht 8 min → Bus A",
+        "Stap 3: Rit 3 (Ut→Ed 07:00-07:42) → Bus A is onderweg → geen bus → Bus B",
+        "Stap 4: Rit 4 (Ed→Ut 07:50-08:32) → Bus A in Ut (wacht 18 min), Bus B in Ede (wacht 8 min)",
+        "        → Bus B (kortste wachttijd) → Bus B",
+        "",
+        "Resultaat: 2 bussen. Bus A: Rit 1→2 | Bus B: Rit 3→4",
+        "Voordeel: Snel, werkt goed in de praktijk. Nadeel: vindt niet altijd het absolute minimum.",
+    ]
+    for line in greedy_lines:
+        ws.cell(row=row, column=1, value=line)
+        row += 1
+    row += 1
+
+    # --- MATCHING ---
+    ws.cell(row=row, column=1, value="B) Bipartite matching (\"wiskundig optimaal minimum bussen\")")
+    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
+    row += 1
+    matching_lines = [
+        "Het algoritme bouwt een netwerk van alle mogelijke koppelingen tussen ritten",
+        "en vindt wiskundig het maximum aantal koppelingen → het minimum aantal bussen.",
+        "",
+        "Mogelijke koppelingen (aankomstlocatie = vertreklocatie, genoeg keertijd):",
+        "  Rit 1 (aankomst Ede 06:42) → Rit 2 (vertrek Ede 06:50): gap 8 min ✓",
+        "  Rit 1 (aankomst Ede 06:42) → Rit 4 (vertrek Ede 07:50): gap 68 min ✓",
+        "  Rit 2 (aankomst Ut 07:32) → geen rit vertrekt uit Ut na 07:32",
+        "  Rit 3 (aankomst Ede 07:42) → Rit 4 (vertrek Ede 07:50): gap 8 min ✓",
+        "",
+        "Maximale matching: Rit 1→Rit 2, Rit 3→Rit 4 (2 koppelingen)",
+        "Bussen nodig = 4 ritten - 2 koppelingen = 2 bussen",
+        "",
+        "Resultaat: 2 bussen (gegarandeerd optimaal). Nadeel: optimaliseert niet op wachttijd.",
+    ]
+    for line in matching_lines:
+        ws.cell(row=row, column=1, value=line)
+        row += 1
+    row += 1
+
+    # --- MINCOST ---
+    ws.cell(row=row, column=1, value="C) Min-cost matching (\"optimaal bussen + minimale wachttijd\")")
+    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
+    row += 1
+    mincost_lines = [
+        "Zoals matching, maar bij gelijke aantallen bussen kiest het de verdeling",
+        "met de minste totale wachttijd.",
+        "",
+        "Mogelijke oplossingen met 2 bussen:",
+        "  Optie 1: Bus A: Rit 1→2 (wacht 8 min) | Bus B: Rit 3→4 (wacht 8 min)  → totaal 16 min wacht",
+        "  Optie 2: Bus A: Rit 1→4 (wacht 68 min) | Bus B: Rit 3 | Bus C: Rit 2   → 3 bussen, slechter",
+        "",
+        "Min-cost kiest Optie 1: 2 bussen, 16 minuten totale wachttijd.",
+        "Dit is het beste van beide werelden: minimum bussen EN minimum wachttijd.",
+        "",
+        "Resultaat: 2 bussen, 16 min wacht. Dit is de meest volledige optimalisatie.",
+    ]
+    for line in mincost_lines:
+        ws.cell(row=row, column=1, value=line)
+        row += 1
+
+    ws.column_dimensions["A"].width = 90
+    return row
+
+
+def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
+                            algorithm: str = "greedy"):
+    """
+    Tab: Sensitiviteitsanalyse - shows impact of different turnaround times.
+    For each bus type present in the data, varies turnaround time and shows bus count.
+    """
+    ws = wb_out.create_sheet(title="Sensitiviteit")
+    row = 1
+    ws.cell(row=row, column=1, value="Sensitiviteitsanalyse Keertijden")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14)
+    row += 2
+
+    ws.cell(row=row, column=1, value="Wat als de minimale keertijd anders is? Hoeveel bussen zijn er dan nodig?")
+    ws.cell(row=row, column=1).font = Font(italic=True)
+    row += 1
+    ws.cell(row=row, column=1, value=f"Algoritme: {ALGORITHMS[algorithm][0]}")
+    row += 2
+
+    # Get bus types present in data
+    active_types = sorted(set(t.bus_type for t in all_trips))
+    # Test values from 2 to max(base+4, 15)
+    max_test = max(max(base_turnaround_map.get(bt, 8) for bt in active_types) + 4, 15)
+    test_values = list(range(2, max_test + 1))
+
+    # --- Section 1: Total buses per turnaround time variation ---
+    ws.cell(row=row, column=1, value="1. Totaal bussen per keertijd-variatie (per bustype)")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+
+    for bus_type in active_types:
+        ws.cell(row=row, column=1, value=f"Bustype: {bus_type}")
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        base_val = base_turnaround_map.get(bus_type, 8)
+        ws.cell(row=row, column=2, value=f"(baseline: {base_val} min)")
+        row += 1
+
+        # Headers
+        headers = ["Keertijd (min)", "Bussen nodig", "Verschil t.o.v. baseline", "Benutting (%)"]
+        for j, h in enumerate(headers):
+            c = ws.cell(row=row, column=1 + j, value=h)
+            c.font = HEADER_FONT_WHITE
+            c.fill = HEADER_FILL
+            c.border = THIN_BORDER
+            c.alignment = Alignment(horizontal="center")
+        row += 1
+
+        # Compute for each test value
+        bt_trips = [t for t in all_trips if t.bus_type == bus_type]
+        baseline_buses = None
+
+        for tv in test_values:
+            test_map = dict(base_turnaround_map)
+            test_map[bus_type] = tv
+            rots = optimize_rotations(all_trips, test_map, algorithm=algorithm)
+            bt_rots = [r for r in rots if r.bus_type == bus_type]
+            n_buses = len(bt_rots)
+            ride = sum(r.total_ride_minutes for r in bt_rots)
+            dienst = sum(r.total_dienst_minutes for r in bt_rots)
+            benutting = (ride / dienst * 100) if dienst > 0 else 0
+
+            if tv == base_val:
+                baseline_buses = n_buses
+
+            diff = n_buses - baseline_buses if baseline_buses is not None else 0
+            diff_str = f"{diff:+d}" if baseline_buses is not None else ""
+
+            is_base = (tv == base_val)
+            vals = [f"{tv} min", n_buses, diff_str, round(benutting, 1)]
+            for j, v in enumerate(vals):
+                c = ws.cell(row=row, column=1 + j, value=v)
+                c.border = THIN_BORDER
+                c.alignment = Alignment(horizontal="center")
+                if is_base:
+                    c.font = Font(bold=True)
+                    c.fill = PatternFill("solid", fgColor="E2EFDA")
+            row += 1
+
+        row += 2
+
+    # --- Section 2: Detail of short turnarounds per route ---
+    ws.cell(row=row, column=1, value="2. Overzicht korte keertijden per traject")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+
+    ws.cell(row=row, column=1, value="Welke trajecten hebben korte keertijden? Zijn kortere keertijden realistisch?")
+    ws.cell(row=row, column=1).font = Font(italic=True)
+    row += 1
+
+    route_headers = ["Dienst", "Bustype", "Min. keertijd (min)", "Locatie", "Voorbeeld aankomst", "Voorbeeld vertrek"]
+    for j, h in enumerate(route_headers):
+        c = ws.cell(row=row, column=1 + j, value=h)
+        c.font = HEADER_FONT_WHITE
+        c.fill = HEADER_FILL
+        c.border = THIN_BORDER
+        c.alignment = Alignment(horizontal="center")
+    row += 1
+
+    # Find min gap per service with example
+    by_service = {}
+    for t in all_trips:
+        by_service.setdefault(t.service, []).append(t)
+
+    service_gaps = []
+    for service, svc_trips in sorted(by_service.items()):
+        bus_type = svc_trips[0].bus_type
+        arrivals_by_loc = {}
+        departures_by_loc = {}
+        for t in svc_trips:
+            dest_loc = normalize_location(t.dest_code)
+            orig_loc = normalize_location(t.origin_code)
+            arrivals_by_loc.setdefault(dest_loc, []).append(t)
+            departures_by_loc.setdefault(orig_loc, []).append(t)
+
+        best_gap = None
+        best_example = None
+        for loc, arrs in arrivals_by_loc.items():
+            deps = departures_by_loc.get(loc, [])
+            deps_sorted = sorted(deps, key=lambda x: x.departure)
+            for a in arrs:
+                for d in deps_sorted:
+                    g = d.departure - a.arrival
+                    if g >= MIN_TURNAROUND_FLOOR:
+                        if best_gap is None or g < best_gap:
+                            best_gap = g
+                            best_example = (loc, a, d)
+                        break
+
+        if best_gap is not None and best_example is not None:
+            loc, a_trip, d_trip = best_example
+            service_gaps.append((best_gap, service, bus_type, loc, a_trip, d_trip))
+
+    service_gaps.sort(key=lambda x: x[0])
+    for gap, service, bus_type, loc, a_trip, d_trip in service_gaps:
+        vals = [
+            service, bus_type, gap, loc,
+            f"{minutes_to_str(a_trip.arrival)} ({a_trip.origin_name}→{a_trip.dest_name})",
+            f"{minutes_to_str(d_trip.departure)} ({d_trip.origin_name}→{d_trip.dest_name})",
+        ]
+        for j, v in enumerate(vals):
+            c = ws.cell(row=row, column=1 + j, value=v)
+            c.border = THIN_BORDER
+            c.alignment = Alignment(horizontal="center" if j in (2,) else "left")
+        row += 1
+
+    # Column widths
+    for j, w in enumerate([28, 16, 18, 18, 40, 40]):
+        ws.column_dimensions[get_column_letter(1 + j)].width = w
+
+
+def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
+                    turnaround_map: dict = None, algorithm: str = "greedy",
+                    include_sensitivity: bool = False):
     """Generate the complete output Excel workbook."""
     wb = openpyxl.Workbook()
     # Remove default sheet
@@ -1275,10 +1827,14 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
     write_overzicht_sheet(wb, rotations, all_trips)
 
     # Tab 3: Berekeningen
-    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map)
+    write_berekeningen_sheet(wb, rotations, all_trips, reserves, turnaround_map, algorithm)
 
     # Tab 4: Overzicht Businzet
     write_businzet_sheet(wb, rotations, all_trips, reserves)
+
+    # Tab 5 (optional): Sensitiviteitsanalyse
+    if include_sensitivity:
+        write_sensitivity_sheet(wb, all_trips, turnaround_map, algorithm)
 
     wb.save(output_file)
     return output_file
@@ -1300,6 +1856,14 @@ def main():
         "--output", "-o",
         default=None,
         help="Uitvoer Excel bestand (standaard: busomloop_output.xlsx)",
+    )
+    parser.add_argument(
+        "--algoritme", "-a",
+        choices=list(ALGORITHMS.keys()),
+        default="greedy",
+        help="Optimalisatie-algoritme: greedy (snel, heuristisch), "
+             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd). "
+             "Standaard: greedy",
     )
     parser.add_argument(
         "--keer-dd",
@@ -1334,22 +1898,24 @@ def main():
     args = parser.parse_args()
 
     if args.output is None:
-        args.output = "busomloop_output.xlsx"
+        args.output = "busomloop_output"
+
+    # Strip .xlsx if user provided it (we'll add suffixes)
+    output_base = args.output.replace(".xlsx", "")
 
     print(f"Busomloop Optimizer")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
     print(f"Invoer:        {args.input_file}")
-    print(f"Uitvoer:       {args.output}")
+    print(f"Uitvoer:       {output_base}_baseline.xlsx + {output_base}_gecombineerd.xlsx")
     print()
 
-    # Parse
+    # ===== PARSE =====
     print("Stap 1: Invoer parsen...")
     all_trips, reserves, sheet_names = parse_all_sheets(args.input_file)
     print(f"  {len(sheet_names) - 1} dienstbladen gevonden")
     print(f"  {len(all_trips)} ritten geparsed (inclusief multipliciteit)")
     print(f"  {len(reserves)} reservebus-regels gevonden")
 
-    # Group trips by type for summary
     by_type = {}
     for t in all_trips:
         by_type.setdefault(t.bus_type, []).append(t)
@@ -1357,12 +1923,11 @@ def main():
         print(f"    {bt}: {len(trips)} ritten")
     print()
 
-    # Determine turnaround times: auto-detect from data, then apply overrides
-    print("Stap 1b: Keertijden bepalen...")
-    auto_detected = detect_turnaround_times(all_trips)
-    turnaround_map = dict(auto_detected)
+    # ===== DETECT TURNAROUND TIMES (within-service = baseline) =====
+    print("Stap 2: Keertijden bepalen (per tabblad, zonder combinaties)...")
+    baseline_turnaround = detect_turnaround_times(all_trips, within_service_only=True)
 
-    # Apply any explicit CLI overrides
+    # Apply CLI overrides
     cli_overrides = {
         "Dubbeldekker": args.keer_dd,
         "Touringcar": args.keer_tc,
@@ -1372,27 +1937,46 @@ def main():
     }
     for bt, val in cli_overrides.items():
         if val is not None:
-            turnaround_map[bt] = val
+            baseline_turnaround[bt] = val
 
-    # Ensure all known types have a value (fallback for types not in data)
     for bt in MIN_TURNAROUND_DEFAULTS:
-        if bt not in turnaround_map:
-            turnaround_map[bt] = MIN_TURNAROUND_DEFAULTS[bt]
+        if bt not in baseline_turnaround:
+            baseline_turnaround[bt] = MIN_TURNAROUND_DEFAULTS[bt]
 
-    print(f"  Keertijden (min {MIN_TURNAROUND_FLOOR} min):")
-    for bt, mins in sorted(turnaround_map.items()):
-        source = "auto-detect" if cli_overrides.get(bt) is None and bt in auto_detected else "handmatig"
+    print(f"  Baseline keertijden (bepaald per tabblad):")
+    for bt, mins in sorted(baseline_turnaround.items()):
+        source = "handmatig" if cli_overrides.get(bt) is not None else "uit data"
         print(f"    {bt:20s} {mins:3d} min  ({source})")
+
+    # Show per-service detail
+    svc_turnarounds = detect_turnaround_per_service(all_trips)
+    print(f"\n  Detail per dienst:")
+    for svc, (bt, gap) in sorted(svc_turnarounds.items(), key=lambda x: x[1][1]):
+        print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
     print()
 
-    # Optimize
-    print("Stap 2: Busomlopen optimaliseren...")
-    rotations = optimize_rotations(all_trips, turnaround_map)
-    print(f"  {len(rotations)} busomlopen gegenereerd")
+    # ===== BASELINE OUTPUT (per-service, no cross-sheet combining) =====
+    algo_name = ALGORITHMS[args.algoritme][0]
+    print(f"Stap 3a: Baseline busomlopen (per tabblad, {algo_name})...")
+    baseline_rotations = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme, per_service=True)
+    n_baseline = len(baseline_rotations)
+    print(f"  {n_baseline} busomlopen (baseline)")
+
+    baseline_file = f"{output_base}_baseline.xlsx"
+    generate_output(baseline_rotations, all_trips, reserves, baseline_file,
+                    baseline_turnaround, args.algoritme)
+    print(f"  Opgeslagen: {baseline_file}")
+    print()
+
+    # ===== COMBINED OUTPUT (cross-sheet, same turnaround times + sensitivity) =====
+    print(f"Stap 3b: Gecombineerde busomlopen (cross-tabblad, {algo_name})...")
+    combined_rotations = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme)
+    n_combined = len(combined_rotations)
+    print(f"  {n_combined} busomlopen (gecombineerd)")
 
     # Summary per date+type
     groups = {}
-    for r in rotations:
+    for r in combined_rotations:
         key = (r.date_str, r.bus_type)
         groups.setdefault(key, []).append(r)
     for (date_str, bus_type), rots in sorted(groups.items()):
@@ -1402,26 +1986,32 @@ def main():
         print(f"    {date_str} / {bus_type}: {len(rots)} bussen, "
               f"{sum(len(r.trips) for r in rots)} ritten, "
               f"benutting {benutting:.0f}%")
+
+    combined_file = f"{output_base}_gecombineerd.xlsx"
+    print(f"\n  Sensitiviteitsanalyse genereren...")
+    generate_output(combined_rotations, all_trips, reserves, combined_file,
+                    baseline_turnaround, args.algoritme, include_sensitivity=True)
+    print(f"  Opgeslagen: {combined_file}")
     print()
 
-    # Generate output
-    print("Stap 3: Uitvoer genereren...")
-    output = generate_output(rotations, all_trips, reserves, args.output, turnaround_map)
-    print(f"  Uitvoer opgeslagen: {output}")
-    print()
+    # ===== FINAL SUMMARY =====
+    def _summary(label, rots):
+        n = len(rots)
+        trips = sum(len(r.trips) for r in rots)
+        ride = sum(r.total_ride_minutes for r in rots)
+        dienst = sum(r.total_dienst_minutes for r in rots)
+        benut = (ride / dienst * 100) if dienst > 0 else 0
+        print(f"  {label}:")
+        print(f"    Bussen:       {n}")
+        print(f"    Ritten:       {trips}")
+        print(f"    Rijtijd:      {ride // 60}u{ride % 60:02d}")
+        print(f"    Diensttijd:   {dienst // 60}u{dienst % 60:02d}")
+        print(f"    Benutting:    {benut:.1f}%")
 
-    # Final summary
-    total_buses = len(rotations)
-    total_trips = sum(len(r.trips) for r in rotations)
-    total_ride = sum(r.total_ride_minutes for r in rotations)
-    total_dienst = sum(r.total_dienst_minutes for r in rotations)
-    print(f"Resultaat:")
-    print(f"  Totaal bussen:      {total_buses}")
-    print(f"  Totaal ritten:      {total_trips}")
-    print(f"  Totaal rijtijd:     {total_ride // 60}u{total_ride % 60:02d}")
-    print(f"  Totaal diensttijd:  {total_dienst // 60}u{total_dienst % 60:02d}")
-    print(f"  Gem. benutting:     {total_ride / total_dienst * 100:.1f}%" if total_dienst > 0 else "  Gem. benutting:     N/A")
-    print(f"  Reservebussen:      {sum(r.count for r in reserves)}")
+    print(f"Vergelijking:")
+    _summary("Baseline (per tabblad)", baseline_rotations)
+    _summary("Gecombineerd (cross-tabblad)", combined_rotations)
+    print(f"  Reservebussen:    {sum(r.count for r in reserves)}")
     print()
     print("Klaar!")
 
