@@ -30,18 +30,63 @@ import requests
 API_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
 
-def build_station_addresses(registry: dict) -> dict:
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+
+def build_station_addresses(registry: dict, halts: dict = None) -> dict:
     """Build Google Maps searchable addresses from the station registry.
 
+    Uses halt/stop info (halteplaats) from the input data when available,
+    giving much more precise locations than just "Station X".
+
+    For example:
+      - "Veenendaal-De Klomp" + halt "OV busstation, Dokter Hoolboomweg"
+        -> "Veenendaal-De Klomp OV busstation, Dokter Hoolboomweg"
+      - "Breukelen" + halt "OV busstation, Stationsweg"
+        -> "Breukelen OV busstation, Stationsweg"
+
     registry: {canonical_key: display_name} from build_station_registry().
-    Returns: {canonical_key: "Station <display_name>, Nederland"}
+    halts:    {canonical_key: set of halt names} from get_station_halts().
+    Returns:  {canonical_key: Google Maps search query string}
     """
+    halts = halts or {}
     addresses = {}
     for canonical, display in registry.items():
-        # Use "Station <display_name>, Nederland" as the search query
-        # This works well for Dutch train stations
-        addresses[canonical] = f"Station {display}, Nederland"
+        halt_set = halts.get(canonical, set())
+        if halt_set:
+            # Pick the most descriptive halt (prefer ones with street/location info)
+            halt = _pick_best_halt(halt_set)
+            addresses[canonical] = f"{display} {halt}, Nederland"
+        else:
+            # Fallback: generic station search
+            addresses[canonical] = f"Station {display}, Nederland"
     return addresses
+
+
+def _pick_best_halt(halt_set: set) -> str:
+    """Pick the most useful halt name for Google Maps geocoding.
+
+    Prefers halts with street names or specific location info.
+    Filters out direction-specific suffixes ("richting X") since those
+    are the same physical location.
+    """
+    import re
+
+    # Normalize: strip direction info ("richting ...")
+    cleaned = set()
+    for h in halt_set:
+        # Remove "richting <anything>" at the end
+        base = re.sub(r'\s+richting\s+.*$', '', h, flags=re.IGNORECASE).strip()
+        cleaned.add(base)
+
+    # Prefer halts with comma (usually have street name: "OV busstation, Stationsweg")
+    with_street = [h for h in cleaned if ',' in h]
+    if with_street:
+        # Pick the longest one (most descriptive)
+        return max(with_street, key=len)
+
+    # Otherwise pick the longest halt name
+    return max(cleaned, key=len) if cleaned else ""
 
 
 def normalize_display_name(name: str) -> str:
@@ -568,17 +613,83 @@ def print_route_analysis(matrix: dict):
             print(f"  {o} -> {d}: {mins:.0f} min ({km_str})")
 
 
-def extract_stations_from_input(input_file: str) -> dict:
-    """Extract stations from input Excel using the optimizer's parser.
+def extract_stations_from_input(input_file: str) -> tuple[dict, dict]:
+    """Extract stations and halt info from input Excel using the optimizer's parser.
 
-    Returns: {canonical_key: display_name}
+    Returns: (registry, halts)
+      registry: {canonical_key: display_name}
+      halts:    {canonical_key: set of halt names}
     """
-    from busomloop_optimizer import parse_all_sheets, build_station_registry
+    from busomloop_optimizer import parse_all_sheets, build_station_registry, get_station_halts
     print(f"Stations extraheren uit {input_file}...")
     all_trips, reserves, _ = parse_all_sheets(input_file)
     registry = build_station_registry(all_trips, reserves)
+    halts = get_station_halts()
     print(f"  {len(registry)} stations gevonden: {', '.join(sorted(registry.values()))}")
-    return registry
+    return registry, halts
+
+
+def verify_addresses(api_key: str, addresses: dict):
+    """Geocode each address and show what Google Maps resolves it to.
+
+    This lets the user verify that search queries point to the right
+    locations before spending API credits on the full NxN distance matrix.
+    """
+    print(f"\n{'='*90}")
+    print("ADRES VERIFICATIE: Google Maps Geocoding")
+    print(f"{'='*90}")
+    print(f"\n{'Station':<25} {'Opgelost adres':<50} {'Lat/Lng'}")
+    print("-" * 90)
+
+    issues = []
+    for canonical, address in sorted(addresses.items()):
+        params = {
+            "address": address,
+            "key": api_key,
+            "language": "nl",
+            "region": "nl",
+        }
+        try:
+            resp = requests.get(GEOCODE_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"  {canonical:<25} FOUT: {e}")
+            issues.append((canonical, address, f"API fout: {e}"))
+            continue
+
+        if data["status"] != "OK" or not data.get("results"):
+            print(f"  {canonical:<25} NIET GEVONDEN ({data['status']})")
+            issues.append((canonical, address, f"Niet gevonden: {data['status']}"))
+            continue
+
+        result = data["results"][0]
+        resolved = result["formatted_address"]
+        loc = result["geometry"]["location"]
+        lat, lng = loc["lat"], loc["lng"]
+
+        # Check if resolved address is in Netherlands (lat ~50.5-53.5, lng ~3.3-7.2)
+        in_nl = 50.5 <= lat <= 53.7 and 3.3 <= lng <= 7.3
+        flag = "" if in_nl else " !! BUITEN NL"
+        if not in_nl:
+            issues.append((canonical, address, f"Buiten Nederland: {resolved}"))
+
+        resolved_short = resolved[:49] if len(resolved) > 49 else resolved
+        print(f"  {canonical:<25} {resolved_short:<50} {lat:.4f}, {lng:.4f}{flag}")
+
+        time.sleep(0.1)  # Rate limit
+
+    print()
+    if issues:
+        print(f"WAARSCHUWINGEN ({len(issues)}):")
+        for canonical, query, issue in issues:
+            print(f"  {canonical}: {issue}")
+            print(f"    Zoekopdracht was: {query}")
+        print(f"\nControleer bovenstaande adressen voordat je de volledige matrix ophaalt.")
+        print(f"Gebruik --key zonder --verify om de matrix op te halen.")
+    else:
+        print("Alle adressen succesvol geverifieerd.")
+        print(f"Gebruik --key zonder --verify om de volledige {len(addresses)}x{len(addresses)} matrix op te halen.")
 
 
 def main():
@@ -598,12 +709,16 @@ def main():
                         help="Load matrix from cached JSON instead of API call")
     parser.add_argument("--validate", default=None,
                         help="Optimizer output .xlsx file for trip validation")
+    parser.add_argument("--verify", action="store_true",
+                        help="Alleen adressen verifiëren via Geocoding API (geen matrix ophalen). "
+                             "Laat zien wat Google Maps per station oplost, zodat je kunt "
+                             "controleren of de locaties kloppen voordat je de matrix ophaalt.")
     args = parser.parse_args()
 
     # Determine station list
     if args.input:
-        registry = extract_stations_from_input(args.input)
-        addresses = build_station_addresses(registry)
+        registry, halts = extract_stations_from_input(args.input)
+        addresses = build_station_addresses(registry, halts)
         locations = sorted(registry.keys())
     elif args.from_cache:
         # When loading from cache without input file, derive locations from cache
@@ -622,6 +737,17 @@ def main():
     for loc in locations:
         addr = addresses.get(loc, "(uit cache)")
         print(f"  {loc}: {addr}")
+
+    # Verify-only mode: geocode addresses and show results, then exit
+    if args.verify:
+        if not args.key:
+            print("\nFOUT: --verify vereist --key API_KEY")
+            sys.exit(1)
+        if not args.input:
+            print("\nFOUT: --verify vereist --input EXCEL_BESTAND")
+            sys.exit(1)
+        verify_addresses(args.key, addresses)
+        return
 
     # Load or fetch matrix
     if args.from_cache:

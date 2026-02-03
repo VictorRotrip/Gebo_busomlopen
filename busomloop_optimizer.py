@@ -549,6 +549,8 @@ _STATION_CODE_TO_CANONICAL: dict = {}
 _STATION_NAME_TO_CANONICAL: dict = {}
 # Maps: canonical key -> display name (for output/Google Maps)
 _CANONICAL_TO_DISPLAY: dict = {}
+# Maps: canonical key -> set of halt names (for Google Maps address building)
+_CANONICAL_TO_HALTS: dict = {}
 
 
 def build_station_registry(all_trips: list, reserves: list = None):
@@ -562,35 +564,34 @@ def build_station_registry(all_trips: list, reserves: list = None):
     _STATION_CODE_TO_CANONICAL.clear()
     _STATION_NAME_TO_CANONICAL.clear()
     _CANONICAL_TO_DISPLAY.clear()
+    _CANONICAL_TO_HALTS.clear()
 
-    # Collect station code -> name mappings from all trip stops
+    def _register(code: str, name: str, halt: str = ""):
+        if not code or not name:
+            return
+        code_lower = code.strip().lower()
+        name_clean = name.strip()
+        canonical = _name_to_canonical(name_clean)
+        _STATION_CODE_TO_CANONICAL[code_lower] = canonical
+        _STATION_NAME_TO_CANONICAL[canonical] = canonical
+        _CANONICAL_TO_DISPLAY[canonical] = name_clean
+        if halt and halt.strip():
+            _CANONICAL_TO_HALTS.setdefault(canonical, set()).add(halt.strip())
+
+    # Collect station code -> name -> halt mappings from all trip stops
     for t in all_trips:
-        for code, name in [(t.origin_code, t.origin_name),
-                           (t.dest_code, t.dest_name)]:
-            if not code or not name:
-                continue
-            code_lower = code.strip().lower()
-            name_clean = name.strip()
-            canonical = _name_to_canonical(name_clean)
-
-            _STATION_CODE_TO_CANONICAL[code_lower] = canonical
-            _STATION_NAME_TO_CANONICAL[canonical] = canonical
-            _CANONICAL_TO_DISPLAY[canonical] = name_clean
+        _register(t.origin_code, t.origin_name, t.origin_halt)
+        _register(t.dest_code, t.dest_name, t.dest_halt)
 
         # Also register intermediate stops if available
         if hasattr(t, 'stops') and t.stops:
             for stop in t.stops:
                 s_code = stop[0] if len(stop) > 0 else ""
                 s_name = stop[1] if len(stop) > 1 else ""
-                if s_code and s_name:
-                    code_lower = s_code.strip().lower()
-                    name_clean = s_name.strip()
-                    canonical = _name_to_canonical(name_clean)
-                    _STATION_CODE_TO_CANONICAL[code_lower] = canonical
-                    _STATION_NAME_TO_CANONICAL[canonical] = canonical
-                    _CANONICAL_TO_DISPLAY[canonical] = name_clean
+                s_halt = stop[3] if len(stop) > 3 else ""
+                _register(s_code, s_name, s_halt)
 
-    # Register reserve bus station names
+    # Register reserve bus station names (no halt info available)
     if reserves:
         for rb in reserves:
             if rb.station:
@@ -606,6 +607,11 @@ def build_station_registry(all_trips: list, reserves: list = None):
 def get_station_registry() -> dict:
     """Return the current station registry: {canonical_key: display_name}."""
     return dict(_CANONICAL_TO_DISPLAY)
+
+
+def get_station_halts() -> dict:
+    """Return halt info per station: {canonical_key: set of halt names}."""
+    return {k: set(v) for k, v in _CANONICAL_TO_HALTS.items()}
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
