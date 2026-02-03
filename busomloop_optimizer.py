@@ -506,6 +506,7 @@ def normalize_location(code: str) -> str:
         "klp": "veenendaal_klomp", "klp90": "veenendaal_klomp",
         "rhn": "rhenen", "rhn90": "rhenen",
         "vdn": "veenendaal", "vdnc": "veenendaal_centrum",
+        "vdnw": "veenendaal_west",
         "mrn": "maarn", "mrn90": "maarn", "mrn91": "maarn",
         "amf": "amersfoort", "amf91": "amersfoort",
         "bhv": "bilthoven", "bhv90": "bilthoven",
@@ -516,6 +517,136 @@ def normalize_location(code: str) -> str:
         "wd": "woerden", "wd90": "woerden",
     }
     return mapping.get(code, code)
+
+
+def normalize_reserve_station(station_name: str) -> str:
+    """Normalize a reserve bus station name to match normalize_location output."""
+    name = station_name.strip().lower()
+    mapping = {
+        "driebergen-zeist": "driebergen",
+        "ede-wageningen": "ede",
+        "utrecht centraal": "utrecht",
+        "veenendaal west": "veenendaal_west",
+        "veenendaal-de klomp": "veenendaal_klomp",
+        "arnhem centraal": "arnhem",
+        "amersfoort centraal": "amersfoort",
+        "breukelen": "breukelen",
+        "houten": "houten",
+        "maarn": "maarn",
+        "rhenen": "rhenen",
+        "woerden": "woerden",
+    }
+    return mapping.get(name, name)
+
+
+def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
+    """Match a reserve day string to a trip date_str.
+    E.g. 'donderdag 11 juni' -> 'do 11-06-2026'
+    """
+    day_lower = reserve_day.strip().lower()
+    # Extract day number
+    parts = day_lower.split()
+    for trip_date in trip_dates:
+        # trip_date format: "do 11-06-2026"
+        td_parts = trip_date.split()
+        day_num = td_parts[1].split("-")[0]  # "11"
+        # Check if day number appears in reserve day and weekday prefix matches
+        day_map = {
+            "maandag": "ma", "dinsdag": "di", "woensdag": "wo",
+            "donderdag": "do", "vrijdag": "vr", "zaterdag": "za", "zondag": "zo"
+        }
+        for full, short in day_map.items():
+            if full in day_lower and td_parts[0] == short and day_num in parts:
+                return trip_date
+    return ""
+
+
+def analyze_reserve_coverage(rotations: list, reserves: list, trip_dates: list) -> list:
+    """
+    Analyze which bus rotations cover reserve bus requirements.
+
+    A rotation covers a reserve requirement if:
+    - It has a gap (idle period) at the reserve station
+    - The gap fully covers the reserve time window
+    - The rotation's bus is at that station during the entire reserve window
+
+    Returns list of dicts with coverage info per reserve requirement.
+    """
+    results = []
+
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        res_loc = normalize_reserve_station(rb.station)
+
+        # Find rotations that are idle at this station during the reserve window
+        covering_buses = []
+
+        for rot in rotations:
+            if rot.date_str != date_str:
+                continue
+
+            # Check each gap between consecutive trips
+            for i in range(len(rot.trips) - 1):
+                prev_trip = rot.trips[i]
+                next_trip = rot.trips[i + 1]
+
+                # Bus is at prev_trip's destination after prev_trip ends
+                bus_loc = normalize_location(prev_trip.dest_code)
+                idle_start = prev_trip.arrival
+                idle_end = next_trip.departure
+
+                # Does this gap cover the reserve window?
+                if (bus_loc == res_loc and
+                    idle_start <= rb.start and
+                    idle_end >= rb.end):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": idle_start,
+                        "idle_end": idle_end,
+                        "prev_trip": f"{prev_trip.origin_name}→{prev_trip.dest_name}",
+                        "next_trip": f"{next_trip.origin_name}→{next_trip.dest_name}",
+                    })
+
+            # Also check: bus arrives at last trip and has no more trips
+            if rot.trips:
+                last = rot.trips[-1]
+                bus_loc = normalize_location(last.dest_code)
+                if (bus_loc == res_loc and last.arrival <= rb.start):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": last.arrival,
+                        "idle_end": 1440,  # end of day
+                        "prev_trip": f"{last.origin_name}→{last.dest_name}",
+                        "next_trip": "(einde dienst)",
+                    })
+
+            # Also check: bus starts first trip from reserve station
+            if rot.trips:
+                first = rot.trips[0]
+                bus_loc = normalize_location(first.origin_code)
+                if (bus_loc == res_loc and first.departure >= rb.end):
+                    covering_buses.append({
+                        "bus_id": rot.bus_id,
+                        "bus_type": rot.bus_type,
+                        "idle_start": 0,
+                        "idle_end": first.departure,
+                        "prev_trip": "(start dienst)",
+                        "next_trip": f"{first.origin_name}→{first.dest_name}",
+                    })
+
+        results.append({
+            "reserve": rb,
+            "date_str": date_str,
+            "location": res_loc,
+            "required": rb.count,
+            "covered": len(covering_buses),
+            "covering_buses": covering_buses,
+            "shortfall": max(0, rb.count - len(covering_buses)),
+        })
+
+    return results
 
 
 def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict) -> bool:
@@ -1245,38 +1376,67 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
 
     row += 2
 
-    # --- Section 3: Reservebussen ---
-    ws.cell(row=row, column=1, value="3. Reservebussen")
+    # --- Section 3: Reservebussen analyse ---
+    ws.cell(row=row, column=1, value="3. Reservebussen - Dekkingsanalyse")
     ws.cell(row=row, column=1).font = Font(bold=True, size=12)
     row += 1
 
-    res_headers = ["Station", "Aantal", "Dag", "Van", "Tot", "Opmerking"]
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+    coverage = analyze_reserve_coverage(rotations, reserves, trip_dates)
+
+    res_headers = ["Station", "Dag", "Van", "Tot", "Nodig", "Gedekt door omloop",
+                   "Extra nodig", "Opmerking", "Dekkende bus(sen)"]
     for j, h in enumerate(res_headers):
         cell = ws.cell(row=row, column=1 + j, value=h)
         cell.font = HEADER_FONT_WHITE
         cell.fill = HEADER_FILL
         cell.border = THIN_BORDER
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
     row += 1
 
     total_reserve = 0
-    for rb in reserves:
-        values = [rb.station, rb.count, rb.day,
-                  minutes_to_time(rb.start), minutes_to_time(rb.end), rb.remark]
+    total_covered = 0
+    total_extra = 0
+    for c in coverage:
+        rb = c["reserve"]
+        covered = min(c["covered"], c["required"])
+        extra = c["shortfall"]
+        total_reserve += rb.count
+        total_covered += covered
+        total_extra += extra
+
+        bus_names = ", ".join(b["bus_id"] for b in c["covering_buses"][:c["required"]])
+
+        values = [rb.station, rb.day, minutes_to_time(rb.start), minutes_to_time(rb.end),
+                  rb.count, covered, extra, rb.remark, bus_names]
         for j, v in enumerate(values):
             cell = ws.cell(row=row, column=1 + j, value=v)
             cell.border = THIN_BORDER
             cell.alignment = Alignment(horizontal="center")
-            if j in (3, 4):
+            if j in (2, 3):
                 cell.number_format = "HH:MM"
-        total_reserve += rb.count
+            if j == 6 and extra > 0:
+                cell.font = Font(bold=True, color="FF0000")
+            elif j == 6 and extra == 0:
+                cell.font = Font(bold=True, color="008000")
         row += 1
 
-    ws.cell(row=row, column=1, value="Totaal reservebussen:")
-    ws.cell(row=row, column=1).font = Font(bold=True)
-    ws.cell(row=row, column=2, value=total_reserve)
-    ws.cell(row=row, column=2).font = Font(bold=True)
-    row += 3
+    # Totals
+    row += 1
+    summary_items = [
+        ("Totaal reservebussen nodig:", total_reserve),
+        ("Gedekt door bestaande busomlopen:", total_covered),
+        ("Extra bussen nodig voor reserve:", total_extra),
+        ("Totaal vloot (omloop + extra reserve):", len(rotations) + total_extra),
+    ]
+    for label, val in summary_items:
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        ws.cell(row=row, column=2, value=val)
+        ws.cell(row=row, column=2).font = Font(bold=True)
+        row += 1
+
+    row += 2
 
     # --- Section 4: Optimalisatie parameters ---
     ws.cell(row=row, column=1, value="4. Optimalisatie parameters & toelichting")
