@@ -7,7 +7,11 @@ Leest het invoer-Excel bestand (Bijlage J) in en genereert:
   3. Berekeningen en optimalisatie-details
 
 Gebruik:
-    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>] [--keer-dd 15] [--keer-tc 8] [--keer-lvb 12] [--keer-midi 10] [--keer-taxi 5]
+    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>]
+
+Keertijden worden automatisch bepaald uit de data (kleinste gap per bustype,
+minimum 2 minuten). Handmatig overschrijven kan met:
+    --keer-dd 15  --keer-tc 8  --keer-lvb 12  --keer-midi 10  --keer-taxi 5
 """
 
 import argparse
@@ -393,6 +397,59 @@ MIN_TURNAROUND_DEFAULTS = {
     "Taxibus": 5,
 }
 MIN_TURNAROUND_FALLBACK = 8  # fallback for unknown bus types
+MIN_TURNAROUND_FLOOR = 2     # absolute minimum turnaround (minutes)
+
+
+def detect_turnaround_times(trips: list) -> dict:
+    """
+    Auto-detect minimum turnaround time per bus type from the trip data.
+
+    For each bus type, groups trips by (date, location) and finds the smallest
+    gap between an arriving trip and a departing trip at the same location.
+    That smallest gap is the intended turnaround time for that bus type.
+
+    Returns dict {bus_type: minutes}, with a floor of MIN_TURNAROUND_FLOOR.
+    """
+    # Group arrivals and departures by (bus_type, date, normalized_location)
+    arrivals = {}   # key -> sorted list of arrival times
+    departures = {} # key -> sorted list of departure times
+
+    for t in trips:
+        dest_loc = normalize_location(t.dest_code)
+        orig_loc = normalize_location(t.origin_code)
+        arr_key = (t.bus_type, t.date_str, dest_loc)
+        dep_key = (t.bus_type, t.date_str, orig_loc)
+        arrivals.setdefault(arr_key, []).append(t.arrival)
+        departures.setdefault(dep_key, []).append(t.departure)
+
+    # For each bus type, find minimum gap between any arrival and subsequent departure
+    min_gap_per_type = {}
+
+    for arr_key, arr_times in arrivals.items():
+        bus_type, date_str, location = arr_key
+        dep_key = (bus_type, date_str, location)
+        if dep_key not in departures:
+            continue
+
+        dep_times = sorted(departures[dep_key])
+        for arr_t in arr_times:
+            # Find departures that happen after this arrival (binary search style)
+            for dep_t in dep_times:
+                gap = dep_t - arr_t
+                if gap >= MIN_TURNAROUND_FLOOR:
+                    if bus_type not in min_gap_per_type or gap < min_gap_per_type[bus_type]:
+                        min_gap_per_type[bus_type] = gap
+                    break  # smallest valid gap for this arrival found
+
+    # Build result with fallback for types not found in data
+    result = {}
+    for bus_type in set(t.bus_type for t in trips):
+        if bus_type in min_gap_per_type:
+            result[bus_type] = min_gap_per_type[bus_type]
+        else:
+            result[bus_type] = MIN_TURNAROUND_FALLBACK
+
+    return result
 
 
 def normalize_location(code: str) -> str:
@@ -1247,53 +1304,42 @@ def main():
     parser.add_argument(
         "--keer-dd",
         type=int,
-        default=MIN_TURNAROUND_DEFAULTS["Dubbeldekker"],
-        help=f"Keertijd dubbeldekker in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Dubbeldekker']})",
+        default=None,
+        help=f"Keertijd dubbeldekker in minuten (standaard: auto-detect uit data)",
     )
     parser.add_argument(
         "--keer-tc",
         type=int,
-        default=MIN_TURNAROUND_DEFAULTS["Touringcar"],
-        help=f"Keertijd touringcar in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Touringcar']})",
+        default=None,
+        help=f"Keertijd touringcar in minuten (standaard: auto-detect uit data)",
     )
     parser.add_argument(
         "--keer-lvb",
         type=int,
-        default=MIN_TURNAROUND_DEFAULTS["Lagevloerbus"],
-        help=f"Keertijd lagevloerbus/gelede bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Lagevloerbus']})",
+        default=None,
+        help=f"Keertijd lagevloerbus/gelede bus in minuten (standaard: auto-detect uit data)",
     )
     parser.add_argument(
         "--keer-midi",
         type=int,
-        default=MIN_TURNAROUND_DEFAULTS["Midi bus"],
-        help=f"Keertijd midi bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Midi bus']})",
+        default=None,
+        help=f"Keertijd midi bus in minuten (standaard: auto-detect uit data)",
     )
     parser.add_argument(
         "--keer-taxi",
         type=int,
-        default=MIN_TURNAROUND_DEFAULTS["Taxibus"],
-        help=f"Keertijd taxibus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Taxibus']})",
+        default=None,
+        help=f"Keertijd taxibus in minuten (standaard: auto-detect uit data)",
     )
     args = parser.parse_args()
 
     if args.output is None:
         args.output = "busomloop_output.xlsx"
 
-    turnaround_map = {
-        "Dubbeldekker": args.keer_dd,
-        "Touringcar": args.keer_tc,
-        "Lagevloerbus": args.keer_lvb,
-        "Midi bus": args.keer_midi,
-        "Taxibus": args.keer_taxi,
-    }
-
     print(f"Busomloop Optimizer")
     print(f"{'='*50}")
     print(f"Invoer:        {args.input_file}")
     print(f"Uitvoer:       {args.output}")
-    print(f"Keertijden:")
-    for bt, mins in turnaround_map.items():
-        print(f"  {bt:20s} {mins} min")
     print()
 
     # Parse
@@ -1309,6 +1355,34 @@ def main():
         by_type.setdefault(t.bus_type, []).append(t)
     for bt, trips in sorted(by_type.items()):
         print(f"    {bt}: {len(trips)} ritten")
+    print()
+
+    # Determine turnaround times: auto-detect from data, then apply overrides
+    print("Stap 1b: Keertijden bepalen...")
+    auto_detected = detect_turnaround_times(all_trips)
+    turnaround_map = dict(auto_detected)
+
+    # Apply any explicit CLI overrides
+    cli_overrides = {
+        "Dubbeldekker": args.keer_dd,
+        "Touringcar": args.keer_tc,
+        "Lagevloerbus": args.keer_lvb,
+        "Midi bus": args.keer_midi,
+        "Taxibus": args.keer_taxi,
+    }
+    for bt, val in cli_overrides.items():
+        if val is not None:
+            turnaround_map[bt] = val
+
+    # Ensure all known types have a value (fallback for types not in data)
+    for bt in MIN_TURNAROUND_DEFAULTS:
+        if bt not in turnaround_map:
+            turnaround_map[bt] = MIN_TURNAROUND_DEFAULTS[bt]
+
+    print(f"  Keertijden (min {MIN_TURNAROUND_FLOOR} min):")
+    for bt, mins in sorted(turnaround_map.items()):
+        source = "auto-detect" if cli_overrides.get(bt) is None and bt in auto_detected else "handmatig"
+        print(f"    {bt:20s} {mins:3d} min  ({source})")
     print()
 
     # Optimize
