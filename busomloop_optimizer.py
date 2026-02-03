@@ -7,7 +7,7 @@ Leest het invoer-Excel bestand (Bijlage J) in en genereert:
   3. Berekeningen en optimalisatie-details
 
 Gebruik:
-    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>] [--keer-dd 15] [--keer-tc 8] [--keer-taxi 5]
+    python busomloop_optimizer.py <invoer.xlsx> [--output <uitvoer.xlsx>] [--keer-dd 15] [--keer-tc 8] [--keer-lvb 12] [--keer-midi 10] [--keer-taxi 5]
 """
 
 import argparse
@@ -164,7 +164,25 @@ def parse_reserve_buses(wb) -> list:
     return reserves
 
 
-BUS_TYPE_VALUES = {"dubbeldekker", "touringcar", "taxibus"}
+BUS_TYPE_VALUES = {"dubbeldekker", "touringcar", "taxibus", "lagevloerbus",
+                    "gelede bus", "midi bus", "midibus"}
+
+
+def normalize_bus_type(raw: str) -> str:
+    """Normalize bus type names to canonical form matching the pricing categories."""
+    low = raw.strip().lower()
+    if "dubbeldek" in low:
+        return "Dubbeldekker"
+    if "touring" in low:
+        return "Touringcar"
+    if "lagevloer" in low or "gelede" in low:
+        return "Lagevloerbus"
+    if "midi" in low:
+        return "Midi bus"
+    if "taxi" in low:
+        return "Taxibus"
+    # Return with title case if unknown
+    return raw.strip() if raw.strip() else "Onbekend"
 
 
 def parse_direction_block(ws, start_row, max_col=100):
@@ -303,7 +321,7 @@ def parse_sheet(wb, sheet_name) -> list:
                          for s, t in col_times]
 
             multiplicity = int(aantal_map.get(col, 1))
-            bus_type = str(bus_types_map.get(col, "Onbekend"))
+            bus_type = normalize_bus_type(str(bus_types_map.get(col, "Onbekend")))
             pattern = str(patterns.get(col, ""))
             snel = str(snel_stop_map.get(col, ""))
 
@@ -370,6 +388,8 @@ def parse_all_sheets(input_file: str):
 MIN_TURNAROUND_DEFAULTS = {
     "Dubbeldekker": 15,
     "Touringcar": 8,
+    "Lagevloerbus": 12,
+    "Midi bus": 10,
     "Taxibus": 5,
 }
 MIN_TURNAROUND_FALLBACK = 8  # fallback for unknown bus types
@@ -526,7 +546,7 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
 
         for bus_type, type_rotations in sorted(by_type.items()):
             # Create sheet per date+type
-            type_abbrev = {"Dubbeldekker": "DD", "Touringcar": "TC", "Taxibus": "Taxi"}.get(bus_type, bus_type[:4])
+            type_abbrev = {"Dubbeldekker": "DD", "Touringcar": "TC", "Lagevloerbus": "LVB", "Midi bus": "Midi", "Taxibus": "Taxi"}.get(bus_type, bus_type[:4])
             day_abbrev = date_str.split()[0] if date_str else "dag"
             sheet_name = f"Omloop {type_abbrev} {day_abbrev}"
             # Ensure unique sheet name (max 31 chars)
@@ -1015,7 +1035,7 @@ def write_businzet_sheet(wb_out, rotations: list, all_trips: list, reserves: lis
                        end_row=date_row, end_column=col_base + 2)
     row += 1
 
-    type_abbrev = {"Dubbeldekker": "DD", "Touringcar": "TC", "Taxibus": "Taxi"}
+    type_abbrev = {"Dubbeldekker": "DD", "Touringcar": "TC", "Lagevloerbus": "LVB", "Midi bus": "Midi", "Taxibus": "Taxi"}
     alt_fill = PatternFill(start_color="E8F0FE", end_color="E8F0FE", fill_type="solid")
 
     for s_idx, service in enumerate(services):
@@ -1237,6 +1257,18 @@ def main():
         help=f"Keertijd touringcar in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Touringcar']})",
     )
     parser.add_argument(
+        "--keer-lvb",
+        type=int,
+        default=MIN_TURNAROUND_DEFAULTS["Lagevloerbus"],
+        help=f"Keertijd lagevloerbus/gelede bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Lagevloerbus']})",
+    )
+    parser.add_argument(
+        "--keer-midi",
+        type=int,
+        default=MIN_TURNAROUND_DEFAULTS["Midi bus"],
+        help=f"Keertijd midi bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Midi bus']})",
+    )
+    parser.add_argument(
         "--keer-taxi",
         type=int,
         default=MIN_TURNAROUND_DEFAULTS["Taxibus"],
@@ -1250,6 +1282,8 @@ def main():
     turnaround_map = {
         "Dubbeldekker": args.keer_dd,
         "Touringcar": args.keer_tc,
+        "Lagevloerbus": args.keer_lvb,
+        "Midi bus": args.keer_midi,
         "Taxibus": args.keer_taxi,
     }
 
@@ -1257,7 +1291,9 @@ def main():
     print(f"{'='*50}")
     print(f"Invoer:        {args.input_file}")
     print(f"Uitvoer:       {args.output}")
-    print(f"Keertijden:    DD={turnaround_map['Dubbeldekker']}min, TC={turnaround_map['Touringcar']}min, Taxi={turnaround_map['Taxibus']}min")
+    print(f"Keertijden:")
+    for bt, mins in turnaround_map.items():
+        print(f"  {bt:20s} {mins} min")
     print()
 
     # Parse
