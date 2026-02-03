@@ -8,8 +8,13 @@ Google Maps Distance Matrix API. Produces:
 2. A validation report comparing scheduled trip durations to Google Maps times
 3. A traffic sensitivity analysis (where buffers are thin)
 
+Stations are automatically discovered from the input Excel file (same file
+used by busomloop_optimizer.py), so this script works with any input file
+without hardcoded station lists.
+
 Usage:
-    python google_maps_distances.py [--key API_KEY] [--output distances.xlsx]
+    python google_maps_distances.py --input casus.xlsx --key API_KEY
+    python google_maps_distances.py --input casus.xlsx --from-cache deadhead_matrix.json
     python google_maps_distances.py --from-cache deadhead_matrix.json --validate output.xlsx
 """
 
@@ -22,83 +27,57 @@ from pathlib import Path
 
 import requests
 
-# ---------------------------------------------------------------------------
-# Canonical locations → Google Maps searchable addresses (train stations)
-# ---------------------------------------------------------------------------
-STATION_ADDRESSES = {
-    "amersfoort":        "Station Amersfoort Centraal, Amersfoort, Nederland",
-    "arnhem":            "Station Arnhem Centraal, Arnhem, Nederland",
-    "bilthoven":         "Station Bilthoven, Bilthoven, Nederland",
-    "breukelen":         "Station Breukelen, Breukelen, Nederland",
-    "den_dolder":        "Station Den Dolder, Den Dolder, Nederland",
-    "driebergen":        "Station Driebergen-Zeist, Driebergen, Nederland",
-    "ede":               "Station Ede-Wageningen, Ede, Nederland",
-    "geldermalsen":      "Station Geldermalsen, Geldermalsen, Nederland",
-    "hilversum":         "Station Hilversum, Hilversum, Nederland",
-    "houten":            "Station Houten, Houten, Nederland",
-    "houten_vinex":      "Station Houten Castellum, Houten, Nederland",
-    "maarn":             "Station Maarn, Maarn, Nederland",
-    "rhenen":            "Station Rhenen, Rhenen, Nederland",
-    "utrecht":           "Station Utrecht Centraal, Utrecht, Nederland",
-    "utrecht_overvecht": "Station Utrecht Overvecht, Utrecht, Nederland",
-    "veenendaal":        "Station Veenendaal-De Klomp, Veenendaal, Nederland",
-    "veenendaal_centrum":"Station Veenendaal Centrum, Veenendaal, Nederland",
-    "veenendaal_klomp":  "Station Veenendaal-De Klomp, Veenendaal, Nederland",
-    "veenendaal_west":   "Station Veenendaal West, Veenendaal, Nederland",
-    "woerden":           "Station Woerden, Woerden, Nederland",
-}
-
-# Map display names (from optimizer output) back to canonical locations
-DISPLAY_TO_CANONICAL = {
-    "arnhem centraal": "arnhem",
-    "ede-wageningen": "ede",
-    "utrecht centraal": "utrecht",
-    "utrecht overvecht": "utrecht_overvecht",
-    "driebergen-zeist": "driebergen",
-    "veenendaal-de klomp": "veenendaal_klomp",
-    "veenendaal centrum": "veenendaal_centrum",
-    "veenendaal west": "veenendaal_west",
-    "amersfoort centraal": "amersfoort",
-    "houten castellum": "houten_vinex",
-    "houten": "houten",
-    "bilthoven": "bilthoven",
-    "breukelen": "breukelen",
-    "den dolder": "den_dolder",
-    "geldermalsen": "geldermalsen",
-    "hilversum": "hilversum",
-    "maarn": "maarn",
-    "rhenen": "rhenen",
-    "woerden": "woerden",
-}
-
 API_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
 
+def build_station_addresses(registry: dict) -> dict:
+    """Build Google Maps searchable addresses from the station registry.
+
+    registry: {canonical_key: display_name} from build_station_registry().
+    Returns: {canonical_key: "Station <display_name>, Nederland"}
+    """
+    addresses = {}
+    for canonical, display in registry.items():
+        # Use "Station <display_name>, Nederland" as the search query
+        # This works well for Dutch train stations
+        addresses[canonical] = f"Station {display}, Nederland"
+    return addresses
+
+
 def normalize_display_name(name: str) -> str:
-    """Convert a display station name to canonical location."""
-    key = name.strip().lower()
-    return DISPLAY_TO_CANONICAL.get(key, key)
+    """Convert a display station name to canonical location (lowercase)."""
+    return name.strip().lower()
 
 
 def fetch_distance_matrix(api_key: str, locations: list[str],
-                          batch_size: int = 10) -> dict:
+                          addresses: dict, batch_size: int = 10) -> dict:
     """Fetch full NxN distance matrix from Google Maps.
+
+    locations: list of canonical location keys.
+    addresses: dict {canonical_key: Google Maps address string}.
 
     Returns dict: {(origin, dest): {"distance_m": int, "duration_s": int,
                                      "duration_min": float, "distance_km": float}}
     """
-    addresses = [STATION_ADDRESSES[loc] for loc in locations]
+    addr_list = []
+    for loc in locations:
+        addr = addresses.get(loc)
+        if not addr:
+            print(f"  WAARSCHUWING: geen adres voor station '{loc}', wordt overgeslagen")
+            continue
+        addr_list.append(addr)
+
     n = len(locations)
     matrix = {}
 
     for i_start in range(0, n, batch_size):
         i_end = min(i_start + batch_size, n)
-        origins = "|".join(addresses[i_start:i_end])
+        origins = "|".join(addr_list[i_start:i_end])
         origin_locs = locations[i_start:i_end]
 
         for j_start in range(0, n, batch_size):
             j_end = min(j_start + batch_size, n)
-            destinations = "|".join(addresses[j_start:j_end])
+            destinations = "|".join(addr_list[j_start:j_end])
             dest_locs = locations[j_start:j_end]
 
             params = {
@@ -113,14 +92,37 @@ def fetch_distance_matrix(api_key: str, locations: list[str],
                   f"({origin_locs[0]}..{origin_locs[-1]} -> "
                   f"{dest_locs[0]}..{dest_locs[-1]}) ...")
 
-            resp = requests.get(API_URL, params=params, timeout=30)
-            resp.raise_for_status()
+            try:
+                resp = requests.get(API_URL, params=params, timeout=30)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                print(f"  FOUT: API-verzoek mislukt: {e}")
+                print(f"  Doorgaan met volgende batch...")
+                for o in origin_locs:
+                    for d in dest_locs:
+                        matrix[(o, d)] = {
+                            "distance_m": None, "duration_s": None,
+                            "duration_min": None, "distance_km": None,
+                        }
+                continue
+
             data = resp.json()
 
             if data["status"] != "OK":
-                print(f"  ERROR: API returned status {data['status']}")
+                print(f"  FOUT: API gaf status {data['status']}")
                 print(f"  {data.get('error_message', '')}")
-                sys.exit(1)
+                if data["status"] == "REQUEST_DENIED":
+                    print("  Controleer of de API-sleutel geldig is en Distance Matrix API "
+                          "is ingeschakeld.")
+                    sys.exit(1)
+                # For other errors, continue with None values
+                for o in origin_locs:
+                    for d in dest_locs:
+                        matrix[(o, d)] = {
+                            "distance_m": None, "duration_s": None,
+                            "duration_min": None, "distance_km": None,
+                        }
+                continue
 
             for ri, row in enumerate(data["rows"]):
                 for ci, element in enumerate(row["elements"]):
@@ -134,7 +136,7 @@ def fetch_distance_matrix(api_key: str, locations: list[str],
                             "distance_km": round(element["distance"]["value"] / 1000, 1),
                         }
                     else:
-                        print(f"  WARNING: No route {o} -> {d}: {element['status']}")
+                        print(f"  WAARSCHUWING: Geen route {o} -> {d}: {element['status']}")
                         matrix[(o, d)] = {
                             "distance_m": None, "duration_s": None,
                             "duration_min": None, "distance_km": None,
@@ -197,7 +199,7 @@ def load_trips_from_output(output_file: str) -> list[dict]:
             break
 
     if not ws:
-        print(f"Could not find 'Ritsamenhang' sheet in {output_file}")
+        print(f"Kon 'Ritsamenhang' sheet niet vinden in {output_file}")
         wb.close()
         return []
 
@@ -215,7 +217,7 @@ def load_trips_from_output(output_file: str) -> list[dict]:
             break
 
     if not header_row:
-        print("Could not find header row in Ritsamenhang sheet")
+        print("Kon header-rij niet vinden in Ritsamenhang sheet")
         wb.close()
         return []
 
@@ -566,9 +568,26 @@ def print_route_analysis(matrix: dict):
             print(f"  {o} -> {d}: {mins:.0f} min ({km_str})")
 
 
+def extract_stations_from_input(input_file: str) -> dict:
+    """Extract stations from input Excel using the optimizer's parser.
+
+    Returns: {canonical_key: display_name}
+    """
+    from busomloop_optimizer import parse_all_sheets, build_station_registry
+    print(f"Stations extraheren uit {input_file}...")
+    all_trips, reserves, _ = parse_all_sheets(input_file)
+    registry = build_station_registry(all_trips, reserves)
+    print(f"  {len(registry)} stations gevonden: {', '.join(sorted(registry.values()))}")
+    return registry
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch Google Maps distances between bus stations")
+        description="Fetch Google Maps distances between bus stations. "
+                    "Stations are auto-discovered from the input Excel file.")
+    parser.add_argument("--input", "-i", default=None,
+                        help="Input Excel file (same as busomloop_optimizer.py). "
+                             "Required when using --key to fetch new distances.")
     parser.add_argument("--key", default=None,
                         help="Google Maps API key")
     parser.add_argument("--output", default="afstanden_stations.xlsx",
@@ -581,23 +600,74 @@ def main():
                         help="Optimizer output .xlsx file for trip validation")
     args = parser.parse_args()
 
-    locations = sorted(STATION_ADDRESSES.keys())
-    print(f"Stations: {len(locations)}")
+    # Determine station list
+    if args.input:
+        registry = extract_stations_from_input(args.input)
+        addresses = build_station_addresses(registry)
+        locations = sorted(registry.keys())
+    elif args.from_cache:
+        # When loading from cache without input file, derive locations from cache
+        print("Geen invoerbestand opgegeven, stations worden uit cache afgeleid...")
+        with open(args.from_cache) as f:
+            cached = json.load(f)
+        locations = sorted(cached.keys())
+        addresses = {}  # Not needed for cache-only mode
+        registry = {loc: loc for loc in locations}
+    else:
+        print("FOUT: Geef --input EXCEL_BESTAND op (nodig om stations te ontdekken)")
+        print("      Of gebruik --from-cache CACHE_BESTAND om eerder opgehaalde data te laden")
+        sys.exit(1)
+
+    print(f"\nStations: {len(locations)}")
     for loc in locations:
-        print(f"  {loc}: {STATION_ADDRESSES[loc]}")
+        addr = addresses.get(loc, "(uit cache)")
+        print(f"  {loc}: {addr}")
 
     # Load or fetch matrix
     if args.from_cache:
         print(f"\nLoading cached matrix from {args.from_cache}...")
         matrix = load_matrix_from_cache(args.from_cache)
+
+        # If we have a registry from input, remap cache keys to match
+        if args.input:
+            from busomloop_optimizer import remap_deadhead_matrix, get_station_registry
+            cache_keys = set()
+            for o, dests in matrix.items():
+                cache_keys.add(o)
+                for d in dests:
+                    cache_keys.add(d)
+            # Only remap if keys don't match
+            # Build a flat matrix for remapping
+            flat_cache = {}
+            for (o, d), vals in matrix.items():
+                if o not in flat_cache:
+                    flat_cache[o] = {}
+                flat_cache[o][d] = vals.get("duration_min") if vals.get("duration_min") is not None else 0
+            remapped = remap_deadhead_matrix(flat_cache)
+            # Rebuild tuple-keyed matrix with remapped keys
+            new_matrix = {}
+            for o, dests in remapped.items():
+                for d, val in dests.items():
+                    old_entry = matrix.get((o, d))
+                    if old_entry:
+                        new_matrix[(o, d)] = old_entry
+                    else:
+                        new_matrix[(o, d)] = {"duration_min": val, "distance_km": None,
+                                              "duration_s": None, "distance_m": None}
+            matrix = new_matrix
+            locations = sorted(set(o for o, d in matrix.keys()))
+
     elif args.key:
+        if not args.input:
+            print("FOUT: --input is vereist bij --key (nodig om stations te ontdekken)")
+            sys.exit(1)
         print(f"\nFetching {len(locations)}x{len(locations)} distance matrix "
               f"({len(locations)**2} elements)...")
-        matrix = fetch_distance_matrix(args.key, locations)
+        matrix = fetch_distance_matrix(args.key, locations, addresses)
         print(f"Received {len(matrix)} route entries")
         save_deadhead_json(matrix, locations, args.json_output)
     else:
-        print("\nERROR: Provide --key API_KEY or --from-cache FILE")
+        print("\nFOUT: Geef --key API_KEY of --from-cache BESTAND op")
         sys.exit(1)
 
     # Trip validation
