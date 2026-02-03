@@ -2311,11 +2311,11 @@ def main():
     )
     parser.add_argument(
         "--algoritme", "-a",
-        choices=list(ALGORITHMS.keys()),
-        default="greedy",
+        choices=list(ALGORITHMS.keys()) + ["all"],
+        default="all",
         help="Optimalisatie-algoritme: greedy (snel, heuristisch), "
-             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd). "
-             "Standaard: greedy",
+             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd), "
+             "all (alle drie). Standaard: all",
     )
     parser.add_argument(
         "--keer-dd",
@@ -2355,10 +2355,14 @@ def main():
     # Strip .xlsx if user provided it (we'll add suffixes)
     output_base = args.output.replace(".xlsx", "")
 
+    algos = list(ALGORITHMS.keys()) if args.algoritme == "all" else [args.algoritme]
+    n_files = len(algos) * 4
+
     print(f"Busomloop Optimizer")
     print(f"{'='*60}")
     print(f"Invoer:        {args.input_file}")
-    print(f"Uitvoer:       4 bestanden (zie onder)")
+    print(f"Algoritme(s):  {', '.join(algos)}")
+    print(f"Uitvoer:       {n_files} bestanden (4 outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
     print()
 
     # ===== PARSE =====
@@ -2407,7 +2411,6 @@ def main():
         print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
     print()
 
-    algo_name = ALGORITHMS[args.algoritme][0]
     total_reserves = sum(r.count for r in reserves)
 
     # Create reserve phantom trips (used by outputs 3 and 4)
@@ -2416,108 +2419,168 @@ def main():
     print(f"  {len(reserve_trip_list)} reservebus-taken aangemaakt (phantom trips)")
     print()
 
-    # Helper for summary printing
-    def _summary(label, rots, extra_reserve=0):
-        n_real = len(set(r.bus_id for r in rots if r.real_trips))
-        n_total_rot = len(rots)
-        trips = sum(len(r.real_trips) for r in rots)
-        res_planned = sum(len(r.reserve_trip_list) for r in rots)
-        ride = sum(r.total_ride_minutes for r in rots)
-        dienst = sum(r.total_dienst_minutes for r in rots)
-        benut = (ride / dienst * 100) if dienst > 0 else 0
-        print(f"  {label}:")
-        print(f"    Bussen:       {n_real}")
-        print(f"    Ritten:       {trips}")
-        if res_planned:
-            print(f"    Reserve ingepland: {res_planned}/{total_reserves}")
-        print(f"    Rijtijd:      {ride // 60}u{ride % 60:02d}")
-        print(f"    Diensttijd:   {dienst // 60}u{dienst % 60:02d}")
-        print(f"    Benutting:    {benut:.1f}%")
-        if extra_reserve > 0:
-            print(f"    Extra reserve: {extra_reserve}")
-            print(f"    Totaal vloot:  {n_real + extra_reserve}")
-        return n_real, extra_reserve
-
-    # ===================================================================
-    # OUTPUT 1: Per dienst, geen reserves
-    # ===================================================================
-    print(f"Stap 3a: Output 1 - Per dienst, geen reserves ({algo_name})...")
-    rot1 = optimize_rotations(all_trips, baseline_turnaround, algorithm=args.algoritme, per_service=True)
-    print(f"  {len(rot1)} busomlopen")
-
-    file1 = f"{output_base}_1_per_dienst.xlsx"
-    generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, args.algoritme,
-                    output_mode=1)
-    print(f"  Opgeslagen: {file1}")
-    print()
-
-    # ===================================================================
-    # OUTPUT 2: Per dienst + optimale idle reserve matching
-    # ===================================================================
-    print(f"Stap 3b: Output 2 - Per dienst + optimale reserve matching ({algo_name})...")
-    # Same rotations as output 1, but with optimal idle matching in the report
-    file2 = f"{output_base}_2_per_dienst_reservematch.xlsx"
-    generate_output(rot1, all_trips, reserves, file2, baseline_turnaround, args.algoritme,
-                    output_mode=2)
-    print(f"  Opgeslagen: {file2}")
-
-    # Compute idle matching stats for summary
     trip_dates = sorted(set(t.date_str for t in all_trips))
-    idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
-    idle_covered = sum(min(c["covered"], c["required"]) for c in idle_cov)
-    idle_extra = sum(c["shortfall"] for c in idle_cov)
-    print(f"  Reserve dekking: {idle_covered}/{total_reserves} gedekt, {idle_extra} extra nodig")
-    print(f"  Totaal vloot: {len(rot1) + idle_extra}")
-    print()
+
+    # Determine which algorithms to run
+    if args.algoritme == "all":
+        algo_keys = list(ALGORITHMS.keys())
+    else:
+        algo_keys = [args.algoritme]
 
     # ===================================================================
-    # OUTPUT 3: Per dienst + reserves ingepland (phantom trips, service constraint)
+    # Per-algorithm results collector for comparison table
     # ===================================================================
-    print(f"Stap 3c: Output 3 - Per dienst + reserves ingepland ({algo_name})...")
-    rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                              algorithm=args.algoritme, service_constraint=True)
-    n3_real = len(set(r.bus_id for r in rot3 if r.real_trips))
-    n3_res_planned = sum(len(r.reserve_trip_list) for r in rot3)
-    n3_extra = max(0, total_reserves - n3_res_planned)
-    print(f"  {n3_real} busomlopen (met ritten)")
-    print(f"  {n3_res_planned}/{total_reserves} reserves ingepland, {n3_extra} extra nodig")
+    # results[algo_key] = {1: {...}, 2: {...}, 3: {...}, 4: {...}}
+    all_results = {}
 
-    file3 = f"{output_base}_3_dienst_met_reserve.xlsx"
-    generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, args.algoritme,
-                    output_mode=3)
-    print(f"  Opgeslagen: {file3}")
+    for algo_idx, algo_key in enumerate(algo_keys):
+        algo_name = ALGORITHMS[algo_key][0]
+        algo_short = {"greedy": "greedy", "matching": "matching", "mincost": "mincost"}[algo_key]
+
+        if len(algo_keys) > 1:
+            print(f"{'='*60}")
+            print(f"Algoritme {algo_idx+1}/{len(algo_keys)}: {algo_name}")
+            print(f"{'='*60}")
+        else:
+            print(f"Algoritme: {algo_name}")
+
+        algo_results = {}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 1: Per dienst, geen reserves
+        # ---------------------------------------------------------------
+        print(f"  Output 1 - Per dienst, geen reserves...")
+        rot1 = optimize_rotations(all_trips, baseline_turnaround,
+                                  algorithm=algo_key, per_service=True)
+        n1 = len(rot1)
+        print(f"    {n1} busomlopen")
+
+        file1 = f"{output_base}_{algo_short}_1_per_dienst.xlsx"
+        generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, algo_key,
+                        output_mode=1)
+        print(f"    -> {file1}")
+
+        algo_results[1] = {"rotations": rot1, "buses": n1, "file": file1,
+                           "reserve_planned": 0, "extra_reserve": total_reserves}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 2: Per dienst + optimale idle reserve matching
+        # ---------------------------------------------------------------
+        print(f"  Output 2 - Per dienst + optimale reserve matching...")
+        file2 = f"{output_base}_{algo_short}_2_per_dienst_reservematch.xlsx"
+        generate_output(rot1, all_trips, reserves, file2, baseline_turnaround, algo_key,
+                        output_mode=2)
+
+        idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
+        idle_covered = sum(min(c["covered"], c["required"]) for c in idle_cov)
+        idle_extra = sum(c["shortfall"] for c in idle_cov)
+        print(f"    Reserve: {idle_covered}/{total_reserves} gedekt, {idle_extra} extra nodig")
+        print(f"    -> {file2}")
+
+        algo_results[2] = {"rotations": rot1, "buses": n1, "file": file2,
+                           "reserve_planned": idle_covered, "extra_reserve": idle_extra}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 3: Per dienst + reserves ingepland (service constraint)
+        # ---------------------------------------------------------------
+        print(f"  Output 3 - Per dienst + reserves ingepland...")
+        rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                  algorithm=algo_key, service_constraint=True)
+        n3_real = len(set(r.bus_id for r in rot3 if r.real_trips))
+        n3_res_planned = sum(len(r.reserve_trip_list) for r in rot3)
+        n3_extra = max(0, total_reserves - n3_res_planned)
+        print(f"    {n3_real} bussen, {n3_res_planned}/{total_reserves} reserves ingepland")
+
+        file3 = f"{output_base}_{algo_short}_3_dienst_met_reserve.xlsx"
+        generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, algo_key,
+                        output_mode=3)
+        print(f"    -> {file3}")
+
+        algo_results[3] = {"rotations": rot3, "buses": n3_real, "file": file3,
+                           "reserve_planned": n3_res_planned, "extra_reserve": n3_extra}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 4: Gecombineerd + reserves ingepland + sensitiviteit
+        # ---------------------------------------------------------------
+        print(f"  Output 4 - Gecombineerd + reserves + sensitiviteit...")
+        rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround, algorithm=algo_key)
+        n4_real = len(set(r.bus_id for r in rot4 if r.real_trips))
+        n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
+        n4_extra = max(0, total_reserves - n4_res_planned)
+        print(f"    {n4_real} bussen, {n4_res_planned}/{total_reserves} reserves ingepland")
+
+        file4 = f"{output_base}_{algo_short}_4_gecombineerd_met_reserve.xlsx"
+        generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
+                        include_sensitivity=True, output_mode=4)
+        print(f"    -> {file4}")
+
+        algo_results[4] = {"rotations": rot4, "buses": n4_real, "file": file4,
+                           "reserve_planned": n4_res_planned, "extra_reserve": n4_extra}
+
+        all_results[algo_key] = algo_results
+        print()
+
+    # ===== FINAL COMPARISON TABLE =====
+    print()
+    print(f"VERGELIJKINGSTABEL")
+    print(f"{'='*100}")
+
+    output_labels = {
+        1: "Per dienst",
+        2: "Per dienst + reserve idle",
+        3: "Per dienst + reserve ingepland",
+        4: "Gecombineerd + reserve ingepland",
+    }
+
+    # Header
+    cw = 14  # column width per algorithm
+    algo_short_names = {"greedy": "Greedy", "matching": "Matching", "mincost": "Min-cost"}
+    print(f"{'Output':<40s}", end="")
+    for ak in algo_keys:
+        print(f" {algo_short_names.get(ak, ak):>{cw}s}", end="")
+    print()
+    print(f"{'-'*40}", end="")
+    for _ in algo_keys:
+        print(f" {'':->{ cw }s}", end="")
     print()
 
-    # ===================================================================
-    # OUTPUT 4: Gecombineerd + reserves ingepland + sensitiviteit
-    # ===================================================================
-    print(f"Stap 3d: Output 4 - Gecombineerd + reserves ingepland + sensitiviteit ({algo_name})...")
-    rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround, algorithm=args.algoritme)
-    n4_real = len(set(r.bus_id for r in rot4 if r.real_trips))
-    n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
-    n4_extra = max(0, total_reserves - n4_res_planned)
-    print(f"  {n4_real} busomlopen (met ritten)")
-    print(f"  {n4_res_planned}/{total_reserves} reserves ingepland, {n4_extra} extra nodig")
+    # Rows per output: buses, reserve, total fleet
+    for out_num in [1, 2, 3, 4]:
+        label = output_labels[out_num]
 
-    file4 = f"{output_base}_4_gecombineerd_met_reserve.xlsx"
-    print(f"  Sensitiviteitsanalyse genereren...")
-    generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, args.algoritme,
-                    include_sensitivity=True, output_mode=4)
-    print(f"  Opgeslagen: {file4}")
-    print()
+        # Buses row
+        print(f"{label + ' - bussen':<40s}", end="")
+        for ak in algo_keys:
+            r = all_results[ak][out_num]
+            print(f" {r['buses']:>{cw}d}", end="")
+        print()
 
-    # ===== FINAL SUMMARY =====
-    print(f"Vergelijking:")
-    print(f"{'='*60}")
-    _summary("1. Per dienst (baseline)", rot1, idle_extra)
-    print()
-    _summary("2. Per dienst + idle reserve matching", rot1, idle_extra)
-    print()
-    _summary("3. Per dienst + reserves ingepland", rot3, n3_extra)
-    print()
-    _summary("4. Gecombineerd + reserves ingepland", rot4, n4_extra)
-    print()
-    print(f"  Reservebussen totaal nodig: {total_reserves}")
+        # Reserve covered row
+        cov_label = "  reserve gedekt"
+        print(f"{cov_label:<40s}", end="")
+        for ak in algo_keys:
+            r = all_results[ak][out_num]
+            print(f" {str(r['reserve_planned'])+'/'+str(total_reserves):>{cw}s}", end="")
+        print()
+
+        # Extra reserve row
+        print(f"{'  extra reserve nodig':<40s}", end="")
+        for ak in algo_keys:
+            r = all_results[ak][out_num]
+            print(f" {r['extra_reserve']:>{cw}d}", end="")
+        print()
+
+        # Total fleet row (bold via asterisks in console)
+        print(f"{'  TOTAAL VLOOT':<40s}", end="")
+        for ak in algo_keys:
+            r = all_results[ak][out_num]
+            fleet = r["buses"] + r["extra_reserve"]
+            print(f" {fleet:>{cw}d}", end="")
+        print()
+        print()
+
+    print(f"Reservebussen totaal nodig: {total_reserves}")
+    print(f"Gegenereerde bestanden: {len(algo_keys) * 4}")
     print()
     print("Klaar!")
 
