@@ -944,6 +944,235 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
             ws.column_dimensions[get_column_letter(1 + j)].width = w
 
 
+def write_businzet_sheet(wb_out, rotations: list, all_trips: list, reserves: list):
+    """
+    Tab 4: Overzicht Businzet - Matrix of services x dates with bus counts.
+    Similar to 'Overzicht businzet.xlsx' but auto-generated with details.
+    """
+    ws = wb_out.create_sheet(title="Overzicht Businzet")
+
+    row = 1
+    ws.cell(row=row, column=1, value="Overzicht Businzet")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14)
+    row += 2
+
+    # --- Section 1: Service x Date matrix ---
+    ws.cell(row=row, column=1, value="1. Busdiensten per datum")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+
+    # Collect unique dates and services from trips
+    dates = sorted(set(t.date_str for t in all_trips))
+    services = sorted(set(t.service for t in all_trips))
+
+    # Build lookup: (service, date) -> {bus_type, trip_count, bus_count}
+    from collections import defaultdict
+    svc_date = defaultdict(lambda: {"trips": 0, "bus_types": set()})
+    for t in all_trips:
+        key = (t.service, t.date_str)
+        svc_date[key]["trips"] += 1
+        svc_date[key]["bus_types"].add(t.bus_type)
+
+    # Count buses per service+date from rotations
+    rot_svc_date = defaultdict(set)
+    for rot in rotations:
+        for trip in rot.trips:
+            rot_svc_date[(trip.service, rot.date_str)].add(rot.bus_id)
+
+    # Header row
+    ws.cell(row=row, column=1, value="Busdienst")
+    ws.cell(row=row, column=1).font = HEADER_FONT_WHITE
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.cell(row=row, column=1).border = THIN_BORDER
+    for j, date in enumerate(dates):
+        col_base = 2 + j * 3
+        for offset, header in enumerate(["Ritten", "Bussen", "Type"]):
+            cell = ws.cell(row=row, column=col_base + offset, value=header)
+            cell.font = HEADER_FONT_WHITE
+            cell.fill = HEADER_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="center")
+    # Date labels above
+    date_row = row - 1
+    for j, date in enumerate(dates):
+        col_base = 2 + j * 3
+        cell = ws.cell(row=date_row, column=col_base, value=date)
+        cell.font = Font(bold=True, size=11)
+        cell.alignment = Alignment(horizontal="center")
+        ws.merge_cells(start_row=date_row, start_column=col_base,
+                       end_row=date_row, end_column=col_base + 2)
+    row += 1
+
+    type_abbrev = {"Dubbeldekker": "DD", "Touringcar": "TC", "Taxibus": "Taxi"}
+    alt_fill = PatternFill(start_color="E8F0FE", end_color="E8F0FE", fill_type="solid")
+
+    for s_idx, service in enumerate(services):
+        use_fill = alt_fill if s_idx % 2 == 0 else None
+        cell = ws.cell(row=row, column=1, value=service)
+        cell.font = Font(bold=True)
+        cell.border = THIN_BORDER
+        if use_fill:
+            cell.fill = use_fill
+
+        for j, date in enumerate(dates):
+            col_base = 2 + j * 3
+            key = (service, date)
+            info = svc_date.get(key)
+            if info and info["trips"] > 0:
+                n_trips = info["trips"]
+                n_buses = len(rot_svc_date.get(key, set()))
+                types_str = ", ".join(type_abbrev.get(bt, bt) for bt in sorted(info["bus_types"]))
+
+                ws.cell(row=row, column=col_base, value=n_trips)
+                ws.cell(row=row, column=col_base + 1, value=n_buses)
+                ws.cell(row=row, column=col_base + 2, value=types_str)
+            else:
+                ws.cell(row=row, column=col_base, value="-")
+                ws.cell(row=row, column=col_base + 1, value="-")
+                ws.cell(row=row, column=col_base + 2, value="-")
+
+            for offset in range(3):
+                c = ws.cell(row=row, column=col_base + offset)
+                c.border = THIN_BORDER
+                c.alignment = Alignment(horizontal="center")
+                if use_fill:
+                    c.fill = use_fill
+        row += 1
+
+    # Totals row
+    ws.cell(row=row, column=1, value="TOTAAL")
+    ws.cell(row=row, column=1).font = Font(bold=True)
+    ws.cell(row=row, column=1).border = THIN_BORDER
+    for j, date in enumerate(dates):
+        col_base = 2 + j * 3
+        date_trips = sum(1 for t in all_trips if t.date_str == date)
+        date_buses = len(set(r.bus_id for r in rotations if r.date_str == date))
+        ws.cell(row=row, column=col_base, value=date_trips)
+        ws.cell(row=row, column=col_base + 1, value=date_buses)
+        for offset in range(3):
+            c = ws.cell(row=row, column=col_base + offset)
+            c.border = THIN_BORDER
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center")
+    row += 3
+
+    # --- Section 2: Buses per date + type summary ---
+    ws.cell(row=row, column=1, value="2. Bussen per datum en bustype")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+
+    bus_types_all = sorted(set(t.bus_type for t in all_trips))
+    headers2 = ["Datum"] + [type_abbrev.get(bt, bt) for bt in bus_types_all] + ["Totaal", "Reserve"]
+    for j, h in enumerate(headers2):
+        cell = ws.cell(row=row, column=1 + j, value=h)
+        cell.font = HEADER_FONT_WHITE
+        cell.fill = HEADER_FILL
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center")
+    row += 1
+
+    for date in dates:
+        ws.cell(row=row, column=1, value=date)
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        total_date = 0
+        for bt_idx, bt in enumerate(bus_types_all):
+            n = len([r for r in rotations if r.date_str == date and r.bus_type == bt])
+            ws.cell(row=row, column=2 + bt_idx, value=n)
+            ws.cell(row=row, column=2 + bt_idx).border = THIN_BORDER
+            ws.cell(row=row, column=2 + bt_idx).alignment = Alignment(horizontal="center")
+            total_date += n
+        ws.cell(row=row, column=2 + len(bus_types_all), value=total_date)
+        ws.cell(row=row, column=2 + len(bus_types_all)).border = THIN_BORDER
+        ws.cell(row=row, column=2 + len(bus_types_all)).font = Font(bold=True)
+        ws.cell(row=row, column=2 + len(bus_types_all)).alignment = Alignment(horizontal="center")
+
+        # Reserve count for this date
+        day_map = {"do": "donderdag", "vr": "vrijdag", "za": "zaterdag",
+                   "zo": "zondag", "ma": "maandag"}
+        day_abbrev = date.split()[0] if date else ""
+        full_day = day_map.get(day_abbrev, day_abbrev)
+        res_count = sum(r.count for r in reserves
+                       if full_day in r.day.lower() or day_abbrev in r.day.lower()[:2])
+        ws.cell(row=row, column=3 + len(bus_types_all), value=res_count)
+        ws.cell(row=row, column=3 + len(bus_types_all)).border = THIN_BORDER
+        ws.cell(row=row, column=3 + len(bus_types_all)).alignment = Alignment(horizontal="center")
+        row += 1
+
+    # Grand total
+    ws.cell(row=row, column=1, value="TOTAAL")
+    ws.cell(row=row, column=1).font = Font(bold=True)
+    ws.cell(row=row, column=1).border = THIN_BORDER
+    grand = 0
+    for bt_idx, bt in enumerate(bus_types_all):
+        n = len([r for r in rotations if r.bus_type == bt])
+        ws.cell(row=row, column=2 + bt_idx, value=n)
+        ws.cell(row=row, column=2 + bt_idx).font = Font(bold=True)
+        ws.cell(row=row, column=2 + bt_idx).border = THIN_BORDER
+        ws.cell(row=row, column=2 + bt_idx).alignment = Alignment(horizontal="center")
+        grand += n
+    ws.cell(row=row, column=2 + len(bus_types_all), value=grand)
+    ws.cell(row=row, column=2 + len(bus_types_all)).font = Font(bold=True)
+    ws.cell(row=row, column=2 + len(bus_types_all)).border = THIN_BORDER
+    ws.cell(row=row, column=2 + len(bus_types_all)).alignment = Alignment(horizontal="center")
+    res_total = sum(r.count for r in reserves)
+    ws.cell(row=row, column=3 + len(bus_types_all), value=res_total)
+    ws.cell(row=row, column=3 + len(bus_types_all)).font = Font(bold=True)
+    ws.cell(row=row, column=3 + len(bus_types_all)).border = THIN_BORDER
+    ws.cell(row=row, column=3 + len(bus_types_all)).alignment = Alignment(horizontal="center")
+    row += 3
+
+    # --- Section 3: Diensttijden per busdienst ---
+    ws.cell(row=row, column=1, value="3. Diensttijden per busdienst")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+
+    headers3 = ["Busdienst", "Datum", "Bustype", "Eerste vertrek", "Laatste aankomst",
+                "Diensttijd (uur)", "Ritten", "Bussen ingezet"]
+    for j, h in enumerate(headers3):
+        cell = ws.cell(row=row, column=1 + j, value=h)
+        cell.font = HEADER_FONT_WHITE
+        cell.fill = HEADER_FILL
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    row += 1
+
+    for s_idx, service in enumerate(services):
+        use_fill = alt_fill if s_idx % 2 == 0 else None
+        for date in dates:
+            key = (service, date)
+            info = svc_date.get(key)
+            if not info or info["trips"] == 0:
+                continue
+            svc_trips = [t for t in all_trips if t.service == service and t.date_str == date]
+            if not svc_trips:
+                continue
+            first_dep = min(t.departure for t in svc_trips)
+            last_arr = max(t.arrival for t in svc_trips)
+            dienst_min = last_arr - first_dep
+            n_buses = len(rot_svc_date.get(key, set()))
+            types_str = ", ".join(type_abbrev.get(bt, bt) for bt in sorted(info["bus_types"]))
+
+            values = [
+                service, date, types_str,
+                minutes_to_time(first_dep), minutes_to_time(last_arr),
+                round(dienst_min / 60, 1), info["trips"], n_buses,
+            ]
+            for j, v in enumerate(values):
+                cell = ws.cell(row=row, column=1 + j, value=v)
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(horizontal="center")
+                if use_fill:
+                    cell.fill = use_fill
+                if j in (3, 4):
+                    cell.number_format = "HH:MM"
+            row += 1
+
+    # Column widths
+    ws.column_dimensions[get_column_letter(1)].width = 20
+    for c in range(2, 2 + len(dates) * 3 + 5):
+        ws.column_dimensions[get_column_letter(c)].width = 14
+
+
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str):
     """Generate the complete output Excel workbook."""
     wb = openpyxl.Workbook()
@@ -958,6 +1187,9 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
 
     # Tab 3: Berekeningen
     write_berekeningen_sheet(wb, rotations, all_trips, reserves)
+
+    # Tab 4: Overzicht Businzet
+    write_businzet_sheet(wb, rotations, all_trips, reserves)
 
     wb.save(output_file)
     return output_file
