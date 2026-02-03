@@ -914,8 +914,7 @@ def _optimize_greedy(group_trips, turnaround_map, service_constraint=False):
 
 
 # ---------------------------------------------------------------------------
-# Algorithm 2: Maximum bipartite matching (Hopcroft-Karp)
-#   Minimizes number of buses (= trips - max matching).
+# Bipartite matching helpers (used by min-cost and reserve idle matching)
 # ---------------------------------------------------------------------------
 
 def _hopcroft_karp(adj, n_left, n_right):
@@ -988,24 +987,8 @@ def _matching_to_chains(n, match_l):
     return chains
 
 
-def _optimize_matching(group_trips, turnaround_map, service_constraint=False):
-    """Maximum bipartite matching via Hopcroft-Karp. Minimizes bus count."""
-    group_trips.sort(key=lambda t: (t.departure, t.arrival))
-    n = len(group_trips)
-
-    # Build adjacency: trip i can be followed by trip j
-    adj = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if can_connect(group_trips[i], group_trips[j], turnaround_map, service_constraint):
-                adj[i].append(j)
-
-    match_l, _ = _hopcroft_karp(adj, n, n)
-    return _matching_to_chains(n, match_l)
-
-
 # ---------------------------------------------------------------------------
-# Algorithm 3: Minimum-cost maximum matching (successive shortest path)
+# Algorithm 2: Minimum-cost maximum matching (successive shortest path)
 #   Minimizes buses first, then minimizes total idle time.
 # ---------------------------------------------------------------------------
 
@@ -1116,7 +1099,6 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False):
 
 ALGORITHMS = {
     "greedy": ("Greedy best-fit", _optimize_greedy),
-    "matching": ("Maximum bipartite matching (Hopcroft-Karp)", _optimize_matching),
     "mincost": ("Min-cost maximum matching (SPFA)", _optimize_mincost),
 }
 
@@ -2062,46 +2044,27 @@ def _write_algo_examples(ws, row):
         row += 1
     row += 1
 
-    # --- MATCHING ---
-    ws.cell(row=row, column=1, value="B) Bipartite matching (\"wiskundig optimaal minimum bussen\")")
+    # --- MINCOST ---
+    ws.cell(row=row, column=1, value="B) Min-cost matching (\"optimaal bussen + minimale wachttijd\")")
     ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
     row += 1
-    matching_lines = [
-        "Het algoritme bouwt een netwerk van alle mogelijke koppelingen tussen ritten",
-        "en vindt wiskundig het maximum aantal koppelingen → het minimum aantal bussen.",
+    mincost_lines = [
+        "Bouwt een netwerk van alle mogelijke koppelingen tussen ritten en vindt",
+        "de verdeling met het minimum aantal bussen EN de minste totale wachttijd.",
         "",
         "Mogelijke koppelingen (aankomstlocatie = vertreklocatie, genoeg keertijd):",
         "  Rit 1 (aankomst Ede 06:42) → Rit 2 (vertrek Ede 06:50): gap 8 min ✓",
         "  Rit 1 (aankomst Ede 06:42) → Rit 4 (vertrek Ede 07:50): gap 68 min ✓",
-        "  Rit 2 (aankomst Ut 07:32) → geen rit vertrekt uit Ut na 07:32",
         "  Rit 3 (aankomst Ede 07:42) → Rit 4 (vertrek Ede 07:50): gap 8 min ✓",
-        "",
-        "Maximale matching: Rit 1→Rit 2, Rit 3→Rit 4 (2 koppelingen)",
-        "Bussen nodig = 4 ritten - 2 koppelingen = 2 bussen",
-        "",
-        "Resultaat: 2 bussen (gegarandeerd optimaal). Nadeel: optimaliseert niet op wachttijd.",
-    ]
-    for line in matching_lines:
-        ws.cell(row=row, column=1, value=line)
-        row += 1
-    row += 1
-
-    # --- MINCOST ---
-    ws.cell(row=row, column=1, value="C) Min-cost matching (\"optimaal bussen + minimale wachttijd\")")
-    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E79")
-    row += 1
-    mincost_lines = [
-        "Zoals matching, maar bij gelijke aantallen bussen kiest het de verdeling",
-        "met de minste totale wachttijd.",
         "",
         "Mogelijke oplossingen met 2 bussen:",
         "  Optie 1: Bus A: Rit 1→2 (wacht 8 min) | Bus B: Rit 3→4 (wacht 8 min)  → totaal 16 min wacht",
         "  Optie 2: Bus A: Rit 1→4 (wacht 68 min) | Bus B: Rit 3 | Bus C: Rit 2   → 3 bussen, slechter",
         "",
         "Min-cost kiest Optie 1: 2 bussen, 16 minuten totale wachttijd.",
-        "Dit is het beste van beide werelden: minimum bussen EN minimum wachttijd.",
         "",
-        "Resultaat: 2 bussen, 16 min wacht. Dit is de meest volledige optimalisatie.",
+        "NB: Zonder deadhead (huidig model) geeft greedy altijd hetzelfde resultaat.",
+        "Min-cost is noodzakelijk als deadhead/repositionering wordt toegevoegd.",
     ]
     for line in mincost_lines:
         ws.cell(row=row, column=1, value=line)
@@ -2317,9 +2280,9 @@ def main():
         "--algoritme", "-a",
         choices=list(ALGORITHMS.keys()) + ["all"],
         default="all",
-        help="Optimalisatie-algoritme: greedy (snel, heuristisch), "
-             "matching (optimaal min. bussen), mincost (optimaal min. bussen + min. wachttijd), "
-             "all (alle drie). Standaard: all",
+        help="Optimalisatie-algoritme: greedy (snel, optimaal zonder deadhead), "
+             "mincost (optimaal min. bussen + min. wachttijd, ook met deadhead), "
+             "all (beide). Standaard: all",
     )
     parser.add_argument(
         "--keer-dd",
@@ -2439,7 +2402,7 @@ def main():
 
     for algo_idx, algo_key in enumerate(algo_keys):
         algo_name = ALGORITHMS[algo_key][0]
-        algo_short = {"greedy": "greedy", "matching": "matching", "mincost": "mincost"}[algo_key]
+        algo_short = {"greedy": "greedy", "mincost": "mincost"}[algo_key]
 
         if len(algo_keys) > 1:
             print(f"{'='*60}")
@@ -2544,7 +2507,7 @@ def main():
 
     # Header
     cw = 14  # column width per algorithm
-    algo_short_names = {"greedy": "Greedy", "matching": "Matching", "mincost": "Min-cost"}
+    algo_short_names = {"greedy": "Greedy", "mincost": "Min-cost"}
     print(f"{'Output':<40s}", end="")
     for ak in algo_keys:
         print(f" {algo_short_names.get(ak, ak):>{cw}s}", end="")

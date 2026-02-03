@@ -11,10 +11,8 @@ Belangrijkste bevinding (empirisch bewezen met 7.6 miljoen tests):
 
 Dit script laat zien:
   1. WAAROM greedy best-fit = min-cost ZONDER deadhead
-  2. Wat er gebeurt als je NIET best-fit gebruikt (greedy worst-fit)
-  3. Verschil tussen matching (Hopcroft-Karp) en min-cost op wachttijd
-  4. MET DEADHEAD: greedy gebruikt meer bussen dan min-cost
-  5. MET DEADHEAD: greedy heeft meer non-productieve tijd dan min-cost
+  2. MET DEADHEAD: greedy gebruikt meer bussen dan min-cost
+  3. MET DEADHEAD: greedy heeft meer deadhead-tijd dan min-cost
 """
 
 from collections import deque
@@ -64,35 +62,6 @@ def greedy_worstfit(trips, ta):
     return buses
 
 
-def hopcroft_karp(adj, n):
-    ml, mr = [-1] * n, [-1] * n
-    def bfs():
-        d = [0]*n; q = deque()
-        for u in range(n):
-            if ml[u]==-1: d[u]=0; q.append(u)
-            else: d[u]=float('inf')
-        f = False
-        while q:
-            u = q.popleft()
-            for v in adj[u]:
-                w = mr[v]
-                if w == -1: f = True
-                elif d[w] == float('inf'): d[w]=d[u]+1; q.append(w)
-        return f, d
-    def dfs(u, d):
-        for v in adj[u]:
-            w = mr[v]
-            if w == -1 or (d[w]==d[u]+1 and dfs(w,d)):
-                ml[u]=v; mr[v]=u; return True
-        d[u] = float('inf'); return False
-    while True:
-        f, d = bfs()
-        if not f: break
-        for u in range(n):
-            if ml[u]==-1: dfs(u, d)
-    return ml
-
-
 def to_chains(n, ml):
     mt = set(v for v in ml if v != -1); ch = []
     for i in range(n):
@@ -101,16 +70,6 @@ def to_chains(n, ml):
             while ml[cur] != -1: cur = ml[cur]; c.append(cur)
             ch.append(c)
     return ch
-
-
-def matching_alg(trips, ta):
-    n = len(trips)
-    adj = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i+1, n):
-            if can_connect(trips[i], trips[j], ta):
-                adj[i].append(j)
-    return to_chains(n, hopcroft_karp(adj, n))
 
 
 def mincost_alg(trips, ta):
@@ -258,39 +217,6 @@ def zoek_worstfit_busverschil(n_attempts=300000):
             if best is None or n < best[0] or (n == best[0] and wfb - bfb > best[-1]):
                 mc = mincost_alg(trips, ta)
                 best = (n, trips, ta, wf, bf, mc, wfb, bfb, wfi, bfi, wfb - bfb)
-
-    return best
-
-
-def zoek_matching_wachttijd(n_attempts=300000):
-    """Zoek voorbeeld waar matching meer wachttijd heeft dan min-cost."""
-    random.seed(42)
-    locs = ["A", "B", "C", "D"]
-    best = None
-
-    for _ in range(n_attempts):
-        n = random.randint(5, 9)
-        trips = []
-        for __ in range(n):
-            o = random.choice(locs)
-            d = random.choice([l for l in locs if l != o])
-            dep = random.randint(480, 720)
-            dur = random.randint(10, 50)
-            trips.append({"origin": o, "dest": d, "dep": dep,
-                          "arr": dep + dur, "name": f"{o}->{d}"})
-        trips.sort(key=lambda t: (t["dep"], t["arr"]))
-        ta = random.choice([0, 2, 5, 8])
-
-        m = matching_alg(trips, ta)
-        c = mincost_alg(trips, ta)
-        mb, mi = stats(trips, m)
-        cb, ci = stats(trips, c)
-
-        if mb == cb and mi > ci:
-            diff = mi - ci
-            if best is None or (n < best[0]) or (n == best[0] and diff > best[-1]):
-                g = greedy_bestfit(trips, ta)
-                best = (n, trips, ta, g, m, c, mi, ci, diff)
 
     return best
 
@@ -601,36 +527,9 @@ if __name__ == "__main__":
   is met wachten". Zo blijven bussen die al langer staan beschikbaar
   voor latere ritten waarvoor ze misschien de ENIGE optie zijn.""")
 
-    # ─── DEEL 3: Matching vs Min-cost (wachttijd) ──────────────
-    print(f"\n  Zoeken naar matching vs min-cost wachttijdverschil (300.000 tests)...")
-    result_mt = zoek_matching_wachttijd(300000)
-    if result_mt:
-        n, trips, ta, g, m, c, mi, ci, diff = result_mt
-        gb, gi = stats(trips, g)
-        mb = stats(trips, m)[0]
-        toon(
-            f"VOORBEELD 2: Matching wacht={mi}min vs Min-cost wacht={ci}min",
-            trips, ta,
-            [("Greedy best-fit", g),
-             ("Bipartite matching (Hopcroft-Karp)", m),
-             ("Min-cost matching", c)]
-        )
-
-        print(f"""
-  Uitleg:
-  Alle drie vinden {mb} bussen. Maar matching kiest WILLEKEURIG welke
-  koppeling het maakt als er meerdere opties zijn. Het optimaliseert
-  alleen het AANTAL koppelingen, niet de wachttijd.
-
-  - Greedy best-fit: {gi} min wachttijd (lokaal optimaal per stap)
-  - Matching:        {mi} min wachttijd (willekeurig bij gelijke opties)
-  - Min-cost:        {ci} min wachttijd (globaal minimale wachttijd)
-
-  Verschil: {mi - ci} minuten meer wachttijd bij matching.""")
-
-    # ─── DEEL 4: Deadhead - busaantal verschil ─────────────────
+    # ─── DEEL 3: Deadhead - busaantal verschil ─────────────────
     print(f"\n{'='*72}")
-    print("  DEEL 4+5: MET DEADHEAD (lege ritten)")
+    print("  DEEL 3+4: MET DEADHEAD (lege ritten)")
     print(f"{'='*72}")
     print("""
   Ons huidige model staat alleen verbindingen toe waar de bestemming
@@ -651,7 +550,7 @@ if __name__ == "__main__":
     mc_nb1, mc_gap1, mc_dhtot1, mc_idle1 = stats_dh(trips_dh1, mc_dh1, dh1)
 
     toon_dh(
-        f"VOORBEELD 3: Deadhead - Greedy={g_nb1} bussen vs Min-cost={mc_nb1} bussen",
+        f"VOORBEELD 2: Deadhead - Greedy={g_nb1} bussen vs Min-cost={mc_nb1} bussen",
         trips_dh1, ta_dh1, dh1,
         [("Greedy best-fit (met deadhead)", g_dh1),
          ("Min-cost matching (met deadhead)", mc_dh1)]
@@ -675,7 +574,7 @@ if __name__ == "__main__":
   - Greedy:   {g_nb1} bussen, {g_dhtot1} min deadhead
   - Min-cost: {mc_nb1} bussen, {mc_dhtot1} min deadhead""")
 
-    # ─── DEEL 5: Deadhead - wachttijd verschil ──────────────────
+    # ─── DEEL 4: Deadhead - wachttijd verschil ──────────────────
     trips_dh2, ta_dh2, dh2 = voorbeeld_deadhead_wachttijd()
     g_dh2 = greedy_bestfit_dh(trips_dh2, ta_dh2, dh2)
     mc_dh2 = mincost_alg_dh(trips_dh2, ta_dh2, dh2)
@@ -683,7 +582,7 @@ if __name__ == "__main__":
     mc_nb2, mc_gap2, mc_dhtot2, mc_idle2 = stats_dh(trips_dh2, mc_dh2, dh2)
 
     toon_dh(
-        f"VOORBEELD 4: Deadhead - Greedy={g_dhtot2}min vs Min-cost={mc_dhtot2}min deadhead",
+        f"VOORBEELD 3: Deadhead - Greedy={g_dhtot2}min vs Min-cost={mc_dhtot2}min deadhead",
         trips_dh2, ta_dh2, dh2,
         [("Greedy best-fit (met deadhead)", g_dh2),
          ("Min-cost matching (met deadhead)", mc_dh2)]
@@ -712,36 +611,34 @@ if __name__ == "__main__":
     print("  SAMENVATTING")
     print(f"{'='*72}")
     print("""
-  ┌───────────────────────────────────────────────────────────────────┐
-  │ ZONDER DEADHEAD (huidig model)                                   │
-  ├─────────────────────┬────────────┬──────────────┬───────────────┤
-  │                     │  Greedy    │  Matching    │  Min-cost     │
-  │                     │  best-fit  │  (Hopcroft-  │  matching     │
-  │                     │            │   Karp)      │  (SPFA)       │
-  ├─────────────────────┼────────────┼──────────────┼───────────────┤
-  │ Aantal bussen       │  Optimaal  │  Optimaal    │  Optimaal     │
-  │ Totale wachttijd    │  Minimaal  │  Willekeurig │  Minimaal     │
-  │ Snelheid            │  O(n²)     │  O(n^2.5)    │  O(n³)        │
-  ├─────────────────────┼────────────┼──────────────┼───────────────┤
-  │ Greedy = Min-cost   │ altijd     │  ANDERS      │  altijd       │
-  └─────────────────────┴────────────┴──────────────┴───────────────┘
+  ┌───────────────────────────────────────────────────────────┐
+  │ ZONDER DEADHEAD (huidig model)                            │
+  ├─────────────────────┬────────────┬────────────────────────┤
+  │                     │  Greedy    │  Min-cost matching     │
+  │                     │  best-fit  │  (SPFA)                │
+  ├─────────────────────┼────────────┼────────────────────────┤
+  │ Aantal bussen       │  Optimaal  │  Optimaal              │
+  │ Totale wachttijd    │  Minimaal  │  Minimaal              │
+  │ Snelheid            │  O(n²)     │  O(n³)                 │
+  ├─────────────────────┼────────────┼────────────────────────┤
+  │ Resultaat           │  IDENTIEK  │  IDENTIEK              │
+  └─────────────────────┴────────────┴────────────────────────┘
 
-  ┌───────────────────────────────────────────────────────────────────┐
-  │ MET DEADHEAD (uitgebreid model)                                  │
-  ├─────────────────────┬────────────┬───────────────────────────────┤
-  │                     │  Greedy    │  Min-cost matching            │
-  ├─────────────────────┼────────────┼───────────────────────────────┤
-  │ Aantal bussen       │  Soms      │  Altijd optimaal             │
-  │                     │  TEVEEL    │                               │
-  │ Non-productieve tijd│  Soms      │  Altijd minimaal             │
-  │                     │  TEVEEL    │                               │
-  └─────────────────────┴────────────┴───────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────┐
+  │ MET DEADHEAD (uitgebreid model)                           │
+  ├─────────────────────┬────────────┬────────────────────────┤
+  │                     │  Greedy    │  Min-cost matching      │
+  ├─────────────────────┼────────────┼────────────────────────┤
+  │ Aantal bussen       │  Soms      │  Altijd optimaal       │
+  │                     │  TEVEEL    │                         │
+  │ Deadhead-tijd       │  Soms      │  Altijd minimaal       │
+  │                     │  TEVEEL    │                         │
+  └─────────────────────┴────────────┴────────────────────────┘
 
   Conclusie:
-  - ZONDER deadhead: greedy best-fit is het beste (simpel én optimaal)
+  - ZONDER deadhead: greedy best-fit is optimaal (simpel én snel)
   - MET deadhead: min-cost matching is noodzakelijk voor optimaliteit
-  - Of het verschil in de praktijk uitmaakt hangt af van de data
 
   Voor de NS-casus (zonder deadhead):
-  Alle 3 algoritmes vinden 181 bussen met identieke wachttijd.
+  Beide algoritmes vinden 181 bussen met identieke wachttijd.
 """)
