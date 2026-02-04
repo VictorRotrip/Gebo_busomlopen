@@ -2749,7 +2749,10 @@ def main():
         print(f"Deadhead:      niet opgegeven (alleen directe verbindingen)")
     if traffic_data:
         print(f"Traffic:       {args.traffic_matrix} ({n_slots} tijdsloten)")
-    print(f"Uitvoer:       {n_files} bestanden ({n_outputs} outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
+    if snel_mode and deadhead_matrix and len(algos) > 1:
+        print(f"Uitvoer:       {n_files} bestanden ({n_basis} outputs x 1 greedy + 1 output x {len(algos)} algoritmes)")
+    else:
+        print(f"Uitvoer:       {n_files} bestanden ({n_outputs} outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
     print()
 
     # ===== PARSE =====
