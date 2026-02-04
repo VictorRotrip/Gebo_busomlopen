@@ -1544,7 +1544,7 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                                 ws.cell(row=row, column=base_col + 4, value=dh_str)
                                 for cc in range(base_col, base_col + 6):
                                     ws.cell(row=row, column=cc).border = THIN_BORDER
-                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="left")
+                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
                                     ws.cell(row=row, column=cc).fill = DEADHEAD_FILL
                                     ws.cell(row=row, column=cc).font = Font(italic=True, size=9)
                             else:
@@ -2034,7 +2034,7 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
     row = _write_algo_examples(ws, row)
 
     # Column widths (don't override col A width set by _write_algo_examples)
-    widths = [None, 16, 18, 28, 28, 14, 14, 16, 14, 16, 14, 14]
+    widths = [None, 16, 18, 36, 36, 14, 14, 16, 14, 16, 14, 14]
     for j, w in enumerate(widths):
         if w is not None and j < 12:
             ws.column_dimensions[get_column_letter(1 + j)].width = w
