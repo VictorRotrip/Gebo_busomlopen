@@ -1539,11 +1539,12 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                                 dh_min = entry["dh_minutes"]
                                 dh_str = f"{round(dh_min)} min" if dh_min is not None else "?"
                                 ws.cell(row=row, column=base_col, value="Lege rit")
-                                ws.cell(row=row, column=base_col + 1, value=f"{entry['from_name']} → {entry['to_name']}")
+                                ws.cell(row=row, column=base_col + 1, value=entry["from_name"])
+                                ws.cell(row=row, column=base_col + 2, value=entry["to_name"])
                                 ws.cell(row=row, column=base_col + 4, value=dh_str)
                                 for cc in range(base_col, base_col + 6):
                                     ws.cell(row=row, column=cc).border = THIN_BORDER
-                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
+                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="left")
                                     ws.cell(row=row, column=cc).fill = DEADHEAD_FILL
                                     ws.cell(row=row, column=cc).font = Font(italic=True, size=9)
                             else:
@@ -1618,6 +1619,7 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                     ws.cell(row=row, column=4, value=minutes_to_time(rb.end))
                     ws.cell(row=row, column=4).number_format = "HH:MM"
                     ws.cell(row=row, column=5, value=rb.remark)
+                    ws.cell(row=row, column=5).alignment = Alignment(wrap_text=True)
                     for cc in range(1, 6):
                         ws.cell(row=row, column=cc).border = THIN_BORDER
                     row += 1
