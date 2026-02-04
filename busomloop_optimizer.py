@@ -888,9 +888,122 @@ def create_reserve_trips(reserves: list, all_trips: list) -> list:
     return reserve_trips
 
 
+# ---------------------------------------------------------------------------
+# Traffic-aware risk analysis
+# ---------------------------------------------------------------------------
+
+def get_time_slot(departure_minutes: int, is_weekend: bool = False) -> str:
+    """Determine the time slot for a trip based on departure time.
+
+    departure_minutes: minutes from midnight.
+    Returns the time slot name (e.g. 'ochtendspits', 'dal', 'weekend').
+    """
+    if is_weekend:
+        return "weekend"
+    from google_maps_distances import TIME_SLOTS
+    for slot_name in ["nacht", "ochtendspits", "dal", "middagspits", "avond"]:
+        lo, hi = TIME_SLOTS[slot_name]["range"]
+        if lo <= departure_minutes < hi:
+            return slot_name
+    return "avond"  # fallback for exactly midnight
+
+
+def is_weekend_date(date_str: str) -> bool:
+    """Check if a date string like 'za 13-06-2026' is a weekend day."""
+    if not date_str:
+        return False
+    prefix = date_str.strip().split()[0].lower()
+    return prefix in ("za", "zo")
+
+
+def compute_trip_turnaround_overrides(
+    trips: list,
+    traffic_data: dict,
+    base_turnaround_map: dict,
+) -> tuple[dict, list]:
+    """Compute per-trip turnaround time overrides based on traffic risk.
+
+    For each trip, compares the scheduled duration against the Google Maps
+    traffic-aware driving time for the trip's time slot. If the Google Maps
+    time exceeds the scheduled time (negative buffer), the excess is added
+    to the turnaround time for that trip.
+
+    Args:
+        trips: list of Trip objects
+        traffic_data: {"time_slots": {slot: {orig: {dest: min}}}, "baseline": {...}}
+        base_turnaround_map: {bus_type: minutes} default turnaround
+
+    Returns:
+        (overrides, report)
+        overrides: {trip_id: adjusted_turnaround_minutes}
+        report: list of dicts with per-trip risk details for Excel output
+    """
+    time_slots = traffic_data.get("time_slots", {})
+    baseline = traffic_data.get("baseline", {})
+    overrides = {}
+    report = []
+
+    for trip in trips:
+        if trip.is_reserve:
+            continue
+
+        is_we = is_weekend_date(trip.date_str)
+        slot = get_time_slot(trip.departure, is_we)
+        base_turn = base_turnaround_map.get(trip.bus_type, 8)
+
+        origin_loc = normalize_location(trip.origin_code)
+        dest_loc = normalize_location(trip.dest_code)
+        scheduled_dur = trip.duration
+
+        # Get traffic-aware driving time for this slot
+        slot_matrix = time_slots.get(slot, {})
+        traffic_min = slot_matrix.get(origin_loc, {}).get(dest_loc)
+        baseline_min = baseline.get(origin_loc, {}).get(dest_loc)
+
+        if traffic_min is not None and scheduled_dur > 0:
+            buffer = scheduled_dur - traffic_min
+            if buffer < 0:
+                # Negative buffer: trip takes longer than scheduled under traffic
+                # Add the deficit to turnaround time
+                extra = abs(buffer)
+                adjusted = base_turn + extra
+                overrides[trip.trip_id] = round(adjusted, 1)
+            else:
+                adjusted = base_turn
+                extra = 0.0
+        else:
+            buffer = None
+            adjusted = base_turn
+            extra = 0.0
+            traffic_min = None
+
+        report.append({
+            "trip_id": trip.trip_id,
+            "service": trip.service,
+            "direction": trip.direction,
+            "origin": trip.origin_name,
+            "dest": trip.dest_name,
+            "departure": trip.departure,
+            "arrival": trip.arrival,
+            "scheduled_min": scheduled_dur,
+            "time_slot": slot,
+            "traffic_min": round(traffic_min, 1) if traffic_min is not None else None,
+            "baseline_min": round(baseline_min, 1) if baseline_min is not None else None,
+            "buffer_min": round(buffer, 1) if buffer is not None else None,
+            "base_turnaround": base_turn,
+            "extra_turnaround": round(extra, 1),
+            "adjusted_turnaround": round(adjusted, 1),
+            "risk": "HOOG" if (buffer is not None and buffer < 0) else
+                    "MATIG" if (buffer is not None and buffer < 5) else "OK",
+        })
+
+    return overrides, report
+
+
 def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
                 service_constraint: bool = False,
-                deadhead_matrix: dict = None) -> tuple:
+                deadhead_matrix: dict = None,
+                trip_turnaround_overrides: dict = None) -> tuple:
     """Check if a bus finishing prev_trip can start next_trip.
 
     If service_constraint=True, two real (non-reserve) trips must belong to
@@ -899,6 +1012,10 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
     deadhead_matrix: optional dict {origin: {dest: minutes}} for repositioning.
     If provided, allows connections where dest != origin if the bus can drive
     there in time (deadhead).
+
+    trip_turnaround_overrides: optional dict {trip_id: minutes} for per-trip
+    turnaround time overrides (from traffic risk analysis). If present, uses
+    the override for prev_trip instead of the bus-type default.
 
     Returns (connectable: bool, deadhead_time: float).
     deadhead_time is 0 if same location, or the driving time in minutes if
@@ -933,7 +1050,11 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
     if prev_trip.is_reserve or next_trip.is_reserve:
         min_turnaround = 0
     else:
-        min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+        # Check per-trip override first, then fall back to bus-type default
+        if trip_turnaround_overrides and prev_trip.trip_id in trip_turnaround_overrides:
+            min_turnaround = trip_turnaround_overrides[prev_trip.trip_id]
+        else:
+            min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
 
     gap = next_trip.departure - prev_trip.arrival
     # Gap must accommodate both deadhead driving and turnaround time
@@ -973,7 +1094,7 @@ def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
 # ---------------------------------------------------------------------------
 
 def _optimize_greedy(group_trips, turnaround_map, service_constraint=False,
-                     deadhead_matrix=None):
+                     deadhead_matrix=None, trip_turnaround_overrides=None):
     """Greedy best-fit: assign each trip to the bus with shortest idle time."""
     group_trips.sort(key=lambda t: (t.departure, t.arrival))
     buses = []  # list of lists of trip indices
@@ -985,7 +1106,7 @@ def _optimize_greedy(group_trips, turnaround_map, service_constraint=False,
         for bus in buses:
             last = group_trips[bus[-1]]
             ok, _dh = can_connect(last, trip, turnaround_map, service_constraint,
-                                  deadhead_matrix)
+                                  deadhead_matrix, trip_turnaround_overrides)
             if ok:
                 gap = trip.departure - last.arrival
                 if gap < best_gap:
@@ -1080,7 +1201,7 @@ def _matching_to_chains(n, match_l):
 # ---------------------------------------------------------------------------
 
 def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
-                      deadhead_matrix=None):
+                      deadhead_matrix=None, trip_turnaround_overrides=None):
     """
     Min-cost max matching via successive shortest path (SPFA).
     Minimizes number of buses (primary) and total deadhead+idle time (secondary).
@@ -1097,7 +1218,8 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
     for i in range(n):
         for j in range(i + 1, n):
             ok, dh = can_connect(group_trips[i], group_trips[j], turnaround_map,
-                                 service_constraint, deadhead_matrix)
+                                 service_constraint, deadhead_matrix,
+                                 trip_turnaround_overrides)
             if ok:
                 idle = group_trips[j].departure - group_trips[i].arrival
                 # Weight deadhead more heavily: it costs fuel and driver time
@@ -1200,7 +1322,8 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
                        algorithm: str = "greedy",
                        per_service: bool = False,
                        service_constraint: bool = False,
-                       deadhead_matrix: dict = None) -> list:
+                       deadhead_matrix: dict = None,
+                       trip_turnaround_overrides: dict = None) -> list:
     """
     Optimize bus rotations using the specified algorithm.
 
@@ -1209,6 +1332,7 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
     If service_constraint=True (only when per_service=False), real-to-real trip
     connections must be within the same service; reserve trips can bridge services.
     deadhead_matrix: optional {origin: {dest: minutes}} for repositioning trips.
+    trip_turnaround_overrides: optional {trip_id: minutes} for per-trip turnaround.
     """
     groups, turnaround_map = _group_trips(trips, turnaround_map)
     algo_name, algo_func = ALGORITHMS[algorithm]
@@ -1228,7 +1352,8 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
             date_str, bus_type = key[0], key[1]
             chains = algo_func(group_trips, turnaround_map,
                                service_constraint=False,
-                               deadhead_matrix=deadhead_matrix)
+                               deadhead_matrix=deadhead_matrix,
+                               trip_turnaround_overrides=trip_turnaround_overrides)
             rotations, rotation_counter = _build_rotations(
                 group_trips, date_str, bus_type, chains, rotation_counter
             )
@@ -1241,7 +1366,8 @@ def optimize_rotations(trips: list, turnaround_map: dict = None,
     for (date_str, bus_type), group_trips in sorted(groups.items()):
         chains = algo_func(group_trips, turnaround_map,
                            service_constraint=service_constraint,
-                           deadhead_matrix=deadhead_matrix)
+                           deadhead_matrix=deadhead_matrix,
+                           trip_turnaround_overrides=trip_turnaround_overrides)
         rotations, rotation_counter = _build_rotations(
             group_trips, date_str, bus_type, chains, rotation_counter
         )
@@ -2322,9 +2448,100 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
         ws.column_dimensions[get_column_letter(1 + j)].width = w
 
 
+def write_risk_analysis_sheet(wb_out, risk_report: list):
+    """Write a risk analysis sheet showing per-trip traffic risk and turnaround adjustments."""
+    ws = wb_out.create_sheet(title="Risico-analyse")
+
+    row = 1
+    ws.cell(row=row, column=1, value="Risico-analyse: Verkeersinvloed op keertijden")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14)
+    row += 2
+
+    # Summary
+    n_total = len(risk_report)
+    n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
+    n_medium = sum(1 for r in risk_report if r["risk"] == "MATIG")
+    n_ok = sum(1 for r in risk_report if r["risk"] == "OK")
+
+    ws.cell(row=row, column=1, value="Samenvatting:")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=11)
+    row += 1
+    ws.cell(row=row, column=1, value=f"Totaal ritten geanalyseerd: {n_total}")
+    row += 1
+    ws.cell(row=row, column=1, value=f"Hoog risico (buffer < 0 min): {n_high}")
+    ws.cell(row=row, column=1).font = Font(color="FF0000")
+    row += 1
+    ws.cell(row=row, column=1, value=f"Matig risico (buffer < 5 min): {n_medium}")
+    ws.cell(row=row, column=1).font = Font(color="FF8C00")
+    row += 1
+    ws.cell(row=row, column=1, value=f"OK (buffer >= 5 min): {n_ok}")
+    ws.cell(row=row, column=1).font = Font(color="008000")
+    row += 2
+
+    # Detail table
+    headers = [
+        "Rit ID", "Busdienst", "Richting", "Van", "Naar",
+        "Vertrek", "Aankomst", "Gepland (min)", "Tijdslot",
+        "Verkeer (min)", "Baseline (min)", "Buffer (min)",
+        "Basis keertijd", "Extra keertijd", "Aangepaste keertijd", "Risico",
+    ]
+
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=c, value=h)
+        cell.font = HEADER_FONT_WHITE
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = THIN_BORDER
+    row += 1
+
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    orange_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+    # Sort by risk: HOOG first, then MATIG, then OK
+    risk_order = {"HOOG": 0, "MATIG": 1, "OK": 2}
+    sorted_report = sorted(risk_report,
+                          key=lambda r: (risk_order.get(r["risk"], 9), -(r["buffer_min"] or 999)))
+
+    def _time_str(minutes):
+        if minutes is None:
+            return ""
+        h, m = divmod(int(minutes) % 1440, 60)
+        return f"{h:02d}:{m:02d}"
+
+    for r in sorted_report:
+        vals = [
+            r["trip_id"], r["service"], r["direction"], r["origin"], r["dest"],
+            _time_str(r["departure"]), _time_str(r["arrival"]), r["scheduled_min"],
+            r["time_slot"], r["traffic_min"], r["baseline_min"], r["buffer_min"],
+            r["base_turnaround"], r["extra_turnaround"], r["adjusted_turnaround"],
+            r["risk"],
+        ]
+        if r["risk"] == "HOOG":
+            fill = red_fill
+        elif r["risk"] == "MATIG":
+            fill = orange_fill
+        else:
+            fill = green_fill
+
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=row, column=c, value=v)
+            cell.border = THIN_BORDER
+            cell.fill = fill
+            if c >= 6:
+                cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    # Column widths
+    widths = [18, 25, 10, 22, 22, 8, 8, 12, 16, 12, 12, 12, 14, 14, 16, 10]
+    for c, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
                     turnaround_map: dict = None, algorithm: str = "greedy",
-                    include_sensitivity: bool = False, output_mode: int = 1):
+                    include_sensitivity: bool = False, output_mode: int = 1,
+                    risk_report: list = None):
     """Generate the complete output Excel workbook.
 
     output_mode:
@@ -2332,6 +2549,7 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
         2 = per dienst + optimal idle reserve matching
         3 = per dienst + reserve phantom trips
         4 = gecombineerd + reserve phantom trips + sensitivity
+    risk_report: optional list of dicts from compute_trip_turnaround_overrides.
     """
     wb = openpyxl.Workbook()
     # Remove default sheet
@@ -2353,6 +2571,10 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
     # Tab 5 (optional): Sensitiviteitsanalyse
     if include_sensitivity:
         write_sensitivity_sheet(wb, all_trips, turnaround_map, algorithm)
+
+    # Tab 6 (optional): Risico-analyse
+    if risk_report:
+        write_risk_analysis_sheet(wb, risk_report)
 
     wb.save(output_file)
     return output_file
@@ -2420,6 +2642,13 @@ def main():
              "Gegenereerd door google_maps_distances.py. "
              "Als opgegeven, mogen bussen lege ritten maken tussen stations.",
     )
+    parser.add_argument(
+        "--traffic-matrix",
+        default=None,
+        help="JSON bestand met traffic-aware matrices (per tijdslot). "
+             "Gegenereerd door google_maps_distances.py --traffic. "
+             "Wordt gebruikt voor risico-analyse in output 4.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -2451,6 +2680,22 @@ def main():
     else:
         dh_locs = 0
 
+    # Load traffic-aware matrix for risk analysis (output 4)
+    traffic_data = None
+    if args.traffic_matrix:
+        tm_path = Path(args.traffic_matrix)
+        if not tm_path.exists():
+            print(f"WAARSCHUWING: Traffic matrix '{args.traffic_matrix}' niet gevonden, "
+                  "risico-analyse wordt overgeslagen")
+        else:
+            try:
+                from google_maps_distances import load_matrix_from_cache_traffic
+                traffic_data = load_matrix_from_cache_traffic(str(tm_path))
+                n_slots = len(traffic_data.get("time_slots", {}))
+                print(f"Traffic matrix geladen: {n_slots} tijdsloten + baseline")
+            except Exception as e:
+                print(f"WAARSCHUWING: Traffic matrix kon niet geladen worden: {e}")
+
     n_outputs = 4 if deadhead_matrix else 3
     n_files = len(algos) * n_outputs
 
@@ -2462,6 +2707,8 @@ def main():
         print(f"Deadhead:      {args.deadhead} ({dh_locs} locaties)")
     else:
         print(f"Deadhead:      niet opgegeven (alleen directe verbindingen)")
+    if traffic_data:
+        print(f"Traffic:       {args.traffic_matrix} ({n_slots} tijdsloten)")
     print(f"Uitvoer:       {n_files} bestanden ({n_outputs} outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
     print()
 
@@ -2630,13 +2877,30 @@ def main():
 
         # ---------------------------------------------------------------
         # OUTPUT 4: Gecombineerd + reserves + deadhead (lege ritten)
+        # + risk-based turnaround when traffic data available
         # Only generated when --deadhead is provided
         # ---------------------------------------------------------------
         if deadhead_matrix:
-            print(f"  Output 4 - Gecombineerd + reserves + deadhead (lege ritten)...")
+            risk_report = None
+            trip_overrides = None
+            if traffic_data and traffic_data.get("time_slots"):
+                print(f"  Risico-analyse: keertijden berekenen op basis van verkeerssituatie...")
+                trip_overrides, risk_report = compute_trip_turnaround_overrides(
+                    trips_with_reserves, traffic_data, baseline_turnaround)
+                n_overrides = len(trip_overrides)
+                n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
+                n_medium = sum(1 for r in risk_report if r["risk"] == "MATIG")
+                print(f"    {n_overrides} ritten met verhoogde keertijd, "
+                      f"{n_high} hoog risico, {n_medium} matig risico")
+
+            label = "Output 4 - Gecombineerd + reserves + deadhead"
+            if trip_overrides:
+                label += " + risico-keertijden"
+            print(f"  {label}...")
             rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                       algorithm=algo_key,
-                                      deadhead_matrix=deadhead_matrix)
+                                      deadhead_matrix=deadhead_matrix,
+                                      trip_turnaround_overrides=trip_overrides)
             n4_with_trips = len([r for r in rot4 if r.real_trips])
             n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
             n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
@@ -2648,7 +2912,8 @@ def main():
 
             file4 = f"{output_base}_{algo_short}_4_gecombineerd_deadhead.xlsx"
             generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
-                            include_sensitivity=True, output_mode=4)
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report)
             print(f"    -> {file4}")
 
             algo_results[4] = {"rotations": rot4, "buses_met_ritten": n4_with_trips,

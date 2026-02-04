@@ -6,7 +6,7 @@ Google Maps Distance Matrix API. Produces:
 
 1. A deadhead matrix (travel time in minutes between all station pairs)
 2. A validation report comparing scheduled trip durations to Google Maps times
-3. A traffic sensitivity analysis (where buffers are thin)
+3. A traffic-aware risk analysis (per time slot: rush, off-peak, night, weekend)
 
 Stations are automatically discovered from the input Excel file (same file
 used by busomloop_optimizer.py), so this script works with any input file
@@ -14,8 +14,9 @@ without hardcoded station lists.
 
 Usage:
     python google_maps_distances.py --input casus.xlsx --key API_KEY
-    python google_maps_distances.py --input casus.xlsx --verify        # check addresses first
-    python google_maps_distances.py --input casus.xlsx                 # uses key from .env
+    python google_maps_distances.py --input casus.xlsx --traffic   # fetch 6 time-slot matrices
+    python google_maps_distances.py --input casus.xlsx --verify    # check addresses first
+    python google_maps_distances.py --input casus.xlsx             # uses key from .env
     python google_maps_distances.py --from-cache deadhead_matrix.json --validate output.xlsx
 
 API key can be provided via --key or in a .env file:
@@ -34,6 +35,17 @@ import requests
 
 API_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+# Time slot definitions for traffic-aware matrix fetching.
+# Ranges are in minutes from midnight.
+TIME_SLOTS = {
+    "nacht":        {"range": (0, 360),    "fetch_hour": 2,  "label": "Nacht (00:00-06:00)"},
+    "ochtendspits": {"range": (360, 570),  "fetch_hour": 8,  "label": "Ochtendspits (06:00-09:30)"},
+    "dal":          {"range": (570, 930),  "fetch_hour": 12, "label": "Daluren (09:30-15:30)"},
+    "middagspits":  {"range": (930, 1110), "fetch_hour": 17, "label": "Middagspits (15:30-18:30)"},
+    "avond":        {"range": (1110, 1440),"fetch_hour": 21, "label": "Avond (18:30-00:00)"},
+    "weekend":      {"range": (0, 1440),   "fetch_hour": 12, "label": "Weekend (hele dag)"},
+}
 
 
 def load_dotenv():
@@ -115,11 +127,14 @@ def normalize_display_name(name: str) -> str:
 
 
 def fetch_distance_matrix(api_key: str, locations: list[str],
-                          addresses: dict, batch_size: int = 10) -> dict:
+                          addresses: dict, batch_size: int = 10,
+                          departure_time: int = None) -> dict:
     """Fetch full NxN distance matrix from Google Maps.
 
     locations: list of canonical location keys.
     addresses: dict {canonical_key: Google Maps address string}.
+    departure_time: optional Unix timestamp for traffic-aware results.
+                    When set, uses duration_in_traffic instead of duration.
 
     Returns dict: {(origin, dest): {"distance_m": int, "duration_s": int,
                                      "duration_min": float, "distance_km": float}}
@@ -152,6 +167,8 @@ def fetch_distance_matrix(api_key: str, locations: list[str],
                 "mode": "driving",
                 "language": "nl",
             }
+            if departure_time is not None:
+                params["departure_time"] = departure_time
 
             print(f"  Fetching {len(origin_locs)}x{len(dest_locs)} "
                   f"({origin_locs[0]}..{origin_locs[-1]} -> "
@@ -194,10 +211,15 @@ def fetch_distance_matrix(api_key: str, locations: list[str],
                     o = origin_locs[ri]
                     d = dest_locs[ci]
                     if element["status"] == "OK":
+                        # Prefer duration_in_traffic when available (traffic-aware)
+                        if "duration_in_traffic" in element:
+                            dur_s = element["duration_in_traffic"]["value"]
+                        else:
+                            dur_s = element["duration"]["value"]
                         matrix[(o, d)] = {
                             "distance_m": element["distance"]["value"],
-                            "duration_s": element["duration"]["value"],
-                            "duration_min": round(element["duration"]["value"] / 60, 1),
+                            "duration_s": dur_s,
+                            "duration_min": round(dur_s / 60, 1),
                             "distance_km": round(element["distance"]["value"] / 1000, 1),
                         }
                     else:
@@ -223,6 +245,13 @@ def save_deadhead_json(matrix: dict, locations: list[str], output_file: str):
                 deadhead[o][d] = entry["duration_min"]
     with open(output_file, "w") as f:
         json.dump(deadhead, f, indent=2, ensure_ascii=False)
+    print(f"Deadhead JSON saved to {output_file}")
+
+
+def save_deadhead_json_from_nested(nested_dict: dict, output_file: str):
+    """Save a nested {origin: {dest: minutes}} dict as deadhead JSON."""
+    with open(output_file, "w") as f:
+        json.dump(nested_dict, f, indent=2, ensure_ascii=False)
     print(f"Deadhead JSON saved to {output_file}")
 
 
@@ -633,6 +662,146 @@ def print_route_analysis(matrix: dict):
             print(f"  {o} -> {d}: {mins:.0f} min ({km_str})")
 
 
+# ---------------------------------------------------------------------------
+# Traffic-aware matrix fetching
+# ---------------------------------------------------------------------------
+
+def extract_dates_from_input(input_file: str) -> tuple[str, str | None]:
+    """Pick one weekday and one weekend day from the input Excel's trip dates.
+
+    Returns (weekday_date_str, weekend_date_str_or_None).
+    The weekday with the most trips is chosen; for weekend the first Saturday.
+    """
+    from busomloop_optimizer import parse_all_sheets
+    all_trips, _, _ = parse_all_sheets(input_file)
+    weekday_counts = {}  # date_str -> count
+    weekend_dates = []
+    for t in all_trips:
+        ds = t.date_str  # e.g. "do 11-06-2026"
+        prefix = ds.split()[0].lower() if ds else ""
+        if prefix in ("za", "zo"):
+            if ds not in weekend_dates:
+                weekend_dates.append(ds)
+        else:
+            weekday_counts[ds] = weekday_counts.get(ds, 0) + 1
+
+    # Pick weekday with most trips
+    best_weekday = max(weekday_counts, key=weekday_counts.get) if weekday_counts else None
+    best_weekend = weekend_dates[0] if weekend_dates else None
+    return best_weekday, best_weekend
+
+
+def _parse_date_str(date_str: str) -> datetime.date:
+    """Parse a date string like 'do 11-06-2026' to a datetime.date."""
+    parts = date_str.strip().split()
+    date_part = parts[-1]  # '11-06-2026'
+    day, month, year = date_part.split("-")
+    return datetime.date(int(year), int(month), int(day))
+
+
+def _make_departure_timestamp(date_str: str, hour: int) -> int:
+    """Create a Unix timestamp for a given date and hour (local time)."""
+    d = _parse_date_str(date_str)
+    dt = datetime.datetime(d.year, d.month, d.day, hour, 0, 0)
+    # Use UTC offset for Netherlands (CET = +1, CEST = +2)
+    # Approximate: summer months (April-October) use CEST (+2), rest CET (+1)
+    if 4 <= d.month <= 10:
+        utc_offset = 2
+    else:
+        utc_offset = 1
+    utc_dt = dt - datetime.timedelta(hours=utc_offset)
+    epoch = datetime.datetime(1970, 1, 1)
+    return int((utc_dt - epoch).total_seconds())
+
+
+def fetch_traffic_aware_matrix(api_key: str, locations: list[str],
+                                addresses: dict, weekday_date: str,
+                                weekend_date: str = None,
+                                batch_size: int = 10) -> dict:
+    """Fetch distance matrices for all time slots.
+
+    Returns dict: {"time_slots": {slot_name: {origin: {dest: minutes}}},
+                   "baseline": {origin: {dest: minutes}}}
+    """
+    result = {"time_slots": {}, "baseline": {}}
+
+    # Weekday slots
+    weekday_slots = ["nacht", "ochtendspits", "dal", "middagspits", "avond"]
+    for slot_name in weekday_slots:
+        slot_info = TIME_SLOTS[slot_name]
+        ts = _make_departure_timestamp(weekday_date, slot_info["fetch_hour"])
+        print(f"\n--- Tijdslot: {slot_info['label']} (departure_time={ts}) ---")
+        matrix = fetch_distance_matrix(api_key, locations, addresses,
+                                       batch_size=batch_size,
+                                       departure_time=ts)
+        # Convert to nested dict format
+        slot_data = {}
+        for o in locations:
+            slot_data[o] = {}
+            for d in locations:
+                entry = matrix.get((o, d))
+                if entry and entry["duration_min"] is not None:
+                    slot_data[o][d] = entry["duration_min"]
+        result["time_slots"][slot_name] = slot_data
+
+    # Weekend slot
+    if weekend_date:
+        slot_info = TIME_SLOTS["weekend"]
+        ts = _make_departure_timestamp(weekend_date, slot_info["fetch_hour"])
+        print(f"\n--- Tijdslot: {slot_info['label']} (departure_time={ts}) ---")
+        matrix = fetch_distance_matrix(api_key, locations, addresses,
+                                       batch_size=batch_size,
+                                       departure_time=ts)
+        slot_data = {}
+        for o in locations:
+            slot_data[o] = {}
+            for d in locations:
+                entry = matrix.get((o, d))
+                if entry and entry["duration_min"] is not None:
+                    slot_data[o][d] = entry["duration_min"]
+        result["time_slots"]["weekend"] = slot_data
+    else:
+        print("\nGeen weekenddag gevonden in de input, weekend-slot wordt overgeslagen.")
+
+    # Baseline = fetch without departure_time (no traffic)
+    print(f"\n--- Baseline (geen verkeer) ---")
+    matrix = fetch_distance_matrix(api_key, locations, addresses,
+                                   batch_size=batch_size,
+                                   departure_time=None)
+    for o in locations:
+        result["baseline"][o] = {}
+        for d in locations:
+            entry = matrix.get((o, d))
+            if entry and entry["duration_min"] is not None:
+                result["baseline"][o][d] = entry["duration_min"]
+
+    return result
+
+
+def save_traffic_aware_json(traffic_data: dict, output_file: str):
+    """Save traffic-aware matrix data to JSON."""
+    with open(output_file, "w") as f:
+        json.dump(traffic_data, f, indent=2, ensure_ascii=False)
+    n_slots = len(traffic_data.get("time_slots", {}))
+    print(f"Traffic-aware JSON saved to {output_file} ({n_slots} tijdsloten + baseline)")
+
+
+def load_matrix_from_cache_traffic(cache_file: str) -> dict:
+    """Load traffic-aware or legacy matrix from cached JSON.
+
+    If the file has "time_slots" key, returns the full traffic-aware structure.
+    Otherwise, wraps legacy flat format as baseline-only.
+    """
+    with open(cache_file) as f:
+        data = json.load(f)
+
+    if "time_slots" in data:
+        return data
+
+    # Legacy flat format: {origin: {dest: minutes}}
+    return {"time_slots": {}, "baseline": data}
+
+
 def extract_stations_from_input(input_file: str) -> tuple[dict, dict]:
     """Extract stations and halt info from input Excel using the optimizer's parser.
 
@@ -733,6 +902,12 @@ def main():
                         help="Alleen adressen verifiëren via Geocoding API (geen matrix ophalen). "
                              "Laat zien wat Google Maps per station oplost, zodat je kunt "
                              "controleren of de locaties kloppen voordat je de matrix ophaalt.")
+    parser.add_argument("--traffic", action="store_true",
+                        help="Haal 6 tijdslot-matrices op (nacht, ochtendspits, dal, "
+                             "middagspits, avond, weekend) voor risico-analyse. "
+                             "Slaat op als traffic_matrix.json.")
+    parser.add_argument("--traffic-json", default="traffic_matrix.json",
+                        help="Output JSON file for traffic-aware matrix (default: traffic_matrix.json)")
     args = parser.parse_args()
 
     # Load API key from .env if not provided on command line
@@ -772,6 +947,31 @@ def main():
             print("\nFOUT: --verify vereist --input EXCEL_BESTAND")
             sys.exit(1)
         verify_addresses(args.key, addresses)
+        return
+
+    # Traffic-aware mode: fetch 6 time-slot matrices + baseline
+    if args.traffic:
+        if not args.key:
+            print("\nFOUT: --traffic vereist een API key (--key of GOOGLE_MAPS_API_KEY in .env)")
+            sys.exit(1)
+        if not args.input:
+            print("\nFOUT: --traffic vereist --input EXCEL_BESTAND")
+            sys.exit(1)
+        print(f"\nDatums bepalen uit invoerbestand...")
+        weekday_date, weekend_date = extract_dates_from_input(args.input)
+        print(f"  Weekdag: {weekday_date}")
+        print(f"  Weekend: {weekend_date or '(geen)'}")
+        n_slots = 5 + (1 if weekend_date else 0) + 1  # weekday slots + weekend + baseline
+        n_elements = len(locations) ** 2
+        print(f"\nFetching {n_slots} matrices x {len(locations)}x{len(locations)} = "
+              f"{n_slots * n_elements} API-elementen...")
+        traffic_data = fetch_traffic_aware_matrix(
+            args.key, locations, addresses, weekday_date, weekend_date)
+        save_traffic_aware_json(traffic_data, args.traffic_json)
+        # Also save baseline as standard deadhead matrix
+        save_deadhead_json_from_nested(traffic_data["baseline"], args.json_output)
+        print(f"\nTraffic-aware matrix opgeslagen. Gebruik --deadhead {args.json_output} "
+              f"en --traffic-matrix {args.traffic_json} in de optimizer.")
         return
 
     # Load or fetch matrix
