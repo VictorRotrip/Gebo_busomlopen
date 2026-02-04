@@ -968,10 +968,10 @@ def compute_trip_turnaround_overrides(
                 # Negative buffer: trip takes longer than scheduled under traffic
                 # Add the deficit to turnaround time
                 extra = abs(buffer)
-                adjusted = base_turn + extra
+                adjusted = max(base_turn + extra, 2)
                 overrides[trip.trip_id] = round(adjusted, 1)
             else:
-                adjusted = base_turn
+                adjusted = max(base_turn, 2)
                 extra = 0.0
         else:
             buffer = None
@@ -1057,6 +1057,8 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
             min_turnaround = trip_turnaround_overrides[prev_trip.trip_id]
         else:
             min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+        # Absolute minimum: never go below 2 minutes for real trips
+        min_turnaround = max(min_turnaround, 2)
 
     gap = next_trip.departure - prev_trip.arrival
     # Gap must accommodate both deadhead driving and turnaround time
