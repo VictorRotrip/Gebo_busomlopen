@@ -1509,7 +1509,7 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
                         if trip_idx < len(bus.trips):
                             t = bus.trips[trip_idx]
                             if t.is_reserve:
-                                ws.cell(row=row, column=base_col, value=f"RESERVE {t.origin_name}")
+                                ws.cell(row=row, column=base_col, value="RESERVE")
                             else:
                                 ws.cell(row=row, column=base_col, value=t.origin_name)
                             ws.cell(row=row, column=base_col + 1, value=t.dest_name)
