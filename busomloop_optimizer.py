@@ -2308,7 +2308,10 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
     """
     Tab: Sensitiviteitsanalyse - shows impact of different turnaround times.
     For each bus type present in the data, varies turnaround time and shows bus count.
+    Always uses greedy algorithm for speed (mincost would be too slow for ~40+ runs).
     """
+    # Always use greedy for sensitivity: mincost is too slow for many iterations
+    sens_algo = "greedy"
     ws = wb_out.create_sheet(title="Sensitiviteit")
     row = 1
     ws.cell(row=row, column=1, value="Sensitiviteitsanalyse Keertijden")
@@ -2318,7 +2321,7 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
     ws.cell(row=row, column=1, value="Wat als de minimale keertijd anders is? Hoeveel bussen zijn er dan nodig?")
     ws.cell(row=row, column=1).font = Font(italic=True)
     row += 1
-    ws.cell(row=row, column=1, value=f"Algoritme: {ALGORITHMS[algorithm][0]}")
+    ws.cell(row=row, column=1, value=f"Algoritme: {ALGORITHMS[sens_algo][0]} (sensitiviteit altijd greedy)")
     row += 2
 
     # Get bus types present in real trips only
@@ -2356,7 +2359,7 @@ def write_sensitivity_sheet(wb_out, all_trips: list, base_turnaround_map: dict,
         for tv in test_values:
             test_map = dict(base_turnaround_map)
             test_map[bus_type] = tv
-            rots = optimize_rotations(all_trips, test_map, algorithm=algorithm)
+            rots = optimize_rotations(all_trips, test_map, algorithm=sens_algo)
             bt_rots = [r for r in rots if r.bus_type == bus_type and r.real_trips]
             n_buses = len(bt_rots)
             ride = sum(r.total_ride_minutes for r in bt_rots)
@@ -2901,9 +2904,10 @@ def main():
             print(f"    Totale wachttijd: {n1_idle} min ({n1_idle / 60:.1f} uur)")
 
             file1 = f"{output_base}_{algo_short}_1_per_dienst.xlsx"
+            print(f"    Schrijven {file1}...", end=" ", flush=True)
             generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, algo_key,
                             output_mode=1)
-            print(f"    -> {file1}")
+            print("OK")
 
             algo_results[1] = {"rotations": rot1, "buses_met_ritten": n1,
                                "reserve_bussen": total_reserves, "idle_min": n1_idle,
@@ -2914,8 +2918,10 @@ def main():
             # ---------------------------------------------------------------
             print(f"  Output 2 - Per dienst + optimale reserve matching...")
             file2 = f"{output_base}_{algo_short}_2_per_dienst_reservematch.xlsx"
+            print(f"    Schrijven {file2}...", end=" ", flush=True)
             generate_output(rot1, all_trips, reserves, file2, baseline_turnaround, algo_key,
                             output_mode=2)
+            print("OK")
 
             idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
             idle_covered = sum(min(c["covered"], c["required"]) for c in idle_cov)
@@ -2923,7 +2929,6 @@ def main():
             print(f"    {n1} bussen met ritten + {n2_reserve_bussen} reserve = {n1 + n2_reserve_bussen} totaal")
             print(f"    ({idle_covered}/{total_reserves} reserves gedekt door bestaande bussen)")
             print(f"    Totale wachttijd: {n1_idle} min ({n1_idle / 60:.1f} uur)")
-            print(f"    -> {file2}")
 
             algo_results[2] = {"rotations": rot1, "buses_met_ritten": n1,
                                "reserve_bussen": n2_reserve_bussen, "idle_min": n1_idle,
@@ -2945,9 +2950,10 @@ def main():
             print(f"    Totale wachttijd: {n3_idle} min ({n3_idle / 60:.1f} uur)")
 
             file3 = f"{output_base}_{algo_short}_3_gecombineerd_met_reserve.xlsx"
+            print(f"    Schrijven {file3}...", end=" ", flush=True)
             generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4)
-            print(f"    -> {file3}")
+            print("OK")
 
             algo_results[3] = {"rotations": rot3, "buses_met_ritten": n3_with_trips,
                                "reserve_bussen": n3_reserve_bussen, "idle_min": n3_idle,
@@ -2989,10 +2995,11 @@ def main():
                 print(f"    Totale wachttijd: {n4_idle} min ({n4_idle / 60:.1f} uur)")
 
                 file4 = f"{output_base}_{algo_short}_4_gecombineerd_risico.xlsx"
+                print(f"    Schrijven {file4}...", end=" ", flush=True)
                 generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
                                 include_sensitivity=True, output_mode=4,
                                 risk_report=risk_report)
-                print(f"    -> {file4}")
+                print("OK")
 
                 algo_results[4] = {"rotations": rot4, "buses_met_ritten": n4_with_trips,
                                    "reserve_bussen": n4_reserve_bussen, "idle_min": n4_idle,
@@ -3029,10 +3036,11 @@ def main():
             print(f"    Totale wachttijd: {n5_idle} min ({n5_idle / 60:.1f} uur)")
 
             file5 = f"{output_base}_{algo_short}_{out_num}_gecombineerd_deadhead.xlsx"
+            print(f"    Schrijven {file5}...", end=" ", flush=True)
             generate_output(rot5, trips_with_reserves, reserves, file5, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
                             risk_report=risk_report)
-            print(f"    -> {file5}")
+            print("OK")
 
             algo_results[out_num] = {"rotations": rot5, "buses_met_ritten": n5_with_trips,
                                      "reserve_bussen": n5_reserve_bussen, "idle_min": n5_idle,
