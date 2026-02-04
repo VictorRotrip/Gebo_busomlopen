@@ -23,6 +23,8 @@ API key can be provided via --key or in a .env file:
     GOOGLE_MAPS_API_KEY=AIza...
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime
 import json
