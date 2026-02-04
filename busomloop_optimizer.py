@@ -2698,7 +2698,11 @@ def main():
             except Exception as e:
                 print(f"WAARSCHUWING: Traffic matrix kon niet geladen worden: {e}")
 
-    n_outputs = 4 if deadhead_matrix else 3
+    n_outputs = 3
+    if traffic_data and traffic_data.get("time_slots"):
+        n_outputs = 4
+    if deadhead_matrix:
+        n_outputs = 5 if (traffic_data and traffic_data.get("time_slots")) else 4
     n_files = len(algos) * n_outputs
 
     print(f"Busomloop Optimizer")
@@ -2878,30 +2882,30 @@ def main():
                            "file": file3}
 
         # ---------------------------------------------------------------
-        # OUTPUT 4: Gecombineerd + reserves + deadhead (lege ritten)
-        # + risk-based turnaround when traffic data available
-        # Only generated when --deadhead is provided
+        # Compute risk overrides once (shared by output 4 and 5)
         # ---------------------------------------------------------------
-        if deadhead_matrix:
-            risk_report = None
-            trip_overrides = None
-            if traffic_data and traffic_data.get("time_slots"):
+        risk_report = None
+        trip_overrides = None
+        if traffic_data and traffic_data.get("time_slots"):
+            if algo_idx == 0:  # Only print once
                 print(f"  Risico-analyse: keertijden berekenen op basis van verkeerssituatie...")
-                trip_overrides, risk_report = compute_trip_turnaround_overrides(
-                    trips_with_reserves, traffic_data, baseline_turnaround)
-                n_overrides = len(trip_overrides)
-                n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
-                n_medium = sum(1 for r in risk_report if r["risk"] == "MATIG")
+            trip_overrides, risk_report = compute_trip_turnaround_overrides(
+                trips_with_reserves, traffic_data, baseline_turnaround)
+            n_overrides = len(trip_overrides)
+            n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
+            n_medium = sum(1 for r in risk_report if r["risk"] == "MATIG")
+            if algo_idx == 0:
                 print(f"    {n_overrides} ritten met verhoogde keertijd, "
                       f"{n_high} hoog risico, {n_medium} matig risico")
 
-            label = "Output 4 - Gecombineerd + reserves + deadhead"
-            if trip_overrides:
-                label += " + risico-keertijden"
-            print(f"  {label}...")
+        # ---------------------------------------------------------------
+        # OUTPUT 4: Gecombineerd + reserves + risico-keertijden (geen deadhead)
+        # Only generated when traffic data is available
+        # ---------------------------------------------------------------
+        if trip_overrides is not None:
+            print(f"  Output 4 - Gecombineerd + reserves + risico-keertijden...")
             rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                       algorithm=algo_key,
-                                      deadhead_matrix=deadhead_matrix,
                                       trip_turnaround_overrides=trip_overrides)
             n4_with_trips = len([r for r in rot4 if r.real_trips])
             n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
@@ -2912,7 +2916,7 @@ def main():
             print(f"    {n4_with_trips} bussen met ritten + {n4_reserve_bussen} reserve = {n4_with_trips + n4_reserve_bussen} totaal")
             print(f"    Totale wachttijd: {n4_idle} min ({n4_idle / 60:.1f} uur)")
 
-            file4 = f"{output_base}_{algo_short}_4_gecombineerd_deadhead.xlsx"
+            file4 = f"{output_base}_{algo_short}_4_gecombineerd_risico.xlsx"
             generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
                             risk_report=risk_report)
@@ -2921,6 +2925,37 @@ def main():
             algo_results[4] = {"rotations": rot4, "buses_met_ritten": n4_with_trips,
                                "reserve_bussen": n4_reserve_bussen, "idle_min": n4_idle,
                                "file": file4}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 5: Gecombineerd + reserves + deadhead + risico-keertijden
+        # Only generated when --deadhead is provided
+        # ---------------------------------------------------------------
+        if deadhead_matrix:
+            out_num = 5 if trip_overrides is not None else 4
+            print(f"  Output {out_num} - Gecombineerd + reserves + deadhead"
+                  f"{' + risico-keertijden' if trip_overrides else ''}...")
+            rot5 = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                      algorithm=algo_key,
+                                      deadhead_matrix=deadhead_matrix,
+                                      trip_turnaround_overrides=trip_overrides)
+            n5_with_trips = len([r for r in rot5 if r.real_trips])
+            n5_reserve_only = len([r for r in rot5 if not r.real_trips and r.reserve_trip_list])
+            n5_res_planned = sum(len(r.reserve_trip_list) for r in rot5)
+            n5_extra = max(0, total_reserves - n5_res_planned)
+            n5_reserve_bussen = n5_reserve_only + n5_extra
+            n5_idle = sum(r.total_idle_minutes for r in rot5)
+            print(f"    {n5_with_trips} bussen met ritten + {n5_reserve_bussen} reserve = {n5_with_trips + n5_reserve_bussen} totaal")
+            print(f"    Totale wachttijd: {n5_idle} min ({n5_idle / 60:.1f} uur)")
+
+            file5 = f"{output_base}_{algo_short}_{out_num}_gecombineerd_deadhead.xlsx"
+            generate_output(rot5, trips_with_reserves, reserves, file5, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report)
+            print(f"    -> {file5}")
+
+            algo_results[out_num] = {"rotations": rot5, "buses_met_ritten": n5_with_trips,
+                                     "reserve_bussen": n5_reserve_bussen, "idle_min": n5_idle,
+                                     "file": file5}
 
         all_results[algo_key] = algo_results
         print()
@@ -2934,12 +2969,16 @@ def main():
         1: "1. Per dienst",
         2: "2. Per dienst + reserve idle",
         3: "3. Gecombineerd + reserve ingepland",
-        4: "4. Gecombineerd + reserve + deadhead",
+        4: "4. Gecombineerd + reserve + risico",
+        5: "5. Gecombineerd + reserve + deadhead + risico",
     }
+    # Fallback label when output 4 is deadhead without traffic data
+    if deadhead_matrix and not (traffic_data and traffic_data.get("time_slots")):
+        output_labels[4] = "4. Gecombineerd + reserve + deadhead"
 
     # Header
     cw = 14  # column width per algorithm
-    lw = 45  # label width
+    lw = 50  # label width
     algo_short_names = {"greedy": "Greedy", "mincost": "Min-cost"}
     print(f"{'Output':<{lw}s}", end="")
     for ak in algo_keys:
@@ -2950,10 +2989,9 @@ def main():
         print(f" {'':->{ cw }s}", end="")
     print()
 
-    # Rows per output
-    output_nums = [1, 2, 3]
-    if deadhead_matrix:
-        output_nums.append(4)
+    # Rows per output - use whatever keys are in the first algo's results
+    first_algo = algo_keys[0]
+    output_nums = sorted(all_results[first_algo].keys())
     for out_num in output_nums:
         label = output_labels[out_num]
         print(label)
