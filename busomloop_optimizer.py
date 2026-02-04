@@ -2429,7 +2429,6 @@ def main():
     output_base = args.output.replace(".xlsx", "")
 
     algos = list(ALGORITHMS.keys()) if args.algoritme == "all" else [args.algoritme]
-    n_files = len(algos) * 4
 
     # Load deadhead matrix if provided
     deadhead_matrix = None
@@ -2452,6 +2451,9 @@ def main():
     else:
         dh_locs = 0
 
+    n_outputs = 5 if deadhead_matrix else 4
+    n_files = len(algos) * n_outputs
+
     print(f"Busomloop Optimizer")
     print(f"{'='*60}")
     print(f"Invoer:        {args.input_file}")
@@ -2460,7 +2462,7 @@ def main():
         print(f"Deadhead:      {args.deadhead} ({dh_locs} locaties)")
     else:
         print(f"Deadhead:      niet opgegeven (alleen directe verbindingen)")
-    print(f"Uitvoer:       {n_files} bestanden (4 outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
+    print(f"Uitvoer:       {n_files} bestanden ({n_outputs} outputs x {len(algos)} algoritme{'s' if len(algos) > 1 else ''})")
     print()
 
     # ===== PARSE =====
@@ -2567,8 +2569,7 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 1 - Per dienst, geen reserves...")
         rot1 = optimize_rotations(all_trips, baseline_turnaround,
-                                  algorithm=algo_key, per_service=True,
-                                  deadhead_matrix=deadhead_matrix)
+                                  algorithm=algo_key, per_service=True)
         n1 = len(rot1)
         print(f"    {n1} busomlopen")
 
@@ -2602,8 +2603,7 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 3 - Per dienst + reserves ingepland...")
         rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                                  algorithm=algo_key, service_constraint=True,
-                                  deadhead_matrix=deadhead_matrix)
+                                  algorithm=algo_key, service_constraint=True)
         n3_total = len(rot3)
         n3_with_trips = len([r for r in rot3 if r.real_trips])
         n3_reserve_only = len([r for r in rot3 if not r.real_trips and r.reserve_trip_list])
@@ -2625,8 +2625,7 @@ def main():
         # ---------------------------------------------------------------
         print(f"  Output 4 - Gecombineerd + reserves + sensitiviteit...")
         rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                                  algorithm=algo_key,
-                                  deadhead_matrix=deadhead_matrix)
+                                  algorithm=algo_key)
         n4_total = len(rot4)
         n4_with_trips = len([r for r in rot4 if r.real_trips])
         n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
@@ -2643,6 +2642,31 @@ def main():
         algo_results[4] = {"rotations": rot4, "buses": n4_total, "file": file4,
                            "reserve_planned": n4_res_planned, "extra_reserve": n4_extra}
 
+        # ---------------------------------------------------------------
+        # OUTPUT 5: Gecombineerd + reserves + deadhead (lege ritten)
+        # Only generated when --deadhead is provided
+        # ---------------------------------------------------------------
+        if deadhead_matrix:
+            print(f"  Output 5 - Gecombineerd + reserves + deadhead (lege ritten)...")
+            rot5 = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                      algorithm=algo_key,
+                                      deadhead_matrix=deadhead_matrix)
+            n5_total = len(rot5)
+            n5_with_trips = len([r for r in rot5 if r.real_trips])
+            n5_reserve_only = len([r for r in rot5 if not r.real_trips and r.reserve_trip_list])
+            n5_res_planned = sum(len(r.reserve_trip_list) for r in rot5)
+            n5_extra = max(0, total_reserves - n5_res_planned)
+            print(f"    {n5_total} bussen ({n5_with_trips} met ritten, {n5_reserve_only} alleen reserve)")
+            print(f"    {n5_res_planned}/{total_reserves} reserves ingepland, {n5_extra} extra nodig")
+
+            file5 = f"{output_base}_{algo_short}_5_gecombineerd_deadhead.xlsx"
+            generate_output(rot5, trips_with_reserves, reserves, file5, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4)
+            print(f"    -> {file5}")
+
+            algo_results[5] = {"rotations": rot5, "buses": n5_total, "file": file5,
+                               "reserve_planned": n5_res_planned, "extra_reserve": n5_extra}
+
         all_results[algo_key] = algo_results
         print()
 
@@ -2656,6 +2680,7 @@ def main():
         2: "Per dienst + reserve idle",
         3: "Per dienst + reserve ingepland",
         4: "Gecombineerd + reserve ingepland",
+        5: "Gecombineerd + reserve + deadhead",
     }
 
     # Header
@@ -2671,7 +2696,10 @@ def main():
     print()
 
     # Rows per output: buses, reserve, total fleet
-    for out_num in [1, 2, 3, 4]:
+    output_nums = [1, 2, 3, 4]
+    if deadhead_matrix:
+        output_nums.append(5)
+    for out_num in output_nums:
         label = output_labels[out_num]
 
         # Buses row
@@ -2706,7 +2734,7 @@ def main():
         print()
 
     print(f"Reservebussen totaal nodig: {total_reserves}")
-    print(f"Gegenereerde bestanden: {len(algo_keys) * 4}")
+    print(f"Gegenereerde bestanden: {n_files}")
     print()
     print("Klaar!")
 
