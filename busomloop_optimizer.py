@@ -1526,6 +1526,7 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                         cell.border = THIN_BORDER
                         cell.alignment = Alignment(horizontal="center")
                 row += 1
+                trip_start_row = row
 
                 # Trip + deadhead rows
                 for row_idx in range(max_rows):
@@ -1577,20 +1578,21 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                                         ws.cell(row=row, column=cc).fill = RESERVE_FILL
                     row += 1
 
-                # Subtotals for this block
+                # Subtotals for this block – placed directly under each bus's last trip
                 for i, bus in enumerate(block):
+                    sub_row = trip_start_row + len(block_rows[i])
                     base_col = 1 + i * cols_per_bus
-                    ws.cell(row=row, column=base_col, value="Ritten:")
-                    ws.cell(row=row, column=base_col).font = Font(bold=True, size=9)
-                    ws.cell(row=row, column=base_col + 1, value=len(bus.trips))
-                    ws.cell(row=row, column=base_col + 2, value="Rijtijd:")
-                    ws.cell(row=row, column=base_col + 2).font = Font(bold=True, size=9)
+                    ws.cell(row=sub_row, column=base_col, value="Ritten:")
+                    ws.cell(row=sub_row, column=base_col).font = Font(bold=True, size=9)
+                    ws.cell(row=sub_row, column=base_col + 1, value=len(bus.trips))
+                    ws.cell(row=sub_row, column=base_col + 2, value="Rijtijd:")
+                    ws.cell(row=sub_row, column=base_col + 2).font = Font(bold=True, size=9)
                     ride = bus.total_ride_minutes
-                    ws.cell(row=row, column=base_col + 3, value=f"{ride // 60}:{ride % 60:02d}")
-                    ws.cell(row=row, column=base_col + 4, value="Wacht:")
-                    ws.cell(row=row, column=base_col + 4).font = Font(bold=True, size=9)
+                    ws.cell(row=sub_row, column=base_col + 3, value=f"{ride // 60}:{ride % 60:02d}")
+                    ws.cell(row=sub_row, column=base_col + 4, value="Wacht:")
+                    ws.cell(row=sub_row, column=base_col + 4).font = Font(bold=True, size=9)
                     idle = bus.total_idle_minutes
-                    ws.cell(row=row, column=base_col + 5, value=f"{idle // 60}:{idle % 60:02d}")
+                    ws.cell(row=sub_row, column=base_col + 5, value=f"{idle // 60}:{idle % 60:02d}")
                 row += 2
 
             # Reserve buses section for this date
