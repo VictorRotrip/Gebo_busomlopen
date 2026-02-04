@@ -2850,7 +2850,7 @@ def main():
 
     # Show per-service detail: gap in schedule vs. turnaround we actually use
     svc_turnarounds = detect_turnaround_per_service(all_trips)
-    print(f"\n  Keertijden geïmpliceerd door dienstregeling vs. gehanteerd:")
+    print(f"\n  Keertijden per dienst (dienstregeling vs. optimizer):")
 
     # Pre-compute column widths for alignment
     items = sorted(svc_turnarounds.items(),
@@ -2871,13 +2871,13 @@ def main():
         if gap is None:
             dir_str = " + ".join(dirs)
             reason = f"{n_trips} rit{'ten' if n_trips > 1 else ''}, alleen {dir_str}" if len(dirs) == 1 else f"{n_trips} ritten, geen keerpunt"
-            print(f"{prefix}  geen keerpunt ({reason})")
+            print(f"{prefix}  {'n.v.t.':>7s}       optimizer gebruikt {used_val} min ({reason})")
         elif gap < used_val:
-            print(f"{prefix}  dienstregeling {gap:3d} min  !! wij hanteren {used_val} min (+{used_val - gap})")
+            print(f"{prefix}  {gap:3d} min       optimizer gebruikt {used_val} min (+{used_val - gap} t.o.v. dienstregeling)")
         elif gap > used_val:
-            print(f"{prefix}  dienstregeling {gap:3d} min  (ruim, wij hanteren {used_val} min)")
+            print(f"{prefix}  {gap:3d} min       optimizer gebruikt {used_val} min (marge {gap - used_val} min)")
         else:
-            print(f"{prefix}  dienstregeling {gap:3d} min  (= gehanteerd)")
+            print(f"{prefix}  {gap:3d} min       optimizer gebruikt {used_val} min (gelijk)")
     print()
 
     total_reserves = sum(r.count for r in reserves)
