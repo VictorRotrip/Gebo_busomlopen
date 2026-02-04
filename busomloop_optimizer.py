@@ -14,6 +14,8 @@ minimum 2 minuten). Handmatig overschrijven kan met:
     --keer-dd 15  --keer-tc 8  --keer-lvb 12  --keer-midi 10  --keer-taxi 5
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime
 import sys
