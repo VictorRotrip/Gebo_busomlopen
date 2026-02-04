@@ -2885,7 +2885,32 @@ def main():
     # Create reserve phantom trips (used by outputs 3+)
     reserve_trip_list = create_reserve_trips(reserves, all_trips)
     trips_with_reserves = all_trips + reserve_trip_list
-    print(f"  {len(reserve_trip_list)} reservebus-taken aangemaakt (phantom trips)")
+    n_phantom = len(reserve_trip_list)
+    n_unmatched = total_reserves - n_phantom
+
+    print(f"  Reservebussen in input: {total_reserves}")
+    if n_unmatched > 0:
+        # Show which stations could not be matched
+        trip_dates = sorted(set(t.date_str for t in all_trips))
+        unmatched_stations = []
+        for rb in reserves:
+            date_str = match_reserve_day(rb.day, trip_dates)
+            res_loc = normalize_reserve_station(rb.station)
+            has_trips = any(
+                t.date_str == date_str and
+                (normalize_location(t.origin_code) == res_loc or
+                 normalize_location(t.dest_code) == res_loc)
+                for t in all_trips
+            )
+            if not has_trips:
+                unmatched_stations.append(f"{rb.station} ({rb.day}, {rb.count}x)")
+        print(f"    {n_phantom} inplanbaar (station komt voor in ritten)")
+        print(f"    {n_unmatched} niet inplanbaar (geen ritten via dat station):")
+        for s in unmatched_stations:
+            print(f"      - {s}")
+        print(f"    Deze {n_unmatched} tellen altijd mee als extra losse reservebussen.")
+    else:
+        print(f"    Alle {n_phantom} reserves inplanbaar als phantom trips.")
     print()
 
     trip_dates = sorted(set(t.date_str for t in all_trips))
