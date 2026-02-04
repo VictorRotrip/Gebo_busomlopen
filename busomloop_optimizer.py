@@ -1539,7 +1539,8 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                                 dh_min = entry["dh_minutes"]
                                 dh_str = f"{round(dh_min)} min" if dh_min is not None else "?"
                                 ws.cell(row=row, column=base_col, value="Lege rit")
-                                ws.cell(row=row, column=base_col + 1, value=f"{entry['from_name']} → {entry['to_name']}")
+                                ws.cell(row=row, column=base_col + 1, value=entry["from_name"])
+                                ws.cell(row=row, column=base_col + 2, value=entry["to_name"])
                                 ws.cell(row=row, column=base_col + 4, value=dh_str)
                                 for cc in range(base_col, base_col + 6):
                                     ws.cell(row=row, column=cc).border = THIN_BORDER
