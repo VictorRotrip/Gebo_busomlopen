@@ -406,13 +406,13 @@ def parse_all_sheets(input_file: str):
 
 # Default minimum turnaround times per bus type (minutes)
 MIN_TURNAROUND_DEFAULTS = {
-    "Dubbeldekker": 15,
-    "Touringcar": 8,
-    "Lagevloerbus": 12,
-    "Midi bus": 10,
-    "Taxibus": 5,
+    "Dubbeldekker": 8,
+    "Touringcar": 6,
+    "Lagevloerbus": 5,
+    "Midi bus": 4,
+    "Taxibus": 3,
 }
-MIN_TURNAROUND_FALLBACK = 8  # fallback for unknown bus types
+MIN_TURNAROUND_FALLBACK = 6  # fallback for unknown bus types
 MIN_TURNAROUND_FLOOR = 2     # absolute minimum turnaround (minutes)
 
 
