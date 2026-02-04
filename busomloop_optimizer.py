@@ -2842,11 +2842,18 @@ def main():
         used = "" if bt in used_bus_types else "  [niet gebruikt]"
         print(f"    {bt:20s} {mins:3d} min  ({source}){used}")
 
-    # Show per-service detail (observed gaps in data, always informational)
+    # Show per-service detail: gap in schedule vs. turnaround we actually use
     svc_turnarounds = detect_turnaround_per_service(all_trips)
-    print(f"\n  Keertijden in dienstregeling (ter info):")
+    print(f"\n  Keertijden geïmpliceerd door dienstregeling vs. gehanteerd:")
     for svc, (bt, gap) in sorted(svc_turnarounds.items(), key=lambda x: x[1][1]):
-        print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
+        used_val = baseline_turnaround.get(bt, MIN_TURNAROUND_FALLBACK)
+        if gap < used_val:
+            delta = f"  !! wij hanteren {used_val} min (+{used_val - gap})"
+        elif gap > used_val:
+            delta = f"  (ruim, wij hanteren {used_val} min)"
+        else:
+            delta = f"  (= gehanteerd)"
+        print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
     print()
 
     total_reserves = sum(r.count for r in reserves)
