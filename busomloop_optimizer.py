@@ -2572,6 +2572,7 @@ def main():
                                   algorithm=algo_key, per_service=True)
         n1 = len(rot1)
         print(f"    {n1} busomlopen")
+        print(f"    0/{total_reserves} reserves ingepland, {total_reserves} extra nodig (elke reserve = aparte bus)")
 
         file1 = f"{output_base}_{algo_short}_1_per_dienst.xlsx"
         generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, algo_key,
