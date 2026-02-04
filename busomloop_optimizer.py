@@ -2851,25 +2851,33 @@ def main():
     # Show per-service detail: gap in schedule vs. turnaround we actually use
     svc_turnarounds = detect_turnaround_per_service(all_trips)
     print(f"\n  Keertijden geïmpliceerd door dienstregeling vs. gehanteerd:")
-    # Sort: services with a gap first (ascending), then services without gap
-    for svc, (bt, gap, dates, n_trips, dirs) in sorted(
-            svc_turnarounds.items(),
-            key=lambda x: (x[1][1] is None, x[1][1] or 0)):
+
+    # Pre-compute column widths for alignment
+    items = sorted(svc_turnarounds.items(),
+                   key=lambda x: (x[1][1] is None, x[1][1] or 0))
+    svc_w = max(len(svc) for svc in svc_turnarounds) + 1
+    bt_w = max(len(bt) for bt, *_ in svc_turnarounds.values()) + 2  # for parens
+    date_strs = {svc: ", ".join(dates) for svc, (_, _, dates, _, _) in items}
+    date_w = max(len(ds) for ds in date_strs.values()) + 2  # for brackets
+
+    for svc, (bt, gap, dates, n_trips, dirs) in items:
         used_val = baseline_turnaround.get(bt, MIN_TURNAROUND_FALLBACK)
-        date_str = ", ".join(dates)
+        col1 = f"{svc:<{svc_w}s}"
+        col2 = f"({bt})"
+        col2 = f"{col2:<{bt_w}s}"
+        col3 = f"[{date_strs[svc]}]"
+        col3 = f"{col3:<{date_w}s}"
+        prefix = f"    {col1} {col2} {col3}"
         if gap is None:
             dir_str = " + ".join(dirs)
             reason = f"{n_trips} rit{'ten' if n_trips > 1 else ''}, alleen {dir_str}" if len(dirs) == 1 else f"{n_trips} ritten, geen keerpunt"
-            print(f"    {svc:20s} ({bt}) [{date_str}]  geen keerpunt ({reason})")
+            print(f"{prefix}  geen keerpunt ({reason})")
         elif gap < used_val:
-            delta = f"  !! wij hanteren {used_val} min (+{used_val - gap})"
-            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
+            print(f"{prefix}  dienstregeling {gap:3d} min  !! wij hanteren {used_val} min (+{used_val - gap})")
         elif gap > used_val:
-            delta = f"  (ruim, wij hanteren {used_val} min)"
-            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
+            print(f"{prefix}  dienstregeling {gap:3d} min  (ruim, wij hanteren {used_val} min)")
         else:
-            delta = f"  (= gehanteerd)"
-            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
+            print(f"{prefix}  dienstregeling {gap:3d} min  (= gehanteerd)")
     print()
 
     total_reserves = sum(r.count for r in reserves)
