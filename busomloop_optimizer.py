@@ -476,7 +476,7 @@ def detect_turnaround_times(trips: list, within_service_only: bool = False) -> d
 def detect_turnaround_per_service(trips: list) -> dict:
     """
     Detect the minimum turnaround time per service (= per Excel tab).
-    Returns dict {service_name: (bus_type, min_gap_minutes)}.
+    Returns dict {service_name: (bus_type, min_gap_minutes or None)}.
     """
     by_service = {}
     for t in trips:
@@ -485,17 +485,19 @@ def detect_turnaround_per_service(trips: list) -> dict:
     result = {}
     for service, svc_trips in by_service.items():
         bus_type = svc_trips[0].bus_type if svc_trips else "Onbekend"
-        arrivals = {}
-        departures = {}
+
+        # Group by (date, location) to avoid cross-day comparisons
+        arrivals = {}   # (date, loc) -> [arrival_minutes]
+        departures = {} # (date, loc) -> [departure_minutes]
         for t in svc_trips:
             dest_loc = normalize_location(t.dest_code)
             orig_loc = normalize_location(t.origin_code)
-            arrivals.setdefault(dest_loc, []).append(t.arrival)
-            departures.setdefault(orig_loc, []).append(t.departure)
+            arrivals.setdefault((t.date_str, dest_loc), []).append(t.arrival)
+            departures.setdefault((t.date_str, orig_loc), []).append(t.departure)
 
         min_gap = None
-        for loc, arr_times in arrivals.items():
-            dep_times = departures.get(loc, [])
+        for (date, loc), arr_times in arrivals.items():
+            dep_times = departures.get((date, loc), [])
             dep_sorted = sorted(dep_times)
             for arr_t in arr_times:
                 for dep_t in dep_sorted:
