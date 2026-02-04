@@ -1419,7 +1419,8 @@ def apply_header_style(ws, row, col_start, col_end, fill=None, font=None):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def write_omloop_sheet(wb_out, rotations: list, reserves: list):
+def write_omloop_sheet(wb_out, rotations: list, reserves: list,
+                       deadhead_matrix: dict = None):
     """
     Tab 1: Busomloop - Transvision style per bus.
     Groups by date + bus_type, shows each bus's trip sequence.
@@ -1463,10 +1464,34 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
             ws.cell(row=row, column=1).font = Font(name="Calibri", bold=True, size=11)
             row += 2
 
+            # Helper: build expanded row list for a bus (trips + deadhead rows)
+            DEADHEAD_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+
+            def _expand_bus_rows(bus):
+                """Return list of row dicts: either a trip or a deadhead entry."""
+                rows = []
+                for t_idx, t in enumerate(bus.trips):
+                    # Check if deadhead is needed before this trip
+                    if t_idx > 0 and deadhead_matrix:
+                        prev_t = bus.trips[t_idx - 1]
+                        prev_dest = normalize_location(prev_t.dest_code)
+                        this_orig = normalize_location(t.origin_code)
+                        if prev_dest != this_orig:
+                            dh_min = deadhead_matrix.get(prev_dest, {}).get(this_orig)
+                            rows.append({
+                                "type": "deadhead",
+                                "from_name": prev_t.dest_name,
+                                "to_name": t.origin_name,
+                                "dh_minutes": dh_min,
+                            })
+                    rows.append({"type": "trip", "trip": t, "trip_idx": t_idx})
+                return rows
+
             # Process in blocks of buses_per_row
             for block_start in range(0, len(type_rotations), buses_per_row):
                 block = type_rotations[block_start:block_start + buses_per_row]
-                max_trips = max(len(b.trips) for b in block)
+                block_rows = [_expand_bus_rows(bus) for bus in block]
+                max_rows = max(len(br) for br in block_rows)
 
                 # Bus headers
                 for i, bus in enumerate(block):
@@ -1502,36 +1527,53 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list):
                         cell.alignment = Alignment(horizontal="center")
                 row += 1
 
-                # Trip rows
-                for trip_idx in range(max_trips):
+                # Trip + deadhead rows
+                for row_idx in range(max_rows):
                     for i, bus in enumerate(block):
                         base_col = 1 + i * cols_per_bus
-                        if trip_idx < len(bus.trips):
-                            t = bus.trips[trip_idx]
-                            if t.is_reserve:
-                                ws.cell(row=row, column=base_col, value="RESERVE")
+                        if row_idx < len(block_rows[i]):
+                            entry = block_rows[i][row_idx]
+
+                            if entry["type"] == "deadhead":
+                                # Deadhead repositioning row
+                                dh_min = entry["dh_minutes"]
+                                dh_str = f"{round(dh_min)} min" if dh_min is not None else "?"
+                                ws.cell(row=row, column=base_col, value=f"lege rit")
+                                ws.cell(row=row, column=base_col + 1, value=f"{entry['from_name']} → {entry['to_name']}")
+                                ws.cell(row=row, column=base_col + 4, value=dh_str)
+                                for cc in range(base_col, base_col + 6):
+                                    ws.cell(row=row, column=cc).border = THIN_BORDER
+                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
+                                    ws.cell(row=row, column=cc).fill = DEADHEAD_FILL
+                                    ws.cell(row=row, column=cc).font = Font(italic=True, size=9)
                             else:
-                                ws.cell(row=row, column=base_col, value=t.origin_name)
-                            ws.cell(row=row, column=base_col + 1, value=t.dest_name)
-                            ws.cell(row=row, column=base_col + 2, value=minutes_to_time(t.departure))
-                            ws.cell(row=row, column=base_col + 2).number_format = "HH:MM"
-                            ws.cell(row=row, column=base_col + 3, value=minutes_to_time(t.arrival))
-                            ws.cell(row=row, column=base_col + 3).number_format = "HH:MM"
-                            dur = t.arrival - t.departure
-                            ws.cell(row=row, column=base_col + 4, value=f"{dur // 60}:{dur % 60:02d}")
-
-                            # Hold/wait time until next trip
-                            if trip_idx < len(bus.trips) - 1:
-                                next_t = bus.trips[trip_idx + 1]
-                                hold = next_t.departure - t.arrival
-                                ws.cell(row=row, column=base_col + 5, value=f"{hold // 60}:{hold % 60:02d}")
-
-                            # Apply borders + reserve highlight
-                            for cc in range(base_col, base_col + 6):
-                                ws.cell(row=row, column=cc).border = THIN_BORDER
-                                ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
+                                # Normal trip row
+                                t = entry["trip"]
+                                t_idx = entry["trip_idx"]
                                 if t.is_reserve:
-                                    ws.cell(row=row, column=cc).fill = RESERVE_FILL
+                                    ws.cell(row=row, column=base_col, value="RESERVE")
+                                else:
+                                    ws.cell(row=row, column=base_col, value=t.origin_name)
+                                ws.cell(row=row, column=base_col + 1, value=t.dest_name)
+                                ws.cell(row=row, column=base_col + 2, value=minutes_to_time(t.departure))
+                                ws.cell(row=row, column=base_col + 2).number_format = "HH:MM"
+                                ws.cell(row=row, column=base_col + 3, value=minutes_to_time(t.arrival))
+                                ws.cell(row=row, column=base_col + 3).number_format = "HH:MM"
+                                dur = t.arrival - t.departure
+                                ws.cell(row=row, column=base_col + 4, value=f"{dur // 60}:{dur % 60:02d}")
+
+                                # Hold/wait time until next trip
+                                if t_idx < len(bus.trips) - 1:
+                                    next_t = bus.trips[t_idx + 1]
+                                    hold = next_t.departure - t.arrival
+                                    ws.cell(row=row, column=base_col + 5, value=f"{hold // 60}:{hold % 60:02d}")
+
+                                # Apply borders + reserve highlight
+                                for cc in range(base_col, base_col + 6):
+                                    ws.cell(row=row, column=cc).border = THIN_BORDER
+                                    ws.cell(row=row, column=cc).alignment = Alignment(horizontal="center")
+                                    if t.is_reserve:
+                                        ws.cell(row=row, column=cc).fill = RESERVE_FILL
                     row += 1
 
                 # Subtotals for this block
@@ -2554,7 +2596,7 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
                     turnaround_map: dict = None, algorithm: str = "greedy",
                     include_sensitivity: bool = False, output_mode: int = 1,
-                    risk_report: list = None):
+                    risk_report: list = None, deadhead_matrix: dict = None):
     """Generate the complete output Excel workbook.
 
     output_mode:
@@ -2563,13 +2605,14 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
         3 = per dienst + reserve phantom trips
         4 = gecombineerd + reserve phantom trips + sensitivity
     risk_report: optional list of dicts from compute_trip_turnaround_overrides.
+    deadhead_matrix: optional {origin: {dest: minutes}} for showing repositioning trips.
     """
     wb = openpyxl.Workbook()
     # Remove default sheet
     wb.remove(wb.active)
 
     # Tab 1: Busomloop (Transvision-stijl)
-    write_omloop_sheet(wb, rotations, reserves)
+    write_omloop_sheet(wb, rotations, reserves, deadhead_matrix=deadhead_matrix)
 
     # Tab 2: Overzicht ritsamenhang
     write_overzicht_sheet(wb, rotations, all_trips)
@@ -3095,7 +3138,7 @@ def main():
             print(f"    Schrijven {file5}...", end=" ", flush=True)
             generate_output(rot5, trips_with_reserves, reserves, file5, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
-                            risk_report=risk_report)
+                            risk_report=risk_report, deadhead_matrix=deadhead_matrix)
             print("OK")
 
             algo_results[out_num] = {"rotations": rot5, "buses_met_ritten": n5_with_trips,
