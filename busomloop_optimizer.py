@@ -968,10 +968,10 @@ def compute_trip_turnaround_overrides(
                 # Negative buffer: trip takes longer than scheduled under traffic
                 # Add the deficit to turnaround time
                 extra = abs(buffer)
-                adjusted = base_turn + extra
+                adjusted = max(base_turn + extra, 2)
                 overrides[trip.trip_id] = round(adjusted, 1)
             else:
-                adjusted = base_turn
+                adjusted = max(base_turn, 2)
                 extra = 0.0
         else:
             buffer = None
@@ -1057,6 +1057,8 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
             min_turnaround = trip_turnaround_overrides[prev_trip.trip_id]
         else:
             min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+        # Absolute minimum: never go below 2 minutes for real trips
+        min_turnaround = max(min_turnaround, 2)
 
     gap = next_trip.departure - prev_trip.arrival
     # Gap must accommodate both deadhead driving and turnaround time
@@ -2617,39 +2619,45 @@ def main():
         "--keertijd",
         type=int,
         default=None,
-        help="Minimale keertijd in minuten voor ALLE bustypes. "
-             "Als de uit data gedetecteerde keertijd lager is, wordt deze "
-             "opgehoogd naar dit minimum. Hogere waarden uit data blijven behouden.",
+        help="Keertijd in minuten voor ALLE bustypes. "
+             "Overschrijft de standaardwaarden.",
+    )
+    parser.add_argument(
+        "--data-keertijd",
+        action="store_true",
+        help="Gebruik de minimale keertijd uit de dienstregeling (kleinste gat "
+             "tussen twee opeenvolgende ritten per tabblad) in plaats van de "
+             "standaardwaarden. Let op: dit kan onrealistisch lage waarden geven.",
     )
     parser.add_argument(
         "--keer-dd",
         type=int,
         default=None,
-        help=f"Keertijd dubbeldekker in minuten (standaard: auto-detect uit data)",
+        help=f"Keertijd dubbeldekker in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Dubbeldekker']})",
     )
     parser.add_argument(
         "--keer-tc",
         type=int,
         default=None,
-        help=f"Keertijd touringcar in minuten (standaard: auto-detect uit data)",
+        help=f"Keertijd touringcar in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Touringcar']})",
     )
     parser.add_argument(
         "--keer-lvb",
         type=int,
         default=None,
-        help=f"Keertijd lagevloerbus/gelede bus in minuten (standaard: auto-detect uit data)",
+        help=f"Keertijd lagevloerbus/gelede bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Lagevloerbus']})",
     )
     parser.add_argument(
         "--keer-midi",
         type=int,
         default=None,
-        help=f"Keertijd midi bus in minuten (standaard: auto-detect uit data)",
+        help=f"Keertijd midi bus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Midi bus']})",
     )
     parser.add_argument(
         "--keer-taxi",
         type=int,
         default=None,
-        help=f"Keertijd taxibus in minuten (standaard: auto-detect uit data)",
+        help=f"Keertijd taxibus in minuten (standaard: {MIN_TURNAROUND_DEFAULTS['Taxibus']})",
     )
     parser.add_argument(
         "--deadhead",
@@ -2776,20 +2784,26 @@ def main():
         print(f"    {bt}: {len(trips)} ritten")
     print()
 
-    # ===== DETECT TURNAROUND TIMES (within-service = baseline) =====
-    print("Stap 2: Keertijden bepalen (per tabblad, zonder combinaties)...")
-    baseline_turnaround = detect_turnaround_times(all_trips, within_service_only=True)
+    # ===== DETERMINE TURNAROUND TIMES =====
+    print("Stap 2: Keertijden bepalen...")
 
-    # Track which bus types were actually detected from data and their original values
-    detected_from_data = set(baseline_turnaround.keys())
-    original_from_data = dict(baseline_turnaround)
+    # Start with defaults for all known bus types
+    baseline_turnaround = dict(MIN_TURNAROUND_DEFAULTS)
 
-    # Apply global --keertijd minimum floor (all types)
+    # Optionally detect from data (--data-keertijd)
+    detected_from_data = {}
+    if args.data_keertijd:
+        detected_from_data = detect_turnaround_times(all_trips, within_service_only=True)
+        # Data-detected values override defaults
+        for bt, val in detected_from_data.items():
+            baseline_turnaround[bt] = val
+
+    # Apply global --keertijd override (all types)
     if args.keertijd is not None:
-        for bt in set(baseline_turnaround.keys()) | set(MIN_TURNAROUND_DEFAULTS.keys()):
-            baseline_turnaround[bt] = max(baseline_turnaround.get(bt, 0), args.keertijd)
+        for bt in set(baseline_turnaround.keys()):
+            baseline_turnaround[bt] = args.keertijd
 
-    # Apply per-type CLI overrides
+    # Apply per-type CLI overrides (highest priority)
     cli_overrides = {
         "Dubbeldekker": args.keer_dd,
         "Touringcar": args.keer_tc,
@@ -2801,31 +2815,30 @@ def main():
         if val is not None:
             baseline_turnaround[bt] = val
 
-    for bt in MIN_TURNAROUND_DEFAULTS:
-        if bt not in baseline_turnaround:
-            baseline_turnaround[bt] = MIN_TURNAROUND_DEFAULTS[bt]
-
-    # Only show bus types that are actually used in the data
+    # Ensure any bus types in data but not in defaults are covered
     used_bus_types = set(t.bus_type for t in all_trips)
-    print(f"  Baseline keertijden (bepaald per tabblad):")
+    for bt in used_bus_types:
+        if bt not in baseline_turnaround:
+            baseline_turnaround[bt] = MIN_TURNAROUND_FALLBACK
+
+    # Display turnaround times with source labels
+    mode_label = "uit data + standaard" if args.data_keertijd else "standaardwaarden"
+    print(f"  Keertijden ({mode_label}):")
     for bt, mins in sorted(baseline_turnaround.items()):
         if cli_overrides.get(bt) is not None:
             source = "handmatig"
+        elif args.keertijd is not None:
+            source = f"--keertijd {args.keertijd}"
         elif bt in detected_from_data:
-            source = "uit data"
+            source = f"uit data"
         else:
             source = "standaard"
-        # Show if --keertijd raised it
-        if args.keertijd is not None and bt in original_from_data:
-            orig = original_from_data[bt]
-            if orig < args.keertijd:
-                source = f"minimum --keertijd (was {orig})"
         used = "" if bt in used_bus_types else "  [niet gebruikt]"
         print(f"    {bt:20s} {mins:3d} min  ({source}){used}")
 
-    # Show per-service detail
+    # Show per-service detail (observed gaps in data, always informational)
     svc_turnarounds = detect_turnaround_per_service(all_trips)
-    print(f"\n  Detail per dienst:")
+    print(f"\n  Keertijden in dienstregeling (ter info):")
     for svc, (bt, gap) in sorted(svc_turnarounds.items(), key=lambda x: x[1][1]):
         print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
     print()
