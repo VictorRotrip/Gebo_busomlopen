@@ -476,7 +476,7 @@ def detect_turnaround_times(trips: list, within_service_only: bool = False) -> d
 def detect_turnaround_per_service(trips: list) -> dict:
     """
     Detect the minimum turnaround time per service (= per Excel tab).
-    Returns dict {service_name: (bus_type, min_gap_minutes or None)}.
+    Returns dict {service_name: (bus_type, min_gap_minutes or None, dates_list)}.
     """
     by_service = {}
     for t in trips:
@@ -485,6 +485,7 @@ def detect_turnaround_per_service(trips: list) -> dict:
     result = {}
     for service, svc_trips in by_service.items():
         bus_type = svc_trips[0].bus_type if svc_trips else "Onbekend"
+        dates = sorted(set(t.date_str for t in svc_trips))
 
         # Group by (date, location) to avoid cross-day comparisons
         arrivals = {}   # (date, loc) -> [arrival_minutes]
@@ -508,7 +509,7 @@ def detect_turnaround_per_service(trips: list) -> dict:
                         break
 
         # min_gap is None when no turnaround exists (e.g. one-way only)
-        result[service] = (bus_type, min_gap)
+        result[service] = (bus_type, min_gap, dates)
 
     return result
 
@@ -2849,21 +2850,22 @@ def main():
     svc_turnarounds = detect_turnaround_per_service(all_trips)
     print(f"\n  Keertijden geïmpliceerd door dienstregeling vs. gehanteerd:")
     # Sort: services with a gap first (ascending), then services without gap
-    for svc, (bt, gap) in sorted(svc_turnarounds.items(),
-                                  key=lambda x: (x[1][1] is None, x[1][1] or 0)):
+    for svc, (bt, gap, dates) in sorted(svc_turnarounds.items(),
+                                         key=lambda x: (x[1][1] is None, x[1][1] or 0)):
         used_val = baseline_turnaround.get(bt, MIN_TURNAROUND_FALLBACK)
+        date_str = ", ".join(dates)
         if gap is None:
             delta = f"  (geen keerpunt, wij hanteren {used_val} min)"
-            print(f"    {svc:30s} ({bt:15s})  dienstregeling   -    {delta}")
+            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling   -    {delta}")
         elif gap < used_val:
             delta = f"  !! wij hanteren {used_val} min (+{used_val - gap})"
-            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
+            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
         elif gap > used_val:
             delta = f"  (ruim, wij hanteren {used_val} min)"
-            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
+            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
         else:
             delta = f"  (= gehanteerd)"
-            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
+            print(f"    {svc:20s} ({bt}) [{date_str}]  dienstregeling {gap:3d} min{delta}")
     print()
 
     total_reserves = sum(r.count for r in reserves)
