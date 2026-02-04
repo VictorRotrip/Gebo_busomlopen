@@ -476,7 +476,7 @@ def detect_turnaround_times(trips: list, within_service_only: bool = False) -> d
 def detect_turnaround_per_service(trips: list) -> dict:
     """
     Detect the minimum turnaround time per service (= per Excel tab).
-    Returns dict {service_name: (bus_type, min_gap_minutes)}.
+    Returns dict {service_name: (bus_type, min_gap_minutes or None)}.
     """
     by_service = {}
     for t in trips:
@@ -485,17 +485,19 @@ def detect_turnaround_per_service(trips: list) -> dict:
     result = {}
     for service, svc_trips in by_service.items():
         bus_type = svc_trips[0].bus_type if svc_trips else "Onbekend"
-        arrivals = {}
-        departures = {}
+
+        # Group by (date, location) to avoid cross-day comparisons
+        arrivals = {}   # (date, loc) -> [arrival_minutes]
+        departures = {} # (date, loc) -> [departure_minutes]
         for t in svc_trips:
             dest_loc = normalize_location(t.dest_code)
             orig_loc = normalize_location(t.origin_code)
-            arrivals.setdefault(dest_loc, []).append(t.arrival)
-            departures.setdefault(orig_loc, []).append(t.departure)
+            arrivals.setdefault((t.date_str, dest_loc), []).append(t.arrival)
+            departures.setdefault((t.date_str, orig_loc), []).append(t.departure)
 
         min_gap = None
-        for loc, arr_times in arrivals.items():
-            dep_times = departures.get(loc, [])
+        for (date, loc), arr_times in arrivals.items():
+            dep_times = departures.get((date, loc), [])
             dep_sorted = sorted(dep_times)
             for arr_t in arr_times:
                 for dep_t in dep_sorted:
@@ -505,7 +507,8 @@ def detect_turnaround_per_service(trips: list) -> dict:
                             min_gap = gap
                         break
 
-        result[service] = (bus_type, min_gap if min_gap is not None else MIN_TURNAROUND_FALLBACK)
+        # min_gap is None when no turnaround exists (e.g. one-way only)
+        result[service] = (bus_type, min_gap)
 
     return result
 
@@ -2842,11 +2845,25 @@ def main():
         used = "" if bt in used_bus_types else "  [niet gebruikt]"
         print(f"    {bt:20s} {mins:3d} min  ({source}){used}")
 
-    # Show per-service detail (observed gaps in data, always informational)
+    # Show per-service detail: gap in schedule vs. turnaround we actually use
     svc_turnarounds = detect_turnaround_per_service(all_trips)
-    print(f"\n  Keertijden in dienstregeling (ter info):")
-    for svc, (bt, gap) in sorted(svc_turnarounds.items(), key=lambda x: x[1][1]):
-        print(f"    {svc:30s} ({bt:15s})  keertijd {gap:3d} min")
+    print(f"\n  Keertijden geïmpliceerd door dienstregeling vs. gehanteerd:")
+    # Sort: services with a gap first (ascending), then services without gap
+    for svc, (bt, gap) in sorted(svc_turnarounds.items(),
+                                  key=lambda x: (x[1][1] is None, x[1][1] or 0)):
+        used_val = baseline_turnaround.get(bt, MIN_TURNAROUND_FALLBACK)
+        if gap is None:
+            delta = f"  (geen keerpunt, wij hanteren {used_val} min)"
+            print(f"    {svc:30s} ({bt:15s})  dienstregeling   -    {delta}")
+        elif gap < used_val:
+            delta = f"  !! wij hanteren {used_val} min (+{used_val - gap})"
+            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
+        elif gap > used_val:
+            delta = f"  (ruim, wij hanteren {used_val} min)"
+            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
+        else:
+            delta = f"  (= gehanteerd)"
+            print(f"    {svc:30s} ({bt:15s})  dienstregeling {gap:3d} min{delta}")
     print()
 
     total_reserves = sum(r.count for r in reserves)
