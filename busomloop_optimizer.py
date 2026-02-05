@@ -659,7 +659,7 @@ def get_station_halts() -> dict:
 # ZE (Zero Emission) Configuration - Version 6
 # ---------------------------------------------------------------------------
 
-# Default ZE configuration (used if financieel_input.xlsx not available)
+# Default ZE configuration (used if additional_inputs.xlsx not available)
 ZE_DEFAULTS = {
     "ze_range_km": {
         "Touringcar": 300,
@@ -686,8 +686,10 @@ ZE_DEFAULTS = {
 }
 
 
-def load_ze_config(financieel_xlsx: str = "financieel_input.xlsx") -> dict:
-    """Load ZE configuration from financieel_input.xlsx Buskosten sheet.
+def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
+    """Load ZE configuration from additional_inputs.xlsx Buskosten sheet.
+
+    Also supports the older financieel_input.xlsx format for backward compatibility.
 
     Returns dict with:
         - ze_range_km: {bus_type: range_km}
@@ -701,9 +703,9 @@ def load_ze_config(financieel_xlsx: str = "financieel_input.xlsx") -> dict:
         "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
     }
 
-    path = Path(financieel_xlsx)
+    path = Path(inputs_xlsx)
     if not path.exists():
-        print(f"  ZE config: {financieel_xlsx} niet gevonden, standaardwaarden gebruikt")
+        print(f"  ZE config: {inputs_xlsx} niet gevonden, standaardwaarden gebruikt")
         return config
 
     try:
@@ -875,18 +877,41 @@ def analyze_ze_feasibility(rotation: BusRotation, ze_config: dict,
         total_recoverable_km = 0
         for station, duration_min, chargers in charging_opportunities:
             best_charger = chargers[0]  # Already sorted by power
+
+            # Account for driving time to/from charger
+            # Assume 30 km/h average speed in urban area
+            drive_time_one_way = (best_charger.distance_km / 30) * 60  # minutes
+            drive_time_total = 2 * drive_time_one_way  # round trip
+            extra_km = 2 * best_charger.distance_km  # round trip adds to total km
+
+            # Actual time available for charging
+            actual_charge_time = duration_min - drive_time_total
+            if actual_charge_time < 10:  # Need at least 10 min to make it worthwhile
+                continue
+
             # kWh charged = power * time * efficiency
-            kwh_charged = best_charger.max_power_kw * (duration_min / 60) * 0.8
+            kwh_charged = best_charger.max_power_kw * (actual_charge_time / 60) * 0.8
             km_recovered = (kwh_charged / consumption) * 100
-            total_recoverable_km += km_recovered
+
+            # Net km benefit = km recovered - extra km driven to charger
+            net_km_benefit = km_recovered - extra_km
+            if net_km_benefit <= 0:
+                continue
+
+            total_recoverable_km += net_km_benefit
 
             if total_km <= ze_range + total_recoverable_km:
                 recommended_charging.append({
                     "station": station,
                     "duration_min": duration_min,
+                    "drive_time_min": round(drive_time_total, 0),
+                    "actual_charge_min": round(actual_charge_time, 0),
                     "charger": best_charger.name,
+                    "charger_distance_km": best_charger.distance_km,
                     "power_kw": best_charger.max_power_kw,
                     "km_recovered": round(km_recovered, 1),
+                    "extra_km_driven": round(extra_km, 1),
+                    "net_km_benefit": round(net_km_benefit, 1),
                 })
                 is_feasible_with_charging = True
                 break
@@ -3393,10 +3418,10 @@ def main():
              "Gegenereerd door fetch_tanklocaties.py. Standaard: tanklocaties.json",
     )
     parser.add_argument(
-        "--financieel",
-        default="financieel_input.xlsx",
-        help="Excel bestand met financiële variabelen (ZE bereik, etc.). "
-             "Gegenereerd door create_financieel_input.py. Standaard: financieel_input.xlsx",
+        "--inputs",
+        default="additional_inputs.xlsx",
+        help="Excel bestand met busspecificaties, tarieven, tankinhoud, etc. "
+             "Gegenereerd door create_additional_inputs.py. Standaard: additional_inputs.xlsx",
     )
     args = parser.parse_args()
 
@@ -3465,7 +3490,7 @@ def main():
     charging_stations = None
     if args.ze:
         print("ZE configuratie laden...")
-        ze_config = load_ze_config(args.financieel)
+        ze_config = load_ze_config(args.inputs)
         charging_stations = load_charging_stations(args.tanklocaties)
 
     # --snel mode: only useful when deadhead is provided + multiple algos
