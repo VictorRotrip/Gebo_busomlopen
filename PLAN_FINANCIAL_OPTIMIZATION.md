@@ -8,12 +8,66 @@ of buses and idle time. This plan extends the optimizer with versions 6-9 that i
 **financial optimization**: maximizing profit by considering revenue, driver costs (CAO BB),
 bus operating costs, sustainability bonuses, and penalty (malus) avoidance.
 
+**Important constraint**: Bus types are dictated by NS in the input Excel (Bijlage J). If NS
+specifies a Dubbeldekker for a trip, we must use a Dubbeldekker. The optimizer cannot swap bus
+types. What the optimizer CAN optimize is:
+- Which trips to chain together on the same bus (affects idle time, deadhead, shift length)
+- Which fuel type to use per bus (diesel B7 / HVO100 / electric ZE)
+- How to schedule fueling/charging stops
+- How to minimize driver costs through smart chaining (reducing ORT, overtime, broken shifts)
+
 All financial variables are sourced from `Commerciele_variabelen.xlsx` (5 data sheets):
 - **CAO_variabelen** — driver labor costs (80 variables)
 - **Contract_variabelen** — contract terms, sustainability incentives (18 variables)
 - **Malus_variabelen** — KPI penalties and bonuses (50 variables)
 - **Prijzenblad_variabelen** — hourly rates, start fees (22 variables)
 - **PvEisen_variabelen** — service level requirements (36 variables)
+
+---
+
+## How the Current Mincost Algorithm Works
+
+### Network Structure
+The algorithm models trip chaining as a **bipartite matching problem**:
+- **Nodes**: Each of the `n` trips is both a potential predecessor (left) and successor (right)
+- **Edges**: `i → j` exists if trip `i` can be followed by trip `j` on the same bus
+- **Edge cost**: `deadhead_time × 2 + idle_time` (or just `idle_time` if same location)
+
+### can_connect() Checks
+Before an edge is created, ALL of these must hold:
+1. Same bus type (`trip_i.bus_type == trip_j.bus_type`)
+2. Same date (`trip_i.date_str == trip_j.date_str`)
+3. Time order (`trip_j.departure > trip_i.arrival`)
+4. Location feasible (same station, or deadhead matrix allows travel)
+5. Time feasible (gap ≥ turnaround time + deadhead driving time)
+
+### Cost Function (Current)
+```
+idle = trip_j.departure - trip_i.arrival
+cost = deadhead_time × 2 + idle    (if different locations)
+cost = idle                         (if same location)
+```
+Deadhead is weighted 2× because empty driving wastes fuel + driver time with no revenue.
+
+### SPFA Algorithm
+The Successive Shortest Path Algorithm (SPFA) finds:
+1. **Maximum matching** = minimum number of buses (primary objective)
+2. **Minimum total cost** = least deadhead + idle (secondary objective)
+
+It works by repeatedly finding the cheapest "augmenting path" — a chain of reassignments
+that merges two buses into one — until no more merges are possible.
+
+### Result
+Chains like `[A→B→D]` and `[C→E]`, where each chain = one BusRotation (one bus's daily
+schedule). The algorithm guarantees the minimum possible number of buses.
+
+### What Changes for Financial Optimization
+The cost function changes from `deadhead × 2 + idle` to a euro-based cost that considers:
+- Revenue lost during idle/deadhead time (bus earns nothing)
+- Driver cost during idle time (still getting paid)
+- Fuel cost during deadhead drives
+- ORT surcharges if chaining extends shifts into unsocial hours
+- Break deduction impacts from shift length changes
 
 ---
 
@@ -61,11 +115,11 @@ Key CAO rules affecting paid hours:
 BUS_COST = Σ (km_driven × fuel_consumption_per_km × fuel_price)
          + deadhead_km × fuel_consumption × fuel_price
 ```
-Parameters needed (not yet in spreadsheet — must be configured):
+Parameters needed (from API or manual config):
 - Fuel consumption per bus type (L/100km for diesel/HVO, kWh/100km for ZE)
-- Diesel B7 price per liter
-- HVO100 price per liter
-- Electricity price per kWh
+- Diesel B7 price per liter (from CBS OData API)
+- HVO100 price per liter (manual config from Rolande)
+- Electricity price per kWh (from EnergyZero API)
 - Bus range (km) for ZE, tank size for diesel
 - Charging time for ZE buses
 
@@ -103,29 +157,118 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 ### Version 7: Cost-Optimized Roster (`7_financieel_geoptimaliseerd`)
 **Goal**: Re-optimize with profit as objective instead of bus count
 
-- Modify min-cost flow: edge weights = `cost_saved − revenue_lost` instead of `deadhead × 2 + idle`
-- Trade-offs: fewer expensive Dubbeldekkers if Touringcars suffice
-- Minimize ORT exposure: prefer scheduling in daytime windows where possible
-- Manage overtime: avoid shifts >7.5h to reduce break deductions and surcharges
-- Allow bus type flexibility when capacity permits
+- Modify min-cost flow: edge weights become euro-based costs instead of `deadhead × 2 + idle`
+- New cost per edge (i→j): `driver_cost(shift_with_j) - driver_cost(shift_without_j) + fuel_cost(deadhead) - revenue_from_reduced_buses`
+- Minimize ORT exposure: prefer chaining trips that keep shifts within daytime hours
+- Manage overtime: consider break deduction bracket jumps when extending shifts
+- **Bus types remain fixed** as dictated by NS input — only chaining order changes
 
 ### Version 8: Sustainability-Optimized (`8_duurzaamheid_geoptimaliseerd`)
-**Goal**: Optimize ZE/HVO bus assignment to maximize sustainability bonuses and avoid malus
+**Goal**: Optimize fuel-type assignment per bus to maximize sustainability bonuses and avoid malus
 
-- Add fuel-type dimension to bus assignment (Diesel/HVO100/Electric)
+- Add fuel-type dimension to each bus rotation (Diesel B7 / HVO100 / Electric ZE)
+- Bus type stays as NS specifies; fuel type is our choice
 - Calculate sustainability KPI scores and project malus/bonus
-- Assign ZE buses to shorter routes (range-feasible) to maximize €0.12/km bonus
-- Schedule HVO100 on remaining routes to hit sustainable fuel targets
-- Determine optimal mix: the marginal cost of ZE vs. the bonus + malus avoidance
+- Assign ZE to shorter rotations (range-feasible) to maximize €0.12/km bonus
+- Assign HVO100 to remaining rotations to hit sustainable fuel KPI targets
+- Determine optimal mix: marginal cost of ZE/HVO vs. bonus + malus avoidance
 
 ### Version 9: Full Financial + Fueling/Charging (`9_volledig_financieel`)
 **Goal**: Full profit optimization including fuel logistics
 
-- Range constraints for ZE buses; determine charging windows
-- Fuel station locations for diesel/HVO along routes (Google Maps API)
-- Charging station locations and availability
+- Range constraints for ZE buses; determine charging windows during idle periods
+- Fuel station locations for diesel/HVO along routes (OpenStreetMap + Google Maps)
+- Charging station locations and availability (Open Charge Map API)
 - Optimal fueling stops that minimize schedule disruption
 - Complete profit optimization: revenue − all costs − penalties + all bonuses
+
+---
+
+## API Integrations for Automated Data
+
+### Recommended API Stack (all free or freemium)
+
+| Data Need | API | Free? | Auth | Notes |
+|-----------|-----|-------|------|-------|
+| Diesel B7 price | **CBS OData** (table `80416ned`) | Yes | None | Daily NL average, official government data |
+| Electricity price | **EnergyZero API** | Yes | None | Hourly Dutch EPEX spot prices incl. BTW |
+| HVO100 price | **Manual config** (Rolande website) | N/A | N/A | No public API exists for HVO100 |
+| Fuel station locations | **OpenStreetMap Overpass** | Yes | None | Full NL, includes `fuel:HVO100=yes` tags |
+| Fuel station prices | **HERE Fuel Prices API** | 250K/mo free | API key | Per-station real-time prices |
+| EV charging stations | **Open Charge Map** | Yes | Free API key | Connector types, power ratings, locations |
+| EV charging (premium) | **Eco-Movement** | Paid | Enterprise | 99% NL coverage, real-time availability |
+| EU-level fuel reference | **EU Weekly Oil Bulletin** | Yes | None | Weekly national averages for cross-check |
+
+### CBS OData — Diesel B7 Prices
+```python
+# pip install cbsodata pandas
+import cbsodata, pandas as pd
+data = pd.DataFrame(cbsodata.get_data('80416ned'))  # Daily pump prices NL
+# Returns: Euro95, Diesel B7, LPG — weighted average incl. VAT
+```
+- URL: https://opendata.cbs.nl/ODataFeed/odata/80416ned
+- License: CC BY 4.0
+- No rate limits, no auth
+
+### EnergyZero — Hourly Electricity Prices
+```python
+# pip install energyzero
+from energyzero import EnergyZero
+from datetime import date
+import asyncio
+
+async def get_prices():
+    async with EnergyZero() as client:
+        prices = await client.energy_prices(start_date=date(2026, 2, 4), end_date=date(2026, 2, 5))
+        print(f"Current: {prices.current_price}, Avg: {prices.average_price}")
+asyncio.run(get_prices())
+```
+- URL: https://api.energyzero.nl/v1/energyprices
+- Dutch EPEX spot day-ahead, including BTW
+- No auth required
+
+### OpenStreetMap Overpass — Fuel & Charging Stations
+```
+# All fuel stations in NL (including HVO100 tags)
+[out:json][timeout:25];
+area["name"="Nederland"]->.searchArea;
+node["amenity"="fuel"](area.searchArea);
+out body;
+
+# All EV charging stations in NL
+[out:json][timeout:25];
+area["name"="Nederland"]->.searchArea;
+node["amenity"="charging_station"](area.searchArea);
+out body;
+```
+- URL: https://overpass-api.de/api/interpreter
+- Returns: lat/lon, brand, fuel types (fuel:diesel, fuel:HVO100), opening hours
+- Completely free, no auth
+
+### Open Charge Map — EV Charging Details
+```
+GET https://api.openchargemap.io/v3/poi/?output=json
+    &latitude=52.3676&longitude=4.9041
+    &distance=10&maxresults=50
+    &countrycode=NL
+    &key={FREE_API_KEY}
+```
+- Register at openchargemap.org for free API key
+- Returns: location, operator, connector types (Type 2, CCS, CHAdeMO), power (kW), status
+
+### HVO100 — Manual Sources (No API Available)
+| Source | URL | Data |
+|--------|-----|------|
+| Rolande | https://rolande.eu/en/pricing/ | Published HVO100 prices excl. VAT |
+| glpautogas.info | https://glpautogas.info/en/hvo100-stations-netherlands.html | 131 HVO100 stations in NL with prices |
+| Argus Media | argusmedia.com (paid) | Wholesale HVO ARA market prices |
+
+### Alternative Fuel Station APIs (if more data needed)
+- **ANWB API** (unofficial): ~3800 stations with prices, reverse-engineered from app
+  - GitHub: https://github.com/bartmachielsen/ANWB-Fuel-Prices
+- **HERE Fuel Prices**: per-station real-time prices, 250K free requests/month
+- **Google Maps Places API**: use `type=gas_station` or `type=electric_vehicle_charging_station`
+  - Already integrated via `google_maps_distances.py` — can extend with Places Nearby Search
 
 ---
 
@@ -146,14 +289,23 @@ Key logic:
 - Overtime detection and surcharge calculation
 - Date-dependent rate selection (2025-01-01, 2025-07-01, 2026-01-01)
 
-### Step 2: Bus Operating Cost Config
+### Step 2: Fuel Price Fetcher Module (`fuel_prices.py`)
+New module that fetches real-time fuel prices:
+- `fetch_diesel_price() → float` — CBS OData API
+- `fetch_electricity_price(date, hour) → float` — EnergyZero API
+- `load_hvo100_price(config) → float` — from manual config
+- `fetch_fuel_stations(lat, lon, radius) → list` — OpenStreetMap Overpass
+- `fetch_charging_stations(lat, lon, radius) → list` — Open Charge Map
+- Cache results to avoid excessive API calls
+
+### Step 3: Bus Operating Cost Config
 New JSON config file (`bus_costs.json`) with:
 ```json
 {
   "fuel_prices": {
-    "diesel_b7_eur_per_liter": 1.85,
+    "diesel_b7_eur_per_liter": "auto",
     "hvo100_eur_per_liter": 2.15,
-    "electricity_eur_per_kwh": 0.25
+    "electricity_eur_per_kwh": "auto"
   },
   "consumption_per_100km": {
     "Dubbeldekker": {"diesel": 45, "hvo100": 45, "electric_kwh": 180},
@@ -173,36 +325,31 @@ New JSON config file (`bus_costs.json`) with:
   "driver_overhead_factor": 1.35
 }
 ```
+Values marked `"auto"` are fetched from APIs; others are manually configured.
 
-### Step 3: Extend busomloop_optimizer.py
+### Step 4: Extend busomloop_optimizer.py
 - New CLI flags: `--financieel`, `--bus-costs JSON`, `--brandstof-api`
-- Import `financial_calculator` module
+- Import `financial_calculator` and `fuel_prices` modules
 - Add version 6 output generation (financial overlay)
-- Add version 7 optimization with profit objective
-- Add version 8 with sustainability constraints
+- Add version 7 optimization with euro-based cost function
+- Add version 8 with sustainability fuel-type assignment
 - Add version 9 with fueling/charging logistics
 
-### Step 4: Extend Output Excel
+### Step 5: Extend Output Excel
 New sheets per financial version:
 - **Financieel Overzicht**: revenue, costs, profit per bus, per day, per bus type
 - **CAO Kosten Detail**: paid hours, ORT, overtime, surcharges per shift
 - **Duurzaamheid KPI**: sustainability scores, malus/bonus projection
 - **Brandstof/Laden Plan**: fueling schedule, charging windows (version 9)
 
-### Step 5: Optional API Integrations
-- Fuel prices: [brandstof-check.nl API](https://brandstof-check.nl) or manual CSV
-- Google Maps: extend `google_maps_distances.py` with fuel/charging station search
-  - Places API: `type=gas_station` or `type=electric_vehicle_charging_station`
-  - Filter along route corridors
-
 ---
 
 ## Variable Priority (Impact on Profit)
 
 ### Highest Impact
-1. **Hourly rates** (Prijzenblad) — directly determines revenue
+1. **Hourly rates** (Prijzenblad) — directly determines revenue; fixed by NS per bus type
 2. **Number of buses × active hours** — total revenue driver
-3. **Bus type selection** — DD earns €36/h more than TC but costs more
+3. **Shift composition** — which trips chain together affects idle time (= unpaid but costly)
 4. **ORT surcharges** — €4–7/h extra cost during unsocial hours
 5. **Sustainability KPI** — malus €1,000 per 0.1pp, adds up fast
 
@@ -223,24 +370,27 @@ New sheets per financial version:
 ## Key Trade-offs the Optimizer Must Balance
 
 1. **More buses = more cost, but also more revenue** (if active hours are filled)
-2. **Dubbeldekker vs Touringcar**: higher revenue rate but higher operating cost
-3. **Deadhead drives**: cost fuel/driver time but enable more revenue per bus
-4. **Evening/night scheduling**: higher driver cost (ORT) but may be required
-5. **Long shifts**: higher meal/break costs but fewer driver changeovers
-6. **ZE buses**: lower fuel cost + €0.12/km bonus but range-limited
+2. **Chaining order affects shift length** — longer shifts cross break deduction brackets and may trigger overtime
+3. **Deadhead drives**: cost fuel/driver time but enable more revenue per bus (fewer buses needed)
+4. **Evening/night scheduling**: higher driver cost (ORT) but may be required by NS timetable
+5. **Long shifts**: higher meal/break costs but fewer driver changeovers needed
+6. **ZE buses**: lower fuel cost + €0.12/km bonus but range-limited and need charging windows
 7. **HVO vs diesel**: higher fuel cost but up to €0.40/L incentive
-8. **Sustainability target**: hitting targets avoids €1000/0.1pp malus
+8. **Sustainability target**: hitting targets avoids €1000/0.1pp malus — worth investing in ZE/HVO
 
 ---
 
 ## Data Gaps to Resolve Before Implementation
 
-| Gap | Action |
-|-----|--------|
-| Base hourly wage per driver | Get from CAO loonschalen or estimate |
-| Fuel consumption per bus type | Get from fleet operator or estimate |
-| Current fuel prices (diesel B7, HVO100, electricity) | Manual input or API |
-| Bus fleet composition (how many ZE/HVO/diesel per type) | Get from operator |
-| Charging infrastructure at stations | Survey or Google Maps API |
-| Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) |
-| Bus range and tank/battery capacity | Get from fleet specs |
+| Gap | Action | Source |
+|-----|--------|--------|
+| Base hourly wage per driver | Get from CAO loonschalen or estimate | CAO Besluit Personenvervoer |
+| Fuel consumption per bus type | Get from fleet operator or estimate | Fleet data / manufacturer specs |
+| Current diesel B7 price | **Automated**: CBS OData API | https://opendata.cbs.nl |
+| Current electricity price | **Automated**: EnergyZero API | https://api.energyzero.nl |
+| HVO100 price | Manual config from Rolande | https://rolande.eu/en/pricing/ |
+| Bus fleet composition (ZE/HVO/diesel) | Get from operator | Fleet inventory |
+| Fuel station locations | **Automated**: OpenStreetMap Overpass | https://overpass-api.de |
+| Charging station locations | **Automated**: Open Charge Map | https://openchargemap.org |
+| Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) | Contract negotiation |
+| Bus range and tank/battery capacity | Get from fleet specs | Manufacturer data |
