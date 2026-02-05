@@ -659,7 +659,7 @@ def get_station_halts() -> dict:
 # ZE (Zero Emission) Configuration - Version 6
 # ---------------------------------------------------------------------------
 
-# Default ZE configuration (used if financieel_input.xlsx not available)
+# Default ZE configuration (used if additional_inputs.xlsx not available)
 ZE_DEFAULTS = {
     "ze_range_km": {
         "Touringcar": 300,
@@ -686,8 +686,10 @@ ZE_DEFAULTS = {
 }
 
 
-def load_ze_config(financieel_xlsx: str = "financieel_input.xlsx") -> dict:
-    """Load ZE configuration from financieel_input.xlsx Buskosten sheet.
+def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
+    """Load ZE configuration from additional_inputs.xlsx Buskosten sheet.
+
+    Also supports the older financieel_input.xlsx format for backward compatibility.
 
     Returns dict with:
         - ze_range_km: {bus_type: range_km}
@@ -701,9 +703,9 @@ def load_ze_config(financieel_xlsx: str = "financieel_input.xlsx") -> dict:
         "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
     }
 
-    path = Path(financieel_xlsx)
+    path = Path(inputs_xlsx)
     if not path.exists():
-        print(f"  ZE config: {financieel_xlsx} niet gevonden, standaardwaarden gebruikt")
+        print(f"  ZE config: {inputs_xlsx} niet gevonden, standaardwaarden gebruikt")
         return config
 
     try:
@@ -3416,10 +3418,10 @@ def main():
              "Gegenereerd door fetch_tanklocaties.py. Standaard: tanklocaties.json",
     )
     parser.add_argument(
-        "--financieel",
-        default="financieel_input.xlsx",
-        help="Excel bestand met financiële variabelen (ZE bereik, etc.). "
-             "Gegenereerd door create_financieel_input.py. Standaard: financieel_input.xlsx",
+        "--inputs",
+        default="additional_inputs.xlsx",
+        help="Excel bestand met busspecificaties, tarieven, tankinhoud, etc. "
+             "Gegenereerd door create_additional_inputs.py. Standaard: additional_inputs.xlsx",
     )
     args = parser.parse_args()
 
@@ -3488,7 +3490,7 @@ def main():
     charging_stations = None
     if args.ze:
         print("ZE configuratie laden...")
-        ze_config = load_ze_config(args.financieel)
+        ze_config = load_ze_config(args.inputs)
         charging_stations = load_charging_stations(args.tanklocaties)
 
     # --snel mode: only useful when deadhead is provided + multiple algos
