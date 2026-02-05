@@ -128,6 +128,39 @@ class ReserveBus:
 
 
 # ---------------------------------------------------------------------------
+# ZE (Zero Emission) Data Classes - Version 6
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChargingStation:
+    """A charging station near a bus station."""
+    name: str
+    operator: str
+    lat: float
+    lon: float
+    distance_km: float
+    max_power_kw: float
+    num_points: int
+    connectors: list
+    category: str  # ultra_fast, fast, semi_fast, slow
+
+
+@dataclass
+class ZEFeasibility:
+    """ZE feasibility assessment for a rotation."""
+    rotation_id: str
+    bus_type: str
+    total_km: float
+    ze_range_km: float
+    is_feasible: bool
+    needs_charging: bool
+    buffer_km: float  # remaining range after rotation
+    charging_opportunities: list  # [(station, idle_window_min, chargers), ...]
+    recommended_charging: list  # planned charging stops
+    reason: str  # why feasible/not feasible
+
+
+# ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
 
@@ -620,6 +653,319 @@ def get_station_registry() -> dict:
 def get_station_halts() -> dict:
     """Return halt info per station: {canonical_key: set of halt names}."""
     return {k: set(v) for k, v in _CANONICAL_TO_HALTS.items()}
+
+
+# ---------------------------------------------------------------------------
+# ZE (Zero Emission) Configuration - Version 6
+# ---------------------------------------------------------------------------
+
+# Default ZE configuration (used if financieel_input.xlsx not available)
+ZE_DEFAULTS = {
+    "ze_range_km": {
+        "Touringcar": 300,
+        "Dubbeldekker": 250,
+        "Lagevloerbus": 280,
+        "Midi bus": 350,
+        "Taxibus": 400,
+    },
+    "ze_consumption_kwh_per_100km": {
+        "Touringcar": 130,
+        "Dubbeldekker": 180,
+        "Lagevloerbus": 150,
+        "Midi bus": 100,
+        "Taxibus": 50,
+    },
+    # Estimated average speed for km calculation (km/h)
+    "avg_speed_kmh": {
+        "Touringcar": 50,
+        "Dubbeldekker": 45,
+        "Lagevloerbus": 40,
+        "Midi bus": 45,
+        "Taxibus": 50,
+    },
+}
+
+
+def load_ze_config(financieel_xlsx: str = "financieel_input.xlsx") -> dict:
+    """Load ZE configuration from financieel_input.xlsx Buskosten sheet.
+
+    Returns dict with:
+        - ze_range_km: {bus_type: range_km}
+        - ze_consumption_kwh_per_100km: {bus_type: kwh}
+        - avg_speed_kmh: {bus_type: km/h for estimating distances}
+    """
+    import json
+    config = {
+        "ze_range_km": dict(ZE_DEFAULTS["ze_range_km"]),
+        "ze_consumption_kwh_per_100km": dict(ZE_DEFAULTS["ze_consumption_kwh_per_100km"]),
+        "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+    }
+
+    path = Path(financieel_xlsx)
+    if not path.exists():
+        print(f"  ZE config: {financieel_xlsx} niet gevonden, standaardwaarden gebruikt")
+        return config
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        if "Buskosten" not in wb.sheetnames:
+            print(f"  ZE config: 'Buskosten' blad niet gevonden, standaardwaarden gebruikt")
+            wb.close()
+            return config
+
+        ws = wb["Buskosten"]
+
+        # Parse the sheet to find ZE range and consumption values
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+            if not row or not row[0]:
+                continue
+            var_name = str(row[0]).lower()
+            value = row[1]
+
+            # ZE range (actieradius)
+            if "actieradius" in var_name and "_ze" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    config["ze_range_km"]["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    config["ze_range_km"]["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    config["ze_range_km"]["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    config["ze_range_km"]["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    config["ze_range_km"]["Taxibus"] = float(value)
+
+            # ZE consumption (kWh per 100km)
+            if "verbruik" in var_name and "_ze" in var_name and "kwh" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    config["ze_consumption_kwh_per_100km"]["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    config["ze_consumption_kwh_per_100km"]["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    config["ze_consumption_kwh_per_100km"]["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    config["ze_consumption_kwh_per_100km"]["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    config["ze_consumption_kwh_per_100km"]["Taxibus"] = float(value)
+
+        wb.close()
+        print(f"  ZE config geladen: bereik Touringcar = {config['ze_range_km']['Touringcar']} km")
+    except Exception as e:
+        print(f"  ZE config laden mislukt ({e}), standaardwaarden gebruikt")
+
+    return config
+
+
+def load_charging_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
+    """Load charging station data from tanklocaties.json.
+
+    Returns: {station_name: [ChargingStation, ...]}
+    """
+    import json
+    path = Path(tanklocaties_json)
+    if not path.exists():
+        print(f"  Laadstations: {tanklocaties_json} niet gevonden")
+        return {}
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        stations_by_location = {}
+
+        for station_name, station_data in data.get("stations", {}).items():
+            chargers = []
+            for cs in station_data.get("charging_stations", []):
+                chargers.append(ChargingStation(
+                    name=cs.get("name", "Unknown"),
+                    operator=cs.get("operator", ""),
+                    lat=cs.get("lat", 0),
+                    lon=cs.get("lon", 0),
+                    distance_km=cs.get("distance_km", 0),
+                    max_power_kw=cs.get("max_power_kw", 0),
+                    num_points=cs.get("num_points", 1),
+                    connectors=cs.get("connectors", []),
+                    category=cs.get("category", "slow"),
+                ))
+
+            # Sort by power (prefer fast chargers) then by distance
+            chargers.sort(key=lambda c: (-c.max_power_kw, c.distance_km))
+            stations_by_location[station_name] = chargers
+
+        total_chargers = sum(len(v) for v in stations_by_location.values())
+        print(f"  Laadstations geladen: {len(stations_by_location)} locaties, {total_chargers} laadpunten")
+        return stations_by_location
+    except Exception as e:
+        print(f"  Laadstations laden mislukt: {e}")
+        return {}
+
+
+def estimate_rotation_km(rotation: BusRotation, ze_config: dict) -> float:
+    """Estimate total km for a rotation based on ride time and average speed."""
+    bus_type = rotation.bus_type
+    avg_speed = ze_config["avg_speed_kmh"].get(bus_type, 45)
+
+    # Use total ride minutes (excluding waiting time)
+    ride_minutes = rotation.total_ride_minutes
+    if ride_minutes <= 0:
+        return 0.0
+
+    # km = speed (km/h) × time (h)
+    return avg_speed * (ride_minutes / 60)
+
+
+def get_idle_windows(rotation: BusRotation, min_idle_min: int = 30) -> list:
+    """Get idle windows for a rotation where charging could happen.
+
+    Returns: [(station_code, start_min, end_min, duration_min), ...]
+    """
+    windows = []
+    trips = rotation.trips
+
+    for i in range(1, len(trips)):
+        prev_trip = trips[i - 1]
+        next_trip = trips[i]
+
+        gap = next_trip.departure - prev_trip.arrival
+        if gap >= min_idle_min:
+            # The bus is waiting at the destination of prev_trip
+            station = normalize_location(prev_trip.dest_code)
+            windows.append((station, prev_trip.arrival, next_trip.departure, gap))
+
+    return windows
+
+
+def analyze_ze_feasibility(rotation: BusRotation, ze_config: dict,
+                           charging_stations: dict) -> ZEFeasibility:
+    """Analyze whether a rotation can be done with a ZE bus."""
+    bus_type = rotation.bus_type
+    ze_range = ze_config["ze_range_km"].get(bus_type, 300)
+    total_km = estimate_rotation_km(rotation, ze_config)
+
+    # Simple feasibility: total km <= range
+    buffer_km = ze_range - total_km
+    is_feasible_without_charging = buffer_km >= 0
+
+    # Check charging opportunities during idle windows
+    idle_windows = get_idle_windows(rotation)
+    charging_opportunities = []
+
+    for station, start_min, end_min, duration_min in idle_windows:
+        # Find matching charging station (try exact match and normalized)
+        chargers = charging_stations.get(station, [])
+        if not chargers:
+            # Try normalized version
+            for loc_name in charging_stations:
+                if normalize_location(loc_name) == station:
+                    chargers = charging_stations[loc_name]
+                    break
+
+        fast_chargers = [c for c in chargers if c.max_power_kw >= 50]
+        if fast_chargers:
+            charging_opportunities.append((station, duration_min, fast_chargers))
+
+    # Calculate if charging can extend range sufficiently
+    needs_charging = not is_feasible_without_charging
+    is_feasible_with_charging = False
+    recommended_charging = []
+
+    if needs_charging and charging_opportunities:
+        consumption = ze_config["ze_consumption_kwh_per_100km"].get(bus_type, 130)
+
+        total_recoverable_km = 0
+        for station, duration_min, chargers in charging_opportunities:
+            best_charger = chargers[0]  # Already sorted by power
+            # kWh charged = power * time * efficiency
+            kwh_charged = best_charger.max_power_kw * (duration_min / 60) * 0.8
+            km_recovered = (kwh_charged / consumption) * 100
+            total_recoverable_km += km_recovered
+
+            if total_km <= ze_range + total_recoverable_km:
+                recommended_charging.append({
+                    "station": station,
+                    "duration_min": duration_min,
+                    "charger": best_charger.name,
+                    "power_kw": best_charger.max_power_kw,
+                    "km_recovered": round(km_recovered, 1),
+                })
+                is_feasible_with_charging = True
+                break
+
+    is_feasible = is_feasible_without_charging or is_feasible_with_charging
+
+    # Determine reason
+    if is_feasible_without_charging:
+        reason = f"Bereik voldoende: {total_km:.0f} km < {ze_range:.0f} km (buffer: {buffer_km:.0f} km)"
+    elif is_feasible_with_charging:
+        reason = f"Haalbaar met opladen tijdens wachttijd"
+    else:
+        reason = f"Niet haalbaar: {total_km:.0f} km > {ze_range:.0f} km"
+
+    return ZEFeasibility(
+        rotation_id=rotation.bus_id,
+        bus_type=bus_type,
+        total_km=total_km,
+        ze_range_km=ze_range,
+        is_feasible=is_feasible,
+        needs_charging=needs_charging and is_feasible,
+        buffer_km=buffer_km,
+        charging_opportunities=charging_opportunities,
+        recommended_charging=recommended_charging,
+        reason=reason,
+    )
+
+
+def assign_ze_buses(rotations: list, min_ze_count: int, ze_config: dict,
+                    charging_stations: dict,
+                    target_bus_type: str = "Touringcar") -> dict:
+    """Assign ZE to rotations, ensuring minimum count for target bus type.
+
+    Returns: {rotation_id: ZEFeasibility}
+    """
+    # Filter to target bus type
+    target_rotations = [r for r in rotations if r.bus_type == target_bus_type]
+
+    if len(target_rotations) < min_ze_count:
+        print(f"  Waarschuwing: slechts {len(target_rotations)} {target_bus_type} omlopen, "
+              f"maar {min_ze_count} ZE vereist")
+
+    # Analyze feasibility for all target rotations
+    feasibility_results = []
+    for rotation in target_rotations:
+        feas = analyze_ze_feasibility(rotation, ze_config, charging_stations)
+        feasibility_results.append(feas)
+
+    # Sort by suitability for ZE:
+    # 1. Feasible without charging first
+    # 2. Then by buffer (more buffer = safer choice)
+    # 3. Then by total km (shorter = better)
+    def ze_score(f: ZEFeasibility) -> tuple:
+        return (
+            0 if f.is_feasible and not f.needs_charging else 1,
+            0 if f.is_feasible else 1,
+            -f.buffer_km,
+            f.total_km,
+        )
+
+    feasibility_results.sort(key=ze_score)
+
+    # Assign ZE to top N feasible rotations
+    ze_assignments = {}
+    assigned_count = 0
+
+    for feas in feasibility_results:
+        if feas.is_feasible and assigned_count < min_ze_count:
+            ze_assignments[feas.rotation_id] = feas
+            assigned_count += 1
+
+    if assigned_count < min_ze_count:
+        print(f"  Waarschuwing: slechts {assigned_count} ZE toewijsbaar, "
+              f"{min_ze_count} vereist")
+
+    # Include all feasibility results for reporting
+    all_results = {f.rotation_id: f for f in feasibility_results}
+
+    return ze_assignments, all_results, assigned_count
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
@@ -2677,6 +3023,218 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
         ws.column_dimensions[get_column_letter(c)].width = w
 
 
+# ---------------------------------------------------------------------------
+# ZE Output Sheets - Version 6
+# ---------------------------------------------------------------------------
+
+# ZE-specific style constants
+ZE_HEADER_FILL = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+ZE_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+ZE_WARNING_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+ZE_ERROR_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+
+def write_ze_inzet_sheet(wb, ze_assignments: dict, all_results: dict,
+                          rotations: list, min_ze_count: int):
+    """Write ZE Inzet sheet showing ZE touringcar assignments."""
+    ws = wb.create_sheet("ZE Inzet")
+
+    headers = ["Bus ID", "Bustype", "Datum", "Totaal km", "ZE Bereik km",
+               "Buffer km", "ZE Toegewezen", "Laden Nodig", "Reden"]
+
+    # Header row
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = ZE_HEADER_FILL
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center")
+
+    # Get touringcar rotations with feasibility
+    touringcar_rots = [r for r in rotations if r.bus_type == "Touringcar"]
+
+    # Sort: assigned first, then by feasibility, then by km
+    def sort_key(r):
+        feas = all_results.get(r.bus_id)
+        if feas is None:
+            return (2, 0, 0)
+        is_assigned = r.bus_id in ze_assignments
+        return (0 if is_assigned else 1, 0 if feas.is_feasible else 1, feas.total_km)
+
+    touringcar_rots.sort(key=sort_key)
+
+    row = 2
+    for rotation in touringcar_rots:
+        feas = all_results.get(rotation.bus_id)
+        if feas is None:
+            continue
+
+        is_assigned = rotation.bus_id in ze_assignments
+
+        ws.cell(row=row, column=1, value=rotation.bus_id).border = THIN_BORDER
+        ws.cell(row=row, column=2, value=rotation.bus_type).border = THIN_BORDER
+        ws.cell(row=row, column=3, value=rotation.date_str).border = THIN_BORDER
+        ws.cell(row=row, column=4, value=round(feas.total_km, 1)).border = THIN_BORDER
+        ws.cell(row=row, column=5, value=feas.ze_range_km).border = THIN_BORDER
+        ws.cell(row=row, column=6, value=round(feas.buffer_km, 1)).border = THIN_BORDER
+
+        ze_cell = ws.cell(row=row, column=7, value="JA" if is_assigned else "Nee")
+        ze_cell.border = THIN_BORDER
+        if is_assigned:
+            ze_cell.fill = ZE_FILL
+            ze_cell.font = Font(bold=True)
+
+        charging_cell = ws.cell(row=row, column=8,
+                                value="Ja" if feas.needs_charging else "Nee")
+        charging_cell.border = THIN_BORDER
+        if feas.needs_charging:
+            charging_cell.fill = ZE_WARNING_FILL
+
+        ws.cell(row=row, column=9, value=feas.reason).border = THIN_BORDER
+
+        row += 1
+
+    # Column widths
+    col_widths = [15, 12, 15, 12, 14, 12, 14, 12, 55]
+    for col, width in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+
+def write_ze_laadstrategie_sheet(wb, ze_assignments: dict, rotations: list):
+    """Write Laadstrategie sheet showing charging plan for ZE buses."""
+    ws = wb.create_sheet("Laadstrategie")
+
+    headers = ["Bus ID", "Station", "Laadduur (min)", "Lader", "Vermogen (kW)",
+               "Geschatte km opgeladen", "Opmerkingen"]
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = ZE_HEADER_FILL
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center")
+
+    row = 2
+    for rot_id, feas in sorted(ze_assignments.items()):
+        if feas.needs_charging and feas.recommended_charging:
+            for charge in feas.recommended_charging:
+                ws.cell(row=row, column=1, value=rot_id).border = THIN_BORDER
+                ws.cell(row=row, column=2, value=charge["station"]).border = THIN_BORDER
+                ws.cell(row=row, column=3, value=charge["duration_min"]).border = THIN_BORDER
+                ws.cell(row=row, column=4, value=charge["charger"]).border = THIN_BORDER
+                ws.cell(row=row, column=5, value=charge["power_kw"]).border = THIN_BORDER
+                ws.cell(row=row, column=6, value=charge["km_recovered"]).border = THIN_BORDER
+                ws.cell(row=row, column=7, value="Laden tijdens wachttijd").border = THIN_BORDER
+                row += 1
+        else:
+            ws.cell(row=row, column=1, value=rot_id).border = THIN_BORDER
+            ws.cell(row=row, column=2, value="-").border = THIN_BORDER
+            ws.cell(row=row, column=3, value="-").border = THIN_BORDER
+            ws.cell(row=row, column=4, value="-").border = THIN_BORDER
+            ws.cell(row=row, column=5, value="-").border = THIN_BORDER
+            ws.cell(row=row, column=6, value="-").border = THIN_BORDER
+            ws.cell(row=row, column=7, value="Geen tussentijds laden nodig").border = THIN_BORDER
+            row += 1
+
+    col_widths = [15, 20, 14, 25, 14, 20, 40]
+    for col, width in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+
+def write_ze_samenvatting_sheet(wb, ze_assignments: dict, all_results: dict,
+                                 rotations: list, min_ze_count: int, assigned_count: int):
+    """Write ZE Samenvatting (summary) sheet."""
+    ws = wb.create_sheet("ZE Samenvatting")
+
+    total_touringcar = len([r for r in rotations if r.bus_type == "Touringcar"])
+    ze_feasible = len([f for f in all_results.values() if f.is_feasible])
+    ze_no_charging = len([f for f in all_results.values()
+                           if f.is_feasible and not f.needs_charging])
+    ze_with_charging = len([f for f in all_results.values()
+                             if f.is_feasible and f.needs_charging])
+    meets_requirement = assigned_count >= min_ze_count
+
+    summary_data = [
+        ("ZE TOURINGCAR INZET - SAMENVATTING", ""),
+        ("", ""),
+        ("NS Vereiste", f"Minimaal {min_ze_count} ZE touringcars"),
+        ("", ""),
+        ("Totaal aantal touringcar-omlopen", total_touringcar),
+        ("Waarvan ZE-geschikt", ze_feasible),
+        ("  - Zonder tussentijds laden", ze_no_charging),
+        ("  - Met tussentijds laden", ze_with_charging),
+        ("", ""),
+        ("ZE touringcars toegewezen", assigned_count),
+        ("Voldoet aan NS vereiste", "JA" if meets_requirement else "NEE"),
+        ("", ""),
+        ("TOELICHTING", ""),
+        ("", ""),
+        ("De ZE touringcars zijn toegewezen aan omlopen die:", ""),
+        ("1. Binnen het elektrische bereik vallen, OF", ""),
+        ("2. Voldoende wachttijd hebben om tussentijds op te laden", ""),
+        ("", ""),
+        ("Selectiecriteria (in volgorde van prioriteit):", ""),
+        ("1. Omlopen die geen tussentijds laden nodig hebben", ""),
+        ("2. Omlopen met grotere marge (buffer) op bereik", ""),
+        ("3. Kortere omlopen (minder km)", ""),
+    ]
+
+    for row_idx, (label, value) in enumerate(summary_data, 1):
+        cell1 = ws.cell(row=row_idx, column=1, value=label)
+        cell2 = ws.cell(row=row_idx, column=2, value=value)
+
+        if row_idx == 1:
+            cell1.font = Font(bold=True, size=14)
+        elif label in ["NS Vereiste", "ZE touringcars toegewezen",
+                       "Voldoet aan NS vereiste", "TOELICHTING"]:
+            cell1.font = Font(bold=True)
+
+        if label == "Voldoet aan NS vereiste":
+            if value == "JA":
+                cell2.fill = ZE_FILL
+            else:
+                cell2.fill = ZE_ERROR_FILL
+            cell2.font = Font(bold=True)
+
+    ws.column_dimensions["A"].width = 45
+    ws.column_dimensions["B"].width = 35
+
+
+def generate_ze_output(rotations: list, output_file: str, ze_config: dict,
+                        charging_stations: dict, min_ze_count: int = 5) -> dict:
+    """Generate Version 6 ZE output: ZE touringcar assignment and charging strategy.
+
+    Returns dict with stats: total_touringcar, ze_feasible, assigned_count, meets_requirement
+    """
+    # Analyze and assign ZE buses
+    ze_assignments, all_results, assigned_count = assign_ze_buses(
+        rotations, min_ze_count, ze_config, charging_stations, "Touringcar"
+    )
+
+    # Create workbook
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # Write sheets
+    write_ze_inzet_sheet(wb, ze_assignments, all_results, rotations, min_ze_count)
+    write_ze_laadstrategie_sheet(wb, ze_assignments, rotations)
+    write_ze_samenvatting_sheet(wb, ze_assignments, all_results, rotations,
+                                 min_ze_count, assigned_count)
+
+    wb.save(output_file)
+
+    # Calculate stats
+    total_touringcar = len([r for r in rotations if r.bus_type == "Touringcar"])
+    ze_feasible = len([f for f in all_results.values() if f.is_feasible])
+
+    return {
+        "total_touringcar": total_touringcar,
+        "ze_feasible": ze_feasible,
+        "assigned_count": assigned_count,
+        "meets_requirement": assigned_count >= min_ze_count,
+    }
+
+
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
                     turnaround_map: dict = None, algorithm: str = "greedy",
                     include_sensitivity: bool = False, output_mode: int = 1,
@@ -2816,6 +3374,30 @@ def main():
              'Formaat: {"Utrecht Centraal": 6, "Ede-Wageningen": 5}. '
              "Na optimalisatie wordt gecontroleerd of de capaciteit overschreden wordt.",
     )
+    # Version 6: ZE (Zero Emission) arguments
+    parser.add_argument(
+        "--ze",
+        action="store_true",
+        help="Genereer Output 6: ZE touringcar toewijzing en laadstrategie (voor NS tender K3).",
+    )
+    parser.add_argument(
+        "--min-ze",
+        type=int,
+        default=5,
+        help="Minimum aantal ZE touringcars (NS vereiste). Standaard: 5",
+    )
+    parser.add_argument(
+        "--tanklocaties",
+        default="tanklocaties.json",
+        help="JSON bestand met laadstations per busstation. "
+             "Gegenereerd door fetch_tanklocaties.py. Standaard: tanklocaties.json",
+    )
+    parser.add_argument(
+        "--financieel",
+        default="financieel_input.xlsx",
+        help="Excel bestand met financiële variabelen (ZE bereik, etc.). "
+             "Gegenereerd door create_financieel_input.py. Standaard: financieel_input.xlsx",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -2877,6 +3459,14 @@ def main():
                 print(f"Haltecapaciteiten geladen: {len(halt_capacity)} haltes")
             except (json.JSONDecodeError, IOError) as e:
                 print(f"WAARSCHUWING: Capaciteitsbestand kon niet geladen worden: {e}")
+
+    # Load ZE configuration if --ze is enabled
+    ze_config = None
+    charging_stations = None
+    if args.ze:
+        print("ZE configuratie laden...")
+        ze_config = load_ze_config(args.financieel)
+        charging_stations = load_charging_stations(args.tanklocaties)
 
     # --snel mode: only useful when deadhead is provided + multiple algos
     snel_mode = args.snel and len(algos) > 1 and deadhead_matrix is not None
@@ -3338,6 +3928,40 @@ def main():
                 print(f"  {algo_label} (output {best_out}): geen overschrijdingen")
         if not any_violation:
             print("  Alle haltes binnen capaciteit.")
+
+    # ===== OUTPUT 6: ZE TOURINGCAR (if --ze enabled) =====
+    if args.ze and ze_config:
+        print()
+        print("OUTPUT 6: ZE TOURINGCAR TOEWIJZING")
+        print("=" * 60)
+
+        # Use the best available rotations (from last algorithm, highest output)
+        best_rotations = None
+        for ak in reversed(algo_keys):
+            results = all_results.get(ak, {})
+            if results:
+                best_out = max(results.keys())
+                best_rotations = results[best_out]["rotations"]
+                print(f"  Gebruik omlopen van {algo_short_names.get(ak, ak)} output {best_out}")
+                break
+
+        if best_rotations:
+            file6 = f"{output_base}_6_ze_laadstrategie.xlsx"
+            print(f"  Genereren {file6}...", end=" ")
+
+            ze_stats = generate_ze_output(
+                best_rotations, file6, ze_config, charging_stations, args.min_ze
+            )
+
+            print("OK")
+            print()
+            print(f"  Touringcar omlopen: {ze_stats['total_touringcar']}")
+            print(f"  ZE-geschikt: {ze_stats['ze_feasible']}")
+            print(f"  ZE toegewezen: {ze_stats['assigned_count']}")
+            print(f"  Voldoet aan NS vereiste ({args.min_ze} ZE): "
+                  f"{'JA' if ze_stats['meets_requirement'] else 'NEE'}")
+        else:
+            print("  Geen omlopen beschikbaar voor ZE analyse")
 
     print()
     print("Klaar!")
