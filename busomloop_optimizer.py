@@ -875,18 +875,40 @@ def analyze_ze_feasibility(rotation: BusRotation, ze_config: dict,
         total_recoverable_km = 0
         for station, duration_min, chargers in charging_opportunities:
             best_charger = chargers[0]  # Already sorted by power
+
+            # Account for driving time to/from charger
+            # Assume 30 km/h average speed in urban area
+            drive_time_one_way = (best_charger.distance_km / 30) * 60  # minutes
+            drive_time_total = 2 * drive_time_one_way  # round trip
+            extra_km = 2 * best_charger.distance_km  # round trip adds to total km
+
+            # Actual time available for charging
+            actual_charge_time = duration_min - drive_time_total
+            if actual_charge_time < 10:  # Need at least 10 min to make it worthwhile
+                continue
+
             # kWh charged = power * time * efficiency
-            kwh_charged = best_charger.max_power_kw * (duration_min / 60) * 0.8
+            kwh_charged = best_charger.max_power_kw * (actual_charge_time / 60) * 0.8
             km_recovered = (kwh_charged / consumption) * 100
-            total_recoverable_km += km_recovered
+
+            # Net km benefit = km recovered - extra km driven to charger
+            net_km_benefit = km_recovered - extra_km
+            if net_km_benefit <= 0:
+                continue
+
+            total_recoverable_km += net_km_benefit
 
             if total_km <= ze_range + total_recoverable_km:
                 recommended_charging.append({
                     "station": station,
                     "duration_min": duration_min,
+                    "actual_charge_min": round(actual_charge_time, 0),
                     "charger": best_charger.name,
+                    "charger_distance_km": best_charger.distance_km,
                     "power_kw": best_charger.max_power_kw,
                     "km_recovered": round(km_recovered, 1),
+                    "extra_km_driven": round(extra_km, 1),
+                    "net_km_benefit": round(net_km_benefit, 1),
                 })
                 is_feasible_with_charging = True
                 break
