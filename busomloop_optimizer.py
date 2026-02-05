@@ -857,8 +857,22 @@ def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
             if "snelheid_naar_tankstation" in var_name and value:
                 config["speed_to_station_kmh"] = float(value)
 
+            # Average speed per bus type (for km estimation)
+            if "avg_snelheid" in var_name and "_kmh" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    config["avg_speed_kmh"]["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    config["avg_speed_kmh"]["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    config["avg_speed_kmh"]["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    config["avg_speed_kmh"]["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    config["avg_speed_kmh"]["Taxibus"] = float(value)
+
         wb.close()
-        print(f"  Fuel config geladen: bereik Touringcar = {config['diesel_range_km']['Touringcar']} km")
+        print(f"  Fuel config geladen: bereik Touringcar = {config['diesel_range_km']['Touringcar']} km, "
+              f"snelheid = {config['avg_speed_kmh']['Touringcar']} km/h")
     except Exception as e:
         print(f"  Fuel config laden mislukt ({e}), standaardwaarden gebruikt")
 
@@ -1178,11 +1192,21 @@ def estimate_trip_km(trip: Trip, fuel_config: dict) -> float:
 
 def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
                                fuel_stations: dict,
-                               deadhead_matrix: dict = None) -> FuelValidationResult:
+                               deadhead_matrix: dict = None,
+                               deadhead_km_matrix: dict = None) -> FuelValidationResult:
     """Validate fuel feasibility for a rotation.
 
     Checks if the cumulative km exceeds fuel range, and if so, whether
     refueling opportunities exist during idle windows.
+
+    Args:
+        rotation: The bus rotation to validate
+        fuel_config: Fuel configuration (range, speeds, etc.)
+        fuel_stations: Fuel stations per location
+        deadhead_matrix: Optional {origin: {dest: minutes}} for deadhead time
+        deadhead_km_matrix: Optional {origin: {dest: km}} from Google Maps
+            - If available, uses actual km from Google Maps (more accurate)
+            - If not, estimates km from duration × avg speed
 
     Returns FuelValidationResult with:
     - is_feasible: True if can complete rotation (with or without refueling)
@@ -1207,15 +1231,22 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
 
         # Add deadhead km from previous trip (if any)
         deadhead_km = 0.0
-        if i > 0 and deadhead_matrix:
+        if i > 0:
             prev_dest = normalize_location(trips[i - 1].dest_code)
             curr_orig = normalize_location(trip.origin_code)
             if prev_dest != curr_orig:
-                dh_time = deadhead_matrix.get(prev_dest, {}).get(curr_orig, 0)
-                if dh_time > 0:
-                    # Estimate deadhead km from time (assume same avg speed)
-                    deadhead_km = (dh_time / 60) * speed_to_station
-                    trip_km += deadhead_km
+                # Prefer Google Maps distance_km if available
+                if deadhead_km_matrix:
+                    deadhead_km = deadhead_km_matrix.get(prev_dest, {}).get(curr_orig, 0) or 0
+
+                # Fall back to estimating from time if no km data
+                if deadhead_km == 0 and deadhead_matrix:
+                    dh_time = deadhead_matrix.get(prev_dest, {}).get(curr_orig, 0)
+                    if dh_time > 0:
+                        # Estimate deadhead km from time (assume avg speed to station)
+                        deadhead_km = (dh_time / 60) * speed_to_station
+
+                trip_km += deadhead_km
 
         # Check if adding this trip exceeds remaining range
         if trip_km > remaining_range and i > 0:
@@ -1294,8 +1325,16 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
 
 def apply_fuel_constraints(rotations: list, fuel_config: dict,
                            fuel_stations: dict,
-                           deadhead_matrix: dict = None) -> tuple:
+                           deadhead_matrix: dict = None,
+                           deadhead_km_matrix: dict = None) -> tuple:
     """Apply fuel constraints to rotations, splitting where necessary.
+
+    Args:
+        rotations: List of bus rotations
+        fuel_config: Fuel configuration (range, speeds, etc.)
+        fuel_stations: Fuel stations per location
+        deadhead_matrix: Optional {origin: {dest: minutes}} for deadhead time
+        deadhead_km_matrix: Optional {origin: {dest: km}} from Google Maps
 
     Returns: (new_rotations, validation_results, split_count)
     - new_rotations: list of rotations after applying splits
@@ -1309,7 +1348,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
 
     for rotation in rotations:
         result = validate_fuel_feasibility(
-            rotation, fuel_config, fuel_stations, deadhead_matrix
+            rotation, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
         )
         validation_results[rotation.bus_id] = result
 
@@ -3789,6 +3828,7 @@ def main():
     # Load deadhead matrix if provided
     import json
     deadhead_matrix = None
+    deadhead_km_matrix = None  # Distance in km (from Google Maps)
     if args.deadhead:
         dh_path = Path(args.deadhead)
         if not dh_path.exists():
@@ -3797,8 +3837,32 @@ def main():
         else:
             try:
                 with open(dh_path) as f:
-                    deadhead_matrix = json.load(f)
+                    raw_data = json.load(f)
+
+                # Parse both old format (just minutes) and new format (dict with min/km)
+                deadhead_matrix = {}
+                deadhead_km_matrix = {}
+                has_distance_data = False
+
+                for origin, dests in raw_data.items():
+                    deadhead_matrix[origin] = {}
+                    deadhead_km_matrix[origin] = {}
+                    for dest, val in dests.items():
+                        if isinstance(val, (int, float)):
+                            # Old format: just the duration_min value
+                            deadhead_matrix[origin][dest] = val
+                        elif isinstance(val, dict):
+                            # New format: {"min": duration_min, "km": distance_km}
+                            deadhead_matrix[origin][dest] = val.get("min", val.get("duration_min", 0))
+                            if val.get("km") is not None:
+                                deadhead_km_matrix[origin][dest] = val["km"]
+                                has_distance_data = True
+
                 dh_locs = len(deadhead_matrix)
+                if has_distance_data:
+                    print(f"  Deadhead matrix met afstandsdata (km) geladen")
+                else:
+                    deadhead_km_matrix = None  # No distance data available
             except (json.JSONDecodeError, IOError) as e:
                 print(f"WAARSCHUWING: Deadhead bestand kon niet geladen worden: {e}")
                 print("  Wordt overgeslagen (alleen directe verbindingen)")
@@ -4088,7 +4152,7 @@ def main():
             if fuel_config and fuel_stations:
                 rot1_orig_count = len(rot1)
                 rot1, fuel_results_1, fuel_splits_1 = apply_fuel_constraints(
-                    rot1, fuel_config, fuel_stations, deadhead_matrix
+                    rot1, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
                 )
                 if fuel_splits_1 > 0:
                     print(f"    Brandstofcontrole: {fuel_splits_1} omlopen gesplitst "
@@ -4141,7 +4205,7 @@ def main():
             if fuel_config and fuel_stations:
                 rot3_orig_count = len(rot3)
                 rot3, fuel_results_3, fuel_splits_3 = apply_fuel_constraints(
-                    rot3, fuel_config, fuel_stations, deadhead_matrix
+                    rot3, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
                 )
                 if fuel_splits_3 > 0:
                     print(f"    Brandstofcontrole: {fuel_splits_3} omlopen gesplitst "
@@ -4197,7 +4261,7 @@ def main():
                 if fuel_config and fuel_stations:
                     rot4_orig_count = len(rot4)
                     rot4, fuel_results_4, fuel_splits_4 = apply_fuel_constraints(
-                        rot4, fuel_config, fuel_stations, deadhead_matrix
+                        rot4, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
                     )
                     if fuel_splits_4 > 0:
                         print(f"    Brandstofcontrole: {fuel_splits_4} omlopen gesplitst "
@@ -4249,7 +4313,7 @@ def main():
             if fuel_config and fuel_stations:
                 rot5_orig_count = len(rot5)
                 rot5, fuel_results_5, fuel_splits_5 = apply_fuel_constraints(
-                    rot5, fuel_config, fuel_stations, deadhead_matrix
+                    rot5, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
                 )
                 if fuel_splits_5 > 0:
                     print(f"    Brandstofcontrole: {fuel_splits_5} omlopen gesplitst "

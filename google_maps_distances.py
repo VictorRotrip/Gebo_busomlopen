@@ -237,17 +237,25 @@ def fetch_distance_matrix(api_key: str, locations: list[str],
 
 
 def save_deadhead_json(matrix: dict, locations: list[str], output_file: str):
-    """Save deadhead matrix as JSON for the optimizer to import."""
+    """Save deadhead matrix as JSON for the optimizer to import.
+
+    Format: {origin: {dest: {"min": duration_min, "km": distance_km}}}
+    For backward compatibility, if only duration is needed, optimizer can
+    access deadhead[o][d]["min"] or check if value is a dict.
+    """
     deadhead = {}
     for o in locations:
         deadhead[o] = {}
         for d in locations:
             entry = matrix.get((o, d))
             if entry and entry["duration_min"] is not None:
-                deadhead[o][d] = entry["duration_min"]
+                deadhead[o][d] = {
+                    "min": entry["duration_min"],
+                    "km": entry.get("distance_km"),
+                }
     with open(output_file, "w") as f:
         json.dump(deadhead, f, indent=2, ensure_ascii=False)
-    print(f"Deadhead JSON saved to {output_file}")
+    print(f"Deadhead JSON saved to {output_file} (includes distance_km)")
 
 
 def save_deadhead_json_from_nested(nested_dict: dict, output_file: str):
@@ -258,17 +266,26 @@ def save_deadhead_json_from_nested(nested_dict: dict, output_file: str):
 
 
 def load_matrix_from_cache(cache_file: str) -> dict:
-    """Load distance matrix from cached JSON."""
+    """Load distance matrix from cached JSON.
+
+    Handles both old format (just minutes) and new format (dict with min/km).
+    """
     with open(cache_file) as f:
         cached = json.load(f)
     matrix = {}
     for o, dests in cached.items():
         for d, val in dests.items():
-            # Cache stores just the duration_min value
             if isinstance(val, (int, float)):
+                # Old format: just the duration_min value
                 matrix[(o, d)] = {"duration_min": val, "distance_km": None,
                                   "duration_s": None, "distance_m": None}
+            elif isinstance(val, dict) and "min" in val:
+                # New format: {"min": duration_min, "km": distance_km}
+                matrix[(o, d)] = {"duration_min": val["min"],
+                                  "distance_km": val.get("km"),
+                                  "duration_s": None, "distance_m": None}
             else:
+                # Full format from API
                 matrix[(o, d)] = val
     return matrix
 
