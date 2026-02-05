@@ -162,17 +162,62 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 
 ## Proposed New Versions
 
-### Version 6: Financial Cost Calculation (`6_financieel_basis`)
-**Goal**: Calculate full financial picture on existing efficient roster (from version 5)
+### Tender Versions (1-6) vs Internal Versions (7-9)
 
-- Input: version 5 roster + `financieel_input.xlsx`
+**Tender versions (1-6)** are designed to demonstrate efficiency and capability to NS:
+- Show optimal bus utilization
+- Satisfy K3 requirements (efficient, robust, realistic)
+- Include ZE touringcar planning (NS requires minimum 5 ZE)
+
+**Internal versions (7-9)** are for operational profit optimization:
+- May differ from tender versions in chaining choices
+- Optimize for actual profit, not just efficiency metrics
+- Used after winning the contract to maximize margins
+
+---
+
+### Version 6: ZE Assignment & Charging Strategy (`6_ze_laadstrategie`)
+**Goal**: Assign ZE touringcars to suitable rotations + show charging strategy (FOR TENDER - K3)
+
+**NS Requirement (from Gunningsleidraad K3):**
+> "Bij het uitwerken van de casus dient er rekening gehouden te worden met het inzetten van
+> tenminste 5 Zero Emissie (ZE) touringcars middels volledige chauffeursdiensten."
+
+**What Version 6 does:**
+- Takes version 5 output (efficient roster with deadhead)
+- Identifies all Touringcar rotations
+- Checks ZE feasibility per rotation:
+  - Total km ≤ ZE range (from `financieel_input.xlsx` Buskosten sheet)
+  - Sufficient idle windows for charging (if needed)
+- Assigns ZE to at least 5 feasible Touringcar rotations
+- Uses `tanklocaties.json` to find nearby charging stations
+- Identifies charging windows during idle periods
+- Outputs:
+  - Excel sheet "ZE Inzet" — which buses are assigned as ZE
+  - Excel sheet "Laadstrategie" — where/when to charge each ZE bus
+  - Summary statistics for tender document
+
+**Input files:**
+- Version 5 roster (from busomloop_optimizer.py)
+- `financieel_input.xlsx` — ZE range per bus type
+- `tanklocaties.json` — charging station locations (from fetch_tanklocaties.py)
+
+---
+
+### Version 7: Financial Analysis Overlay (`7_financieel_analyse`)
+**Goal**: Calculate full financial picture on the roster (INTERNAL)
+
+- Input: version 5/6 roster + `financieel_input.xlsx`
 - Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost
 - Output: new Excel sheets "Financieel Overzicht", "CAO Kosten", "Duurzaamheid"
-- No re-optimization; purely analytical overlay on the efficient roster
-- **Same algorithm, same result as version 5** — just adds financial calculations
+- No re-optimization; purely analytical overlay
+- **Same roster as version 5/6** — just adds financial calculations
+- Helps understand: "How much profit do we actually make on this roster?"
 
-### Version 7: Cost-Optimized Roster (`7_financieel_geoptimaliseerd`)
-**Goal**: Re-optimize with euro-based cost function (secondary objective changes)
+---
+
+### Version 8: Cost-Optimized Chaining (`8_kosten_geoptimaliseerd`)
+**Goal**: Re-optimize with euro-based cost function (INTERNAL)
 
 - **Primary objective unchanged**: still minimizes number of buses
 - **Secondary objective**: among all chainings that achieve minimum buses, pick the most profitable
@@ -182,24 +227,18 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 - **Bus types remain fixed** as dictated by NS input — only chaining order changes
 - **Note**: If only one bus-optimal chaining exists, result is identical to version 5
 
-### Version 8: Sustainability-Optimized (`8_duurzaamheid_geoptimaliseerd`)
-**Goal**: Optimize fuel-type assignment per bus to maximize sustainability bonuses and avoid malus
+---
 
-- Add fuel-type dimension to each bus rotation (Diesel B7 / HVO100 / Electric ZE)
-- Bus type stays as NS specifies; fuel type is our choice
-- Calculate sustainability KPI scores and project malus/bonus
-- Assign ZE to shorter rotations (range-feasible) to maximize €0.12/km bonus
-- Assign HVO100 to remaining rotations to hit sustainable fuel KPI targets
-- Determine optimal mix: marginal cost of ZE/HVO vs. bonus + malus avoidance
+### Version 9: Full Profit Optimization (`9_winst_maximalisatie`)
+**Goal**: Maximize actual profit, potentially using different number of buses (INTERNAL)
 
-### Version 9: Full Financial + Fueling/Charging (`9_volledig_financieel`)
-**Goal**: Full profit optimization including fuel logistics
-
-- Range constraints for ZE buses; determine charging windows during idle periods
-- Fuel station locations for diesel/HVO along routes (OpenStreetMap + Google Maps)
-- Charging station locations and availability (Open Charge Map API)
-- Optimal fueling stops that minimize schedule disruption
-- Complete profit optimization: revenue − all costs − penalties + all bonuses
+- Does NOT force minimum buses as primary objective
+- Instead: directly minimizes total operational cost
+- May use MORE buses if that reduces driver costs (ORT, overtime, break brackets)
+- May use FEWER buses if fixed costs dominate
+- Includes fuel type assignment (ZE/HVO/diesel) as part of optimization
+- Complete profit calculation: revenue − all costs − penalties + all bonuses
+- **This might produce a DIFFERENT roster than version 5**
 
 ---
 
@@ -447,85 +486,104 @@ New sheets per financial version:
 
 ## Next Steps to Implement Versions 6-9
 
-### Immediate Next Step: Create `financial_calculator.py`
+### Recommended Implementation Order
 
-This is the core module needed for all versions 6-9. It reads `financieel_input.xlsx` and provides:
+1. ✅ **Step 0:** Data preparation scripts (DONE)
+   - `create_financieel_input.py` ✓
+   - `update_financieel_input.py` ✓
+   - `fetch_tanklocaties.py` ✓
+
+2. **Step 1:** Implement Version 6 — ZE Assignment + Charging (FOR TENDER)
+3. **Step 2:** Test Version 6 on real tender casus data
+4. **Step 3:** Create `financial_calculator.py` for versions 7-9
+5. **Step 4:** Implement Version 7 — Financial Analysis (internal)
+6. **Step 5:** Implement Version 8 — Cost-Optimized Chaining (internal)
+7. **Step 6:** Implement Version 9 — Full Profit Optimization (internal)
+
+---
+
+### Immediate Next Step: Version 6 (ZE + Charging)
+
+Version 6 is tender-relevant and should be implemented first. It does NOT require
+`financial_calculator.py` — it only needs:
+- Version 5 roster output
+- ZE range data from `financieel_input.xlsx`
+- Charging stations from `tanklocaties.json`
+
+**Implementation plan for Version 6:**
+
+```python
+# ze_charging_planner.py
+
+def load_ze_config(financieel_xlsx):
+    """Load ZE range per bus type from Buskosten sheet."""
+    # Returns: {"Touringcar": 300, "Dubbeldekker": 250, ...} (km)
+
+def load_charging_stations(tanklocaties_json):
+    """Load charging station data per bus station."""
+    # Returns: {station_name: [list of nearby chargers with power, distance]}
+
+def calculate_rotation_km(rotation, deadhead_matrix=None):
+    """Calculate total km for a rotation (trips + deadhead)."""
+    # Sum of trip distances + deadhead repositioning
+
+def check_ze_feasibility(rotation, ze_range_km, charging_stations):
+    """Check if rotation can be done with ZE bus."""
+    # Returns: (feasible: bool, needs_charging: bool, charging_plan: list)
+    # - feasible: total_km <= ze_range OR can charge during idle
+    # - charging_plan: [(station, idle_window, charger_info), ...]
+
+def assign_ze_buses(rotations, min_ze_count, ze_config, charging_stations):
+    """Assign ZE to at least min_ze_count Touringcar rotations."""
+    # 1. Filter to Touringcar rotations only
+    # 2. Check ZE feasibility for each
+    # 3. Sort by suitability (prefer shorter rotations, better charging options)
+    # 4. Assign ZE to top N feasible rotations
+    # Returns: {rotation_id: ZEAssignment}
+
+def generate_ze_output(rotations, ze_assignments, charging_stations, output_xlsx):
+    """Generate Excel output for tender."""
+    # Sheet "ZE Inzet": which buses are ZE, why they were chosen
+    # Sheet "Laadstrategie": charging plan per ZE bus
+```
+
+**Key decisions for ZE assignment:**
+- Prefer rotations with lower total km (more buffer)
+- Prefer rotations with good charging opportunities (long idle at station with fast charger)
+- Prefer rotations that don't require mid-route charging (simpler)
+- Ensure at least 5 Touringcar rotations are assigned as ZE
+
+---
+
+### Version 7: Financial Calculator Module
+
+After Version 6 is done, create `financial_calculator.py` for internal analysis:
 
 ```python
 # Core functions needed:
 load_financial_config(xlsx_path) → FinancialConfig
-calculate_revenue(rotation, config) → float  # active_hours × hourly_rate
+calculate_revenue(rotation, config) → float
 calculate_driver_cost(rotation, config) → DriverCostBreakdown
-    # - paid_hours (after break deductions)
-    # - base_wage
-    # - ORT_surcharge (per time window)
-    # - overtime_surcharge
-    # - meal_allowance
-    # - break_surcharge (onderbrekingstoeslag)
 calculate_fuel_cost(rotation, fuel_type, config) → float
 calculate_sustainability(rotations, config) → SustainabilityReport
-    # - ZE km and bonus
-    # - HVO100 liters and incentive
-    # - KPI score vs target
-    # - projected malus/bonus
 ```
 
-**Estimated effort:** Medium (1-2 days) — mostly translating CAO rules into code.
+**Key CAO logic to implement:**
+- Break deduction brackets (Pauzestaffel)
+- ORT time-window overlap calculation
+- Overtime detection and surcharges
+- Meal allowances for long shifts
 
-### Version 6 Implementation
+---
 
-After `financial_calculator.py` exists:
+### Versions 8 & 9: Internal Optimization
 
-1. Add `--financieel` flag to `busomloop_optimizer.py`
-2. After generating version 5 output, call financial calculator on each rotation
-3. Add new Excel sheets: "Financieel Overzicht", "CAO Kosten Detail", "Duurzaamheid KPI"
-4. No algorithm changes — purely additive
+**Version 8 (Cost-Optimized Chaining):**
+- Change secondary cost function from `deadhead×2 + idle` to euro-based
+- Challenge: edge costs depend on accumulated chain state
+- Options: approximate, iterative, or exact algorithm
 
-**Estimated effort:** Small (half day) — just output formatting.
-
-### Version 7 Implementation
-
-1. Create new cost function for edge weights:
-   ```python
-   def financial_edge_cost(trip_i, trip_j, current_chain, config):
-       # Calculate driver cost delta if we add trip_j to current_chain
-       chain_with_j = current_chain + [trip_j]
-       cost_with_j = calculate_driver_cost(chain_with_j, config)
-       cost_without_j = calculate_driver_cost(current_chain, config)
-       driver_delta = cost_with_j.total - cost_without_j.total
-
-       # Add fuel cost for deadhead (if different locations)
-       fuel_cost = calculate_deadhead_fuel_cost(trip_i, trip_j, config)
-
-       return driver_delta + fuel_cost
-   ```
-
-2. Modify `_optimize_mincost()` to use this cost function instead of `deadhead × 2 + idle`
-
-3. **Challenge:** The current algorithm calculates edge costs upfront (before knowing the full chain).
-   For version 7, the cost depends on the accumulated chain (shift length affects ORT, break brackets).
-   Options:
-   - **Approximate:** Use average/typical shift assumptions for edge costs
-   - **Iterative:** Run optimization, then refine edge costs based on result, repeat
-   - **Exact:** More complex algorithm that tracks state through the matching
-
-**Estimated effort:** Medium-Large (2-4 days) — algorithm modifications needed.
-
-### Version 8 & 9 Implementation
-
-These build on version 7 and add:
-- **Version 8:** Fuel type assignment per rotation (ZE/HVO/diesel) as a second optimization pass
-- **Version 9:** Integration with `tanklocaties.json` for fueling/charging logistics
-
-**Estimated effort:** Medium each (1-2 days per version).
-
-### Recommended Implementation Order
-
-1. ✅ Step 0: Data preparation scripts (DONE)
-2. **Step 1:** Create `financial_calculator.py` with CAO logic
-3. **Step 2:** Implement Version 6 (financial overlay)
-4. **Step 3:** Test Version 6 thoroughly on real data
-5. **Step 4:** Implement Version 7 (cost function change)
-6. **Step 5:** Compare Version 5 vs 7 results on various inputs
-7. **Step 6:** Implement Version 8 (fuel type assignment)
-8. **Step 7:** Implement Version 9 (fueling logistics)
+**Version 9 (Full Profit Optimization):**
+- Remove "minimize buses" as primary constraint
+- Directly minimize total operational cost
+- May produce different roster than version 5
