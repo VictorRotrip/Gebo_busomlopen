@@ -256,12 +256,47 @@ GET https://api.openchargemap.io/v3/poi/?output=json
 - Register at openchargemap.org for free API key
 - Returns: location, operator, connector types (Type 2, CCS, CHAdeMO), power (kW), status
 
-### HVO100 — Manual Sources (No API Available)
+### HVO100 & B7 Diesel Advisory Prices — Contract-Specified Sources
+
+The NS contract specifies that the monthly HVO100/B7 price difference is calculated from
+the **landelijke adviesprijzen** (national advisory prices) of three commercial suppliers,
+taken on the **first day of each month**. The price difference is the average across the
+three sources.
+
+**Contract formula:**
+```
+monthly_price_diff = average(
+    (HVO100_price - B7_price) for PK_Energy,
+    (HVO100_price - B7_price) for Fieten_Olie,
+    (HVO100_price - B7_price) for BP_Nederland
+)
+# All prices taken on the 1st of the month
+
+if price_diff > 0:
+    incentive_per_liter = min(price_diff, €0.35) + €0.05   # capped at €0.40 total
+else:
+    incentive_per_liter = €0.00   # everything falls away (both diff and stimulans)
+```
+
+**Note**: If a source publishes per 100 liters, convert to per-liter first.
+
+| Source | HVO100 | B7 Diesel | Format | URL | Automatable? |
+|--------|--------|-----------|--------|-----|-------------|
+| **Fieten Olie** | Yes | Yes | Per 100L, excl.+incl. BTW, daily, 1yr history | https://www.fieten.info/adviesprijzen/ | Best: daily updates, both fuels, historical data. Needs web scraper. |
+| **PK Energy** | Yes | Yes | Per 100L, excl. BTW, PDF history | https://pkenergy.nl/brandstofprijzen/ | Medium: website + PDF. No API. |
+| **BP Nederland** | Unclear | Yes | Per liter, incl. BTW | bp.com landelijke-adviesprijzen | Difficult: HVO100 not on standard advisory page. May need direct contact. |
+
+**Current example prices (Feb 2026, Fieten Olie):**
+- HVO100: €180.91 / 100L excl. BTW = €1.81/L
+- Diesel B7: €167.69 / 100L excl. BTW = €1.68/L
+- Price difference: €0.13/L → incentive = €0.13 + €0.05 = **€0.18/L**
+
+**Additional HVO100 sources (for cross-reference):**
 | Source | URL | Data |
 |--------|-----|------|
 | Rolande | https://rolande.eu/en/pricing/ | Published HVO100 prices excl. VAT |
 | glpautogas.info | https://glpautogas.info/en/hvo100-stations-netherlands.html | 131 HVO100 stations in NL with prices |
-| Argus Media | argusmedia.com (paid) | Wholesale HVO ARA market prices |
+| evofenedex | evofenedex.nl (members only since Nov 2024) | Weekly HVO diesel price overview |
 
 ### Alternative Fuel Station APIs (if more data needed)
 - **ANWB API** (unofficial): ~3800 stations with prices, reverse-engineered from app
@@ -290,13 +325,16 @@ Key logic:
 - Date-dependent rate selection (2025-01-01, 2025-07-01, 2026-01-01)
 
 ### Step 2: Fuel Price Fetcher Module (`fuel_prices.py`)
-New module that fetches real-time fuel prices:
-- `fetch_diesel_price() → float` — CBS OData API
-- `fetch_electricity_price(date, hour) → float` — EnergyZero API
-- `load_hvo100_price(config) → float` — from manual config
+New module that fetches fuel prices and station data:
+- `fetch_diesel_b7_price() → float` — CBS OData API (daily NL average)
+- `fetch_electricity_price(date, hour) → float` — EnergyZero API (hourly EPEX spot)
+- `fetch_hvo100_incentive(month, year) → HVOIncentive` — scrape Fieten Olie + PK Energy + BP
+  - Gets HVO100 and B7 prices from all 3 contract-specified sources on 1st of month
+  - Calculates average price difference across sources
+  - Applies contract formula: incentive = min(diff, €0.35) + €0.05 if diff > 0, else €0
 - `fetch_fuel_stations(lat, lon, radius) → list` — OpenStreetMap Overpass
 - `fetch_charging_stations(lat, lon, radius) → list` — Open Charge Map
-- Cache results to avoid excessive API calls
+- Cache results to avoid excessive API calls (fuel prices: 24h cache, stations: 7d cache)
 
 ### Step 3: Bus Operating Cost Config
 New JSON config file (`bus_costs.json`) with:
@@ -382,15 +420,16 @@ New sheets per financial version:
 
 ## Data Gaps to Resolve Before Implementation
 
-| Gap | Action | Source |
-|-----|--------|--------|
-| Base hourly wage per driver | Get from CAO loonschalen or estimate | CAO Besluit Personenvervoer |
-| Fuel consumption per bus type | Get from fleet operator or estimate | Fleet data / manufacturer specs |
-| Current diesel B7 price | **Automated**: CBS OData API | https://opendata.cbs.nl |
-| Current electricity price | **Automated**: EnergyZero API | https://api.energyzero.nl |
-| HVO100 price | Manual config from Rolande | https://rolande.eu/en/pricing/ |
-| Bus fleet composition (ZE/HVO/diesel) | Get from operator | Fleet inventory |
-| Fuel station locations | **Automated**: OpenStreetMap Overpass | https://overpass-api.de |
-| Charging station locations | **Automated**: Open Charge Map | https://openchargemap.org |
-| Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) | Contract negotiation |
-| Bus range and tank/battery capacity | Get from fleet specs | Manufacturer data |
+| Gap | Action | Source | Status |
+|-----|--------|--------|--------|
+| Base hourly wage per driver | Get from CAO loonschalen or estimate | CAO Besluit Personenvervoer | Manual input needed |
+| Fuel consumption per bus type | Get from fleet operator or estimate | Fleet data / manufacturer specs | Manual input needed |
+| Current diesel B7 price | **Automated**: CBS OData API | https://opendata.cbs.nl (table 80416ned) | Ready to implement |
+| Current electricity price | **Automated**: EnergyZero API | https://api.energyzero.nl | Ready to implement |
+| HVO100/B7 price diff (incentive) | **Semi-automated**: scrape contract sources | Fieten Olie, PK Energy, BP Nederland (1st of month) | Sources identified |
+| HVO100 price (absolute) | Scrape Fieten Olie adviesprijzen | https://www.fieten.info/adviesprijzen/ | Source found, needs scraper |
+| Bus fleet composition (ZE/HVO/diesel) | Get from operator | Fleet inventory | Manual input needed |
+| Fuel station locations | **Automated**: OpenStreetMap Overpass | https://overpass-api.de | Ready to implement |
+| Charging station locations | **Automated**: Open Charge Map | https://openchargemap.org | Ready to implement |
+| Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) | Contract negotiation | Manual input needed |
+| Bus range and tank/battery capacity | Get from fleet specs | Manufacturer data | Manual input needed |
