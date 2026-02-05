@@ -902,6 +902,7 @@ def analyze_ze_feasibility(rotation: BusRotation, ze_config: dict,
                 recommended_charging.append({
                     "station": station,
                     "duration_min": duration_min,
+                    "drive_time_min": round(drive_time_total, 0),
                     "actual_charge_min": round(actual_charge_time, 0),
                     "charger": best_charger.name,
                     "charger_distance_km": best_charger.distance_km,
