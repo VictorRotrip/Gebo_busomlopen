@@ -897,6 +897,87 @@ def create_reserve_trips(reserves: list, all_trips: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Halt capacity check
+# ---------------------------------------------------------------------------
+
+def check_halt_capacity(rotations: list, halt_capacity: dict) -> list:
+    """Check if bus rotations exceed halt capacity limits.
+
+    For each station with a capacity limit, count the maximum number of buses
+    present simultaneously. A bus is "present" at a station from its arrival
+    until its next departure (i.e. during idle time between trips).
+
+    Args:
+        rotations: list of BusRotation objects
+        halt_capacity: {station_name: max_buses} e.g. {"Utrecht Centraal": 6}
+
+    Returns:
+        list of dicts with violations:
+        [{"station": str, "date": str, "time": str, "count": int, "capacity": int}]
+    """
+    if not halt_capacity:
+        return []
+
+    # Collect all presence intervals: (station, date, start_min, end_min)
+    # A bus is present at trip.dest_name from trip.arrival until next_trip.departure
+    intervals = []
+    for rot in rotations:
+        for i, trip in enumerate(rot.trips):
+            if i < len(rot.trips) - 1:
+                next_trip = rot.trips[i + 1]
+                # Bus waits at dest station from arrival until next departure
+                intervals.append((trip.dest_name, rot.date_str,
+                                  trip.arrival, next_trip.departure))
+
+    # For each capped station, find the peak concurrent bus count
+    violations = []
+    for station, capacity in halt_capacity.items():
+        # Filter intervals for this station (fuzzy match: check if station
+        # name is contained in the interval station name or vice versa)
+        station_intervals = [
+            (date, start, end) for (stn, date, start, end) in intervals
+            if station.lower() in stn.lower() or stn.lower() in station.lower()
+        ]
+        if not station_intervals:
+            continue
+
+        # Group by date
+        by_date = {}
+        for date, start, end in station_intervals:
+            by_date.setdefault(date, []).append((start, end))
+
+        for date, ivs in by_date.items():
+            # Sweep-line: collect all start/end events
+            events = []
+            for start, end in ivs:
+                if start < end:  # valid interval
+                    events.append((start, +1))
+                    events.append((end, -1))
+            events.sort(key=lambda e: (e[0], e[1]))
+
+            concurrent = 0
+            peak = 0
+            peak_time = 0
+            for time_min, delta in events:
+                concurrent += delta
+                if concurrent > peak:
+                    peak = concurrent
+                    peak_time = time_min
+
+            if peak > capacity:
+                h, m = divmod(peak_time, 60)
+                violations.append({
+                    "station": station,
+                    "date": date,
+                    "time": f"{h:02d}:{m:02d}",
+                    "count": peak,
+                    "capacity": capacity,
+                })
+
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # Traffic-aware risk analysis
 # ---------------------------------------------------------------------------
 
@@ -1539,9 +1620,8 @@ def write_omloop_sheet(wb_out, rotations: list, reserves: list,
                                 # Deadhead repositioning row
                                 dh_min = entry["dh_minutes"]
                                 dh_str = f"{round(dh_min)} min" if dh_min is not None else "?"
-                                ws.cell(row=row, column=base_col, value="Lege rit")
-                                ws.cell(row=row, column=base_col + 1, value=entry["from_name"])
-                                ws.cell(row=row, column=base_col + 2, value=entry["to_name"])
+                                ws.cell(row=row, column=base_col, value=entry["from_name"])
+                                ws.cell(row=row, column=base_col + 1, value=entry["to_name"])
                                 ws.cell(row=row, column=base_col + 4, value=dh_str)
                                 for cc in range(base_col, base_col + 6):
                                     ws.cell(row=row, column=cc).border = THIN_BORDER
@@ -2729,6 +2809,13 @@ def main():
              "Gegenereerd door google_maps_distances.py --traffic. "
              "Wordt gebruikt voor risico-analyse in output 4.",
     )
+    parser.add_argument(
+        "--capaciteit",
+        default=None,
+        help="JSON bestand met haltecapaciteiten (max gelijktijdige bussen). "
+             'Formaat: {"Utrecht Centraal": 6, "Ede-Wageningen": 5}. '
+             "Na optimalisatie wordt gecontroleerd of de capaciteit overschreden wordt.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -2740,9 +2827,9 @@ def main():
     algos = list(ALGORITHMS.keys()) if args.algoritme == "all" else [args.algoritme]
 
     # Load deadhead matrix if provided
+    import json
     deadhead_matrix = None
     if args.deadhead:
-        import json
         dh_path = Path(args.deadhead)
         if not dh_path.exists():
             print(f"WAARSCHUWING: Deadhead bestand '{args.deadhead}' niet gevonden, "
@@ -2775,6 +2862,21 @@ def main():
                 print(f"Traffic matrix geladen: {n_slots} tijdsloten + baseline")
             except Exception as e:
                 print(f"WAARSCHUWING: Traffic matrix kon niet geladen worden: {e}")
+
+    # Load halt capacity limits if provided
+    halt_capacity = None
+    if args.capaciteit:
+        cap_path = Path(args.capaciteit)
+        if not cap_path.exists():
+            print(f"WAARSCHUWING: Capaciteitsbestand '{args.capaciteit}' niet gevonden, "
+                  "capaciteitscheck wordt overgeslagen")
+        else:
+            try:
+                with open(cap_path) as f:
+                    halt_capacity = json.load(f)
+                print(f"Haltecapaciteiten geladen: {len(halt_capacity)} haltes")
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"WAARSCHUWING: Capaciteitsbestand kon niet geladen worden: {e}")
 
     # --snel mode: only useful when deadhead is provided + multiple algos
     snel_mode = args.snel and len(algos) > 1 and deadhead_matrix is not None
@@ -3210,6 +3312,33 @@ def main():
 
     print(f"Reservebussen totaal nodig: {total_reserves}")
     print(f"Gegenereerde bestanden: {n_files}")
+
+    # Halt capacity check (if --capaciteit provided)
+    if halt_capacity:
+        print()
+        print("HALTECAPACITEITSCHECK")
+        print("=" * 60)
+        any_violation = False
+        for ak in algo_keys:
+            results = all_results.get(ak, {})
+            if not results:
+                continue
+            # Use the most complete output (highest number)
+            best_out = max(results.keys())
+            rots = results[best_out]["rotations"]
+            violations = check_halt_capacity(rots, halt_capacity)
+            algo_label = algo_short_names.get(ak, ak)
+            if violations:
+                any_violation = True
+                for v in violations:
+                    print(f"  WAARSCHUWING [{algo_label}, output {best_out}]: "
+                          f"{v['station']} op {v['date']} om {v['time']}: "
+                          f"{v['count']} bussen (max {v['capacity']})")
+            else:
+                print(f"  {algo_label} (output {best_out}): geen overschrijdingen")
+        if not any_violation:
+            print("  Alle haltes binnen capaciteit.")
+
     print()
     print("Klaar!")
 
