@@ -197,8 +197,10 @@ Version 6 now integrates energy constraints directly into the optimization algor
    - Charge time (based on charger power and battery capacity)
 
 2. **Tracks cumulative km** during optimization:
-   - Trip km estimated from duration × avg speed
-   - Deadhead km from deadhead matrix
+   - Trip km estimated from duration × avg_speed
+   - Average speed calculated from Google Maps data when available (distance_km / duration)
+   - Bus-type speed factors applied (0.85-0.95x car speed for different bus types)
+   - Deadhead km from Google Maps distance_km when available, else time × speed estimate
    - Running total per chain
 
 3. **Validates fuel feasibility** during chaining:
@@ -422,7 +424,7 @@ Completed scripts for data preparation:
 - CLI flags: `--fuel-only`, `--charging-only`, `--radius N`, `--ocm-key KEY`, `--dry-run`
 - Input options: `--input Bijlage_J.xlsx` (auto-discover), `--coords file.json`, or `--stations "Name1" "Name2"`
 
-### Step 1: Version 6 - Fuel/Charging Constraints (IN PROGRESS ✓)
+### Step 1: Version 6 - Fuel/Charging Constraints (DONE ✓)
 
 **Implemented features:**
 - ZE feasibility analysis integrated into `busomloop_optimizer.py`
@@ -432,13 +434,17 @@ Completed scripts for data preparation:
 - ZE assignment for Touringcar rotations (min 5 for NS K3)
 - Excel output: "ZE Inzet" and "Laadstrategie" sheets
 
-**TODO (fuel constraint integration into optimization):**
-- [ ] Load diesel range configuration from `additional_inputs.xlsx`
-- [ ] Track cumulative km during trip chaining
-- [ ] Validate fuel range before connecting trips
-- [ ] Check for refueling opportunities during idle windows
-- [ ] Split chains when fuel range exceeded without refuel opportunity
-- [ ] Add fuel stop planning to Excel output
+**Fuel constraint integration (DONE):**
+- [x] Load diesel range configuration from `additional_inputs.xlsx`
+- [x] Track cumulative km during trip chaining
+- [x] Validate fuel range with `validate_fuel_feasibility()`
+- [x] Check for refueling opportunities during idle windows
+- [x] Split chains when fuel range exceeded without refuel opportunity
+- [x] CLI flag `--fuel-constraints` to enable fuel validation
+- [x] Use Google Maps distance_km for deadhead when available
+- [x] Calculate actual avg_speed from Google Maps data (distance/duration)
+- [x] Apply bus-type speed factors (0.85-0.95x) to Google Maps car speeds
+- [ ] Add fuel stop planning to Excel output (future work)
 
 ### Step 2: Financial Calculator Module (`financial_calculator.py`)
 New module that reads additional_inputs.xlsx and exposes:
@@ -535,11 +541,13 @@ New sheets per financial version:
    - `fetch_fuel_charging_prices.py` ✓
    - `fetch_tanklocaties.py` ✓
 
-2. ⏳ **Step 1:** Version 6 — Fuel/Charging Constraints (IN PROGRESS)
+2. ✅ **Step 1:** Version 6 — Fuel/Charging Constraints (DONE)
    - ZE feasibility analysis ✓
    - ZE charging strategy with drive time ✓
-   - Diesel fuel range validation ← **CURRENT**
-   - Fuel constraint integration into optimization ← **CURRENT**
+   - Diesel fuel range validation ✓
+   - Fuel constraint integration into optimization ✓
+   - Google Maps distance data for accurate km estimation ✓
+   - Automatic avg_speed calculation from Google Maps data ✓
 
 3. **Step 2:** Test Version 6 on real tender casus data
 4. **Step 3:** Create `financial_calculator.py` for versions 7-9

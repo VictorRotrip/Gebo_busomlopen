@@ -961,6 +961,100 @@ def load_charging_stations(tanklocaties_json: str = "tanklocaties.json") -> dict
         return {}
 
 
+def calculate_gmaps_avg_speed(deadhead_matrix: dict = None,
+                               deadhead_km_matrix: dict = None) -> float | None:
+    """Calculate actual average speed from Google Maps deadhead data.
+
+    Uses all available distance/duration pairs from the deadhead matrices
+    to compute the weighted average speed: sum(km) / sum(hours).
+
+    This gives a more accurate average speed for the specific geographic area
+    covered by the routes, accounting for actual road conditions.
+
+    Args:
+        deadhead_matrix: {origin: {dest: duration_min}} from Google Maps
+        deadhead_km_matrix: {origin: {dest: distance_km}} from Google Maps
+
+    Returns:
+        Average speed in km/h, or None if no valid data available.
+    """
+    if not deadhead_matrix or not deadhead_km_matrix:
+        return None
+
+    total_km = 0.0
+    total_hours = 0.0
+
+    for origin, dests_time in deadhead_matrix.items():
+        if origin not in deadhead_km_matrix:
+            continue
+        dests_km = deadhead_km_matrix[origin]
+
+        for dest, duration_min in dests_time.items():
+            if dest not in dests_km or origin == dest:
+                continue
+            distance_km = dests_km[dest]
+
+            # Skip invalid entries
+            if not duration_min or duration_min <= 0:
+                continue
+            if not distance_km or distance_km <= 0:
+                continue
+
+            total_km += distance_km
+            total_hours += duration_min / 60
+
+    if total_hours <= 0:
+        return None
+
+    avg_speed = total_km / total_hours
+    return round(avg_speed, 1)
+
+
+def update_config_with_gmaps_speed(config: dict, deadhead_matrix: dict = None,
+                                    deadhead_km_matrix: dict = None) -> dict:
+    """Update fuel/ZE config with calculated average speed from Google Maps.
+
+    If Google Maps distance data is available, calculates the actual average
+    driving speed for the area and uses it for all bus types (as the geographic
+    conditions are the same). Falls back to configured values if no data.
+
+    Args:
+        config: Fuel or ZE config dict with avg_speed_kmh key
+        deadhead_matrix: {origin: {dest: duration_min}}
+        deadhead_km_matrix: {origin: {dest: distance_km}}
+
+    Returns:
+        Updated config dict with potentially adjusted avg_speed_kmh values.
+    """
+    gmaps_speed = calculate_gmaps_avg_speed(deadhead_matrix, deadhead_km_matrix)
+
+    if gmaps_speed is None:
+        return config
+
+    print(f"  Google Maps gemiddelde snelheid berekend: {gmaps_speed} km/h")
+
+    # Apply a factor per bus type (buses are slightly slower than cars due to size)
+    # Google Maps calculates car speeds, buses are typically 5-10% slower
+    bus_speed_factor = {
+        "Touringcar": 0.95,      # Large, highway-capable
+        "Dubbeldekker": 0.90,    # Large, slightly slower
+        "Lagevloerbus": 0.85,    # Urban, frequent stops design
+        "Midi bus": 0.92,        # Medium size
+        "Taxibus": 0.95,         # Small, agile
+    }
+
+    for bus_type in config["avg_speed_kmh"]:
+        factor = bus_speed_factor.get(bus_type, 0.90)
+        adjusted_speed = round(gmaps_speed * factor, 1)
+        config["avg_speed_kmh"][bus_type] = adjusted_speed
+
+    print(f"  Snelheden aangepast op basis van Google Maps data:")
+    for bus_type, speed in sorted(config["avg_speed_kmh"].items()):
+        print(f"    {bus_type}: {speed} km/h")
+
+    return config
+
+
 def estimate_rotation_km(rotation: BusRotation, ze_config: dict) -> float:
     """Estimate total km for a rotation based on ride time and average speed."""
     bus_type = rotation.bus_type
@@ -3910,6 +4004,12 @@ def main():
         ze_config = load_ze_config(args.inputs)
         charging_stations = load_charging_stations(args.tanklocaties)
 
+        # Update avg_speed with calculated values from Google Maps if available
+        if deadhead_km_matrix:
+            ze_config = update_config_with_gmaps_speed(
+                ze_config, deadhead_matrix, deadhead_km_matrix
+            )
+
     # Load fuel configuration if --fuel-constraints is enabled
     fuel_config = None
     fuel_stations = None
@@ -3917,6 +4017,13 @@ def main():
         print("Brandstofconfiguratie laden...")
         fuel_config = load_fuel_config(args.inputs)
         fuel_stations = load_fuel_stations(args.tanklocaties)
+
+        # Update avg_speed with calculated values from Google Maps if available
+        if deadhead_km_matrix:
+            fuel_config = update_config_with_gmaps_speed(
+                fuel_config, deadhead_matrix, deadhead_km_matrix
+            )
+
         # Show range per bus type
         print("  Actieradius per bustype:")
         for bt, range_km in fuel_config["diesel_range_km"].items():
