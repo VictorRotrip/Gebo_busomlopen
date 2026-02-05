@@ -16,7 +16,7 @@ types. What the optimizer CAN optimize is:
 - How to schedule fueling/charging stops
 - How to minimize driver costs through smart chaining (reducing ORT, overtime, broken shifts)
 
-All financial variables are stored in **`financieel_input.xlsx`** (5 sheets: Tarieven,
+All financial variables are stored in **`additional_inputs.xlsx`** (5 sheets: Tarieven,
 Chauffeurkosten, Buskosten, Duurzaamheid, Brandstofprijzen) — this is the primary input file
 for versions 6-9.
 
@@ -176,31 +176,55 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 
 ---
 
-### Version 6: ZE Assignment & Charging Strategy (`6_ze_laadstrategie`)
-**Goal**: Assign ZE touringcars to suitable rotations + show charging strategy (FOR TENDER - K3)
+### Version 6: Fuel/Charging Constraint Integration (`6_fuel_charging_constraints`)
+**Goal**: Integrate fuel and charging constraints INTO the optimization, affecting chaining decisions and potentially increasing bus count when fuel range is exceeded.
+
+**UPDATED APPROACH (Feb 2026):**
+Version 6 now integrates energy constraints directly into the optimization algorithm rather than doing post-analysis. This means:
+- Fuel/charging feasibility affects which trips can be chained together
+- If cumulative km exceeds fuel range without a refueling opportunity, the chain must be split
+- This may result in MORE buses than purely time-based optimization
 
 **NS Requirement (from Gunningsleidraad K3):**
 > "Bij het uitwerken van de casus dient er rekening gehouden te worden met het inzetten van
 > tenminste 5 Zero Emissie (ZE) touringcars middels volledige chauffeursdiensten."
 
 **What Version 6 does:**
-- Takes version 5 output (efficient roster with deadhead)
-- Identifies all Touringcar rotations
-- Checks ZE feasibility per rotation:
-  - Total km ≤ ZE range (from `financieel_input.xlsx` Buskosten sheet)
-  - Sufficient idle windows for charging (if needed)
-- Assigns ZE to at least 5 feasible Touringcar rotations
-- Uses `tanklocaties.json` to find nearby charging stations
-- Identifies charging windows during idle periods
-- Outputs:
-  - Excel sheet "ZE Inzet" — which buses are assigned as ZE
-  - Excel sheet "Laadstrategie" — where/when to charge each ZE bus
-  - Summary statistics for tender document
+1. **Loads fuel configuration** from `additional_inputs.xlsx`:
+   - Diesel range per bus type (actieradius_*_diesel_km)
+   - ZE range per bus type (actieradius_*_ze_km)
+   - Refuel time (tanktijd_diesel_min + tanktijd_buffer_min = ~20 min)
+   - Charge time (based on charger power and battery capacity)
+
+2. **Tracks cumulative km** during optimization:
+   - Trip km estimated from duration × avg speed
+   - Deadhead km from deadhead matrix
+   - Running total per chain
+
+3. **Validates fuel feasibility** during chaining:
+   - Before connecting trip i → trip j, checks: current_km + trip_j_km ≤ remaining_range
+   - If exceeding, checks for refueling opportunity (idle window ≥ refuel time + travel to station)
+   - If refueling possible: resets range, adds refuel stop to plan
+   - If NOT possible: connection is rejected (chain split)
+
+4. **ZE assignment** for Touringcar rotations:
+   - Assigns ZE to at least 5 feasible Touringcar rotations (NS K3 requirement)
+   - Uses `tanklocaties.json` to find nearby charging stations
+   - Calculates charge_time accounting for driving time to/from charger:
+     - drive_time = 2 × (distance_to_charger / 30 km/h)
+     - actual_charge_time = idle_window - drive_time
+     - kwh_charged = charger_power × actual_charge_time × 0.8 (efficiency)
+
+5. **Output includes:**
+   - Excel sheet "ZE Inzet" — which buses are assigned as ZE
+   - Excel sheet "Laadstrategie" — where/when to charge each ZE bus (including drive_time_min)
+   - Fuel stops for diesel buses during long idle windows
+   - Warning if optimization needed MORE buses due to fuel constraints
 
 **Input files:**
-- Version 5 roster (from busomloop_optimizer.py)
-- `financieel_input.xlsx` — ZE range per bus type
-- `tanklocaties.json` — charging station locations (from fetch_tanklocaties.py)
+- Input roster (Bijlage_J.xlsx)
+- `additional_inputs.xlsx` — fuel consumption, tank capacity, ZE range per bus type
+- `tanklocaties.json` — charging and fuel station locations (from fetch_tanklocaties.py)
 
 ---
 
@@ -372,18 +396,18 @@ Completed scripts for data preparation:
 
 | Script | Purpose | Status |
 |--------|---------|--------|
-| `create_financieel_input.py` | Generate `financieel_input.xlsx` with 83 essential variables across 5 sheets | ✓ Done |
-| `update_financieel_input.py` | Auto-fetch fuel/electricity prices from CBS, EnergyZero, Fieten Olie APIs | ✓ Done |
+| `additional_inputs.xlsx` | Consolidated financial and operational variables (83+ variables across 5 sheets) | ✓ Done |
+| `fetch_fuel_charging_prices.py` | Auto-fetch fuel/electricity prices from CBS, EnergyZero, Fieten Olie APIs | ✓ Done |
 | `fetch_tanklocaties.py` | Fetch nearby fuel stations (OSM) and EV chargers (Open Charge Map) per bus station | ✓ Done |
 
-**`financieel_input.xlsx`** (5 sheets):
+**`additional_inputs.xlsx`** (5 sheets):
 - **Tarieven**: 5 hourly rates per bus type (from Prijzenblad)
-- **Chauffeurkosten**: 66 CAO variables (pauzestaffel, ORT, overtime, etc.)
-- **Buskosten**: fuel consumption per bus type — manual input (yellow cells)
+- **Chauffeurkosten**: CAO variables (pauzestaffel, ORT, overtime, etc.)
+- **Buskosten**: fuel consumption, tank capacity, diesel range, ZE battery capacity per bus type
 - **Duurzaamheid**: ZE/HVO incentives, KPI targets, malus rules
-- **Brandstofprijzen**: auto-updated by `update_financieel_input.py` (green cells)
+- **Brandstofprijzen**: auto-updated by `fetch_fuel_charging_prices.py` (green cells)
 
-**`update_financieel_input.py`** fetches:
+**`fetch_fuel_charging_prices.py`** (renamed from update_financieel_input.py) fetches:
 - CBS OData (table 80416ned): diesel B7 pump price (daily NL average)
 - EnergyZero API: electricity EPEX spot (hourly, incl. BTW)
 - Fieten Olie scraper: HVO100 + B7 advisory prices
@@ -398,8 +422,26 @@ Completed scripts for data preparation:
 - CLI flags: `--fuel-only`, `--charging-only`, `--radius N`, `--ocm-key KEY`, `--dry-run`
 - Input options: `--input Bijlage_J.xlsx` (auto-discover), `--coords file.json`, or `--stations "Name1" "Name2"`
 
-### Step 1: Financial Calculator Module (`financial_calculator.py`)
-New module that reads financieel_input.xlsx and exposes:
+### Step 1: Version 6 - Fuel/Charging Constraints (IN PROGRESS ✓)
+
+**Implemented features:**
+- ZE feasibility analysis integrated into `busomloop_optimizer.py`
+- ZE configuration loading from `additional_inputs.xlsx` (with defaults)
+- Charging station lookup from `tanklocaties.json`
+- Charging time calculation including drive time to/from charger
+- ZE assignment for Touringcar rotations (min 5 for NS K3)
+- Excel output: "ZE Inzet" and "Laadstrategie" sheets
+
+**TODO (fuel constraint integration into optimization):**
+- [ ] Load diesel range configuration from `additional_inputs.xlsx`
+- [ ] Track cumulative km during trip chaining
+- [ ] Validate fuel range before connecting trips
+- [ ] Check for refueling opportunities during idle windows
+- [ ] Split chains when fuel range exceeded without refuel opportunity
+- [ ] Add fuel stop planning to Excel output
+
+### Step 2: Financial Calculator Module (`financial_calculator.py`)
+New module that reads additional_inputs.xlsx and exposes:
 - `load_financial_config(xlsx_path) → dict`
 - `calculate_driver_cost(rotation, date, config) → CostBreakdown`
 - `calculate_revenue(rotation, bus_type, config) → float`
@@ -413,15 +455,15 @@ Key logic:
 - Overtime detection and surcharge calculation
 - Date-dependent rate selection (2025-01-01, 2025-07-01, 2026-01-01)
 
-### Step 2: Extend busomloop_optimizer.py
-- New CLI flags: `--financieel`, `--financieel-input XLSX`, `--tanklocaties JSON`
-- Import `financial_calculator` module
-- Add version 6 output generation (financial overlay on existing roster)
+### Step 3: Extend busomloop_optimizer.py
+- CLI flags: `--ze` (enable ZE analysis), `--min-ze N` (minimum ZE buses), `--inputs XLSX`, `--tanklocaties JSON`
+- Import `financial_calculator` module (for versions 7-9)
+- Version 6: fuel/charging constraints integrated into optimization ✓
 - Add version 7 optimization with euro-based cost function
 - Add version 8 with sustainability fuel-type assignment
-- Add version 9 with fueling/charging logistics (uses `tanklocaties.json`)
+- Add version 9 with full profit optimization
 
-### Step 3: Extend Output Excel
+### Step 4: Extend Output Excel
 New sheets per financial version:
 - **Financieel Overzicht**: revenue, costs, profit per bus, per day, per bus type
 - **CAO Kosten Detail**: paid hours, ORT, overtime, surcharges per shift
@@ -489,11 +531,16 @@ New sheets per financial version:
 ### Recommended Implementation Order
 
 1. ✅ **Step 0:** Data preparation scripts (DONE)
-   - `create_financieel_input.py` ✓
-   - `update_financieel_input.py` ✓
+   - `additional_inputs.xlsx` — consolidated financial + operational inputs ✓
+   - `fetch_fuel_charging_prices.py` ✓
    - `fetch_tanklocaties.py` ✓
 
-2. **Step 1:** Implement Version 6 — ZE Assignment + Charging (FOR TENDER)
+2. ⏳ **Step 1:** Version 6 — Fuel/Charging Constraints (IN PROGRESS)
+   - ZE feasibility analysis ✓
+   - ZE charging strategy with drive time ✓
+   - Diesel fuel range validation ← **CURRENT**
+   - Fuel constraint integration into optimization ← **CURRENT**
+
 3. **Step 2:** Test Version 6 on real tender casus data
 4. **Step 3:** Create `financial_calculator.py` for versions 7-9
 5. **Step 4:** Implement Version 7 — Financial Analysis (internal)
@@ -502,56 +549,36 @@ New sheets per financial version:
 
 ---
 
-### Immediate Next Step: Version 6 (ZE + Charging)
+### Current Implementation Focus: Fuel Constraint Integration
 
-Version 6 is tender-relevant and should be implemented first. It does NOT require
-`financial_calculator.py` — it only needs:
-- Version 5 roster output
-- ZE range data from `financieel_input.xlsx`
-- Charging stations from `tanklocaties.json`
+The ZE functionality is already implemented. The remaining work for Version 6 is integrating
+**diesel fuel constraints** into the optimization algorithm.
 
-**Implementation plan for Version 6:**
+**Algorithm change for fuel-constrained optimization:**
 
-```python
-# ze_charging_planner.py
+The cleanest approach is a **post-optimization validation pass**:
+1. Run the standard min-cost optimization (unchanged)
+2. For each resulting chain, calculate cumulative km
+3. At each trip transition, check: `cumulative_km + next_trip_km > fuel_range?`
+4. If yes, check the idle window before the next trip:
+   - If `idle_window >= refuel_time + 2 × drive_to_station`: can refuel, reset cumulative km
+   - If not: must split the chain at this point (creates additional bus)
+5. Re-number buses after splits
 
-def load_ze_config(financieel_xlsx):
-    """Load ZE range per bus type from Buskosten sheet."""
-    # Returns: {"Touringcar": 300, "Dubbeldekker": 250, ...} (km)
+**Why this approach:**
+- Keeps the core optimization algorithm unchanged and correct
+- Fuel constraints are validated after matching, not during
+- Easy to add different fuel types (diesel, HVO, ZE) with different ranges
+- Refueling opportunities are checked against actual idle windows
 
-def load_charging_stations(tanklocaties_json):
-    """Load charging station data per bus station."""
-    # Returns: {station_name: [list of nearby chargers with power, distance]}
+**Data needed from `additional_inputs.xlsx`:**
+- `actieradius_*_diesel_km`: diesel range per bus type
+- `tanktijd_diesel_min` + `tanktijd_buffer_min`: refuel time (~20 min)
+- `avg_snelheid_naar_tankstation_kmh`: drive speed to fuel station (30 km/h)
 
-def calculate_rotation_km(rotation, deadhead_matrix=None):
-    """Calculate total km for a rotation (trips + deadhead)."""
-    # Sum of trip distances + deadhead repositioning
-
-def check_ze_feasibility(rotation, ze_range_km, charging_stations):
-    """Check if rotation can be done with ZE bus."""
-    # Returns: (feasible: bool, needs_charging: bool, charging_plan: list)
-    # - feasible: total_km <= ze_range OR can charge during idle
-    # - charging_plan: [(station, idle_window, charger_info), ...]
-
-def assign_ze_buses(rotations, min_ze_count, ze_config, charging_stations):
-    """Assign ZE to at least min_ze_count Touringcar rotations."""
-    # 1. Filter to Touringcar rotations only
-    # 2. Check ZE feasibility for each
-    # 3. Sort by suitability (prefer shorter rotations, better charging options)
-    # 4. Assign ZE to top N feasible rotations
-    # Returns: {rotation_id: ZEAssignment}
-
-def generate_ze_output(rotations, ze_assignments, charging_stations, output_xlsx):
-    """Generate Excel output for tender."""
-    # Sheet "ZE Inzet": which buses are ZE, why they were chosen
-    # Sheet "Laadstrategie": charging plan per ZE bus
-```
-
-**Key decisions for ZE assignment:**
-- Prefer rotations with lower total km (more buffer)
-- Prefer rotations with good charging opportunities (long idle at station with fast charger)
-- Prefer rotations that don't require mid-route charging (simpler)
-- Ensure at least 5 Touringcar rotations are assigned as ZE
+**Data needed from `tanklocaties.json`:**
+- Nearest fuel stations per bus station
+- Distance to each station (for drive time calculation)
 
 ---
 

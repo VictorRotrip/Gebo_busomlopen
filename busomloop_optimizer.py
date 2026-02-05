@@ -659,6 +659,30 @@ def get_station_halts() -> dict:
 # ZE (Zero Emission) Configuration - Version 6
 # ---------------------------------------------------------------------------
 
+# Default fuel configuration (used if additional_inputs.xlsx not available)
+FUEL_DEFAULTS = {
+    # Diesel range per bus type (km) - from tank capacity / consumption
+    "diesel_range_km": {
+        "Touringcar": 1562,      # 500L tank / 32L per 100km
+        "Dubbeldekker": 889,     # 400L tank / 45L per 100km
+        "Lagevloerbus": 789,     # 300L tank / 38L per 100km
+        "Midi bus": 800,         # 200L tank / 25L per 100km
+        "Taxibus": 667,          # 80L tank / 12L per 100km
+    },
+    # Diesel consumption per bus type (L/100km)
+    "diesel_consumption_l_per_100km": {
+        "Touringcar": 32,
+        "Dubbeldekker": 45,
+        "Lagevloerbus": 38,
+        "Midi bus": 25,
+        "Taxibus": 12,
+    },
+    # Refuel time in minutes (including buffer)
+    "refuel_time_min": 20,       # 15 min tank + 5 min buffer
+    # Average speed to fuel station (km/h)
+    "speed_to_station_kmh": 30,
+}
+
 # Default ZE configuration (used if additional_inputs.xlsx not available)
 ZE_DEFAULTS = {
     "ze_range_km": {
@@ -756,6 +780,127 @@ def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
         print(f"  ZE config laden mislukt ({e}), standaardwaarden gebruikt")
 
     return config
+
+
+def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
+    """Load fuel configuration from additional_inputs.xlsx Buskosten sheet.
+
+    Returns dict with:
+        - diesel_range_km: {bus_type: range_km}
+        - diesel_consumption_l_per_100km: {bus_type: liters}
+        - refuel_time_min: total refuel time including buffer
+        - speed_to_station_kmh: average speed driving to fuel station
+        - avg_speed_kmh: {bus_type: km/h for estimating trip distances}
+    """
+    config = {
+        "diesel_range_km": dict(FUEL_DEFAULTS["diesel_range_km"]),
+        "diesel_consumption_l_per_100km": dict(FUEL_DEFAULTS["diesel_consumption_l_per_100km"]),
+        "refuel_time_min": FUEL_DEFAULTS["refuel_time_min"],
+        "speed_to_station_kmh": FUEL_DEFAULTS["speed_to_station_kmh"],
+        "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+    }
+
+    path = Path(inputs_xlsx)
+    if not path.exists():
+        print(f"  Fuel config: {inputs_xlsx} niet gevonden, standaardwaarden gebruikt")
+        return config
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        if "Buskosten" not in wb.sheetnames:
+            print(f"  Fuel config: 'Buskosten' blad niet gevonden, standaardwaarden gebruikt")
+            wb.close()
+            return config
+
+        ws = wb["Buskosten"]
+
+        # Parse the sheet to find diesel range and other values
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+            if not row or not row[0]:
+                continue
+            var_name = str(row[0]).lower()
+            value = row[1]
+
+            # Diesel range (actieradius)
+            if "actieradius" in var_name and "_diesel" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    config["diesel_range_km"]["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    config["diesel_range_km"]["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    config["diesel_range_km"]["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    config["diesel_range_km"]["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    config["diesel_range_km"]["Taxibus"] = float(value)
+
+            # Diesel consumption (L per 100km)
+            if "verbruik" in var_name and "_diesel" in var_name and "l_per" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    config["diesel_consumption_l_per_100km"]["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    config["diesel_consumption_l_per_100km"]["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    config["diesel_consumption_l_per_100km"]["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    config["diesel_consumption_l_per_100km"]["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    config["diesel_consumption_l_per_100km"]["Taxibus"] = float(value)
+
+            # Refuel time
+            if "tanktijd_diesel" in var_name and value:
+                config["refuel_time_min"] = float(value)
+            if "tanktijd_buffer" in var_name and value:
+                config["refuel_time_min"] += float(value)
+
+            # Speed to station
+            if "snelheid_naar_tankstation" in var_name and value:
+                config["speed_to_station_kmh"] = float(value)
+
+        wb.close()
+        print(f"  Fuel config geladen: bereik Touringcar = {config['diesel_range_km']['Touringcar']} km")
+    except Exception as e:
+        print(f"  Fuel config laden mislukt ({e}), standaardwaarden gebruikt")
+
+    return config
+
+
+def load_fuel_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
+    """Load fuel station data from tanklocaties.json.
+
+    Returns: {station_name: [{"name": str, "distance_km": float, "fuel_types": list}, ...]}
+    """
+    import json
+    path = Path(tanklocaties_json)
+    if not path.exists():
+        print(f"  Tankstations: {tanklocaties_json} niet gevonden")
+        return {}
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        stations_by_location = {}
+
+        for station_name, station_data in data.get("stations", {}).items():
+            fuel_stations = []
+            for fs in station_data.get("fuel_stations", []):
+                fuel_stations.append({
+                    "name": fs.get("name", "Unknown"),
+                    "distance_km": fs.get("distance_km", 0),
+                    "fuel_types": fs.get("fuel_types", ["diesel"]),
+                })
+
+            # Sort by distance (prefer closest)
+            fuel_stations.sort(key=lambda s: s["distance_km"])
+            stations_by_location[station_name] = fuel_stations
+
+        total_stations = sum(len(v) for v in stations_by_location.values())
+        print(f"  Tankstations geladen: {len(stations_by_location)} locaties, {total_stations} tankpunten")
+        return stations_by_location
+    except Exception as e:
+        print(f"  Tankstations laden mislukt: {e}")
+        return {}
 
 
 def load_charging_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
@@ -991,6 +1136,208 @@ def assign_ze_buses(rotations: list, min_ze_count: int, ze_config: dict,
     all_results = {f.rotation_id: f for f in feasibility_results}
 
     return ze_assignments, all_results, assigned_count
+
+
+# ---------------------------------------------------------------------------
+# Fuel Constraint Validation - Version 6 (Integrated into optimization)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FuelStop:
+    """A planned fuel stop during a rotation."""
+    station_name: str
+    fuel_station_name: str
+    fuel_station_distance_km: float
+    idle_start_min: int
+    idle_end_min: int
+    idle_duration_min: int
+    drive_time_min: float
+    km_before_stop: float
+
+
+@dataclass
+class FuelValidationResult:
+    """Result of fuel constraint validation for a rotation."""
+    rotation_id: str
+    bus_type: str
+    total_km: float
+    fuel_range_km: float
+    is_feasible: bool
+    needs_refuel: bool
+    fuel_stops: list  # List of FuelStop
+    split_points: list  # List of trip indices where chain should be split
+    reason: str
+
+
+def estimate_trip_km(trip: Trip, fuel_config: dict) -> float:
+    """Estimate km for a single trip based on duration and average speed."""
+    avg_speed = fuel_config["avg_speed_kmh"].get(trip.bus_type, 45)
+    duration_hours = trip.duration / 60
+    return avg_speed * duration_hours
+
+
+def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
+                               fuel_stations: dict,
+                               deadhead_matrix: dict = None) -> FuelValidationResult:
+    """Validate fuel feasibility for a rotation.
+
+    Checks if the cumulative km exceeds fuel range, and if so, whether
+    refueling opportunities exist during idle windows.
+
+    Returns FuelValidationResult with:
+    - is_feasible: True if can complete rotation (with or without refueling)
+    - needs_refuel: True if refueling is needed
+    - fuel_stops: List of planned fuel stops
+    - split_points: If not feasible, indices where chain should be split
+    """
+    bus_type = rotation.bus_type
+    fuel_range = fuel_config["diesel_range_km"].get(bus_type, 1000)
+    refuel_time = fuel_config["refuel_time_min"]
+    speed_to_station = fuel_config["speed_to_station_kmh"]
+
+    trips = rotation.trips
+    fuel_stops = []
+    split_points = []
+
+    cumulative_km = 0.0
+    remaining_range = fuel_range
+
+    for i, trip in enumerate(trips):
+        trip_km = estimate_trip_km(trip, fuel_config)
+
+        # Add deadhead km from previous trip (if any)
+        deadhead_km = 0.0
+        if i > 0 and deadhead_matrix:
+            prev_dest = normalize_location(trips[i - 1].dest_code)
+            curr_orig = normalize_location(trip.origin_code)
+            if prev_dest != curr_orig:
+                dh_time = deadhead_matrix.get(prev_dest, {}).get(curr_orig, 0)
+                if dh_time > 0:
+                    # Estimate deadhead km from time (assume same avg speed)
+                    deadhead_km = (dh_time / 60) * speed_to_station
+                    trip_km += deadhead_km
+
+        # Check if adding this trip exceeds remaining range
+        if trip_km > remaining_range and i > 0:
+            # Need to check for refueling opportunity BEFORE this trip
+            prev_trip = trips[i - 1]
+            idle_gap = trip.departure - prev_trip.arrival
+
+            # Find nearest fuel station at the location
+            station_loc = normalize_location(prev_trip.dest_code)
+            stations = fuel_stations.get(station_loc, [])
+
+            # Try normalized match if exact match fails
+            if not stations:
+                for loc_name in fuel_stations:
+                    if normalize_location(loc_name) == station_loc:
+                        stations = fuel_stations[loc_name]
+                        break
+
+            can_refuel = False
+            if stations:
+                nearest = stations[0]
+                drive_time_one_way = (nearest["distance_km"] / speed_to_station) * 60
+                drive_time_total = 2 * drive_time_one_way  # round trip
+                total_time_needed = refuel_time + drive_time_total
+
+                if idle_gap >= total_time_needed:
+                    can_refuel = True
+                    fuel_stops.append(FuelStop(
+                        station_name=station_loc,
+                        fuel_station_name=nearest["name"],
+                        fuel_station_distance_km=nearest["distance_km"],
+                        idle_start_min=prev_trip.arrival,
+                        idle_end_min=trip.departure,
+                        idle_duration_min=idle_gap,
+                        drive_time_min=drive_time_total,
+                        km_before_stop=cumulative_km,
+                    ))
+                    # Reset range after refueling
+                    remaining_range = fuel_range
+                    cumulative_km = 0.0
+
+            if not can_refuel:
+                # Cannot refuel, mark split point
+                split_points.append(i)
+                # Reset for new bus
+                remaining_range = fuel_range
+                cumulative_km = 0.0
+
+        # Add trip km to cumulative
+        cumulative_km += trip_km
+        remaining_range -= trip_km
+
+    total_km = sum(estimate_trip_km(t, fuel_config) for t in trips)
+    is_feasible = len(split_points) == 0
+    needs_refuel = len(fuel_stops) > 0
+
+    if is_feasible and not needs_refuel:
+        reason = f"Bereik voldoende: {total_km:.0f} km < {fuel_range:.0f} km"
+    elif is_feasible and needs_refuel:
+        reason = f"Haalbaar met {len(fuel_stops)} tankstop(s)"
+    else:
+        reason = f"Niet haalbaar: {len(split_points)} splits nodig"
+
+    return FuelValidationResult(
+        rotation_id=rotation.bus_id,
+        bus_type=bus_type,
+        total_km=total_km,
+        fuel_range_km=fuel_range,
+        is_feasible=is_feasible,
+        needs_refuel=needs_refuel,
+        fuel_stops=fuel_stops,
+        split_points=split_points,
+        reason=reason,
+    )
+
+
+def apply_fuel_constraints(rotations: list, fuel_config: dict,
+                           fuel_stations: dict,
+                           deadhead_matrix: dict = None) -> tuple:
+    """Apply fuel constraints to rotations, splitting where necessary.
+
+    Returns: (new_rotations, validation_results, split_count)
+    - new_rotations: list of rotations after applying splits
+    - validation_results: {rotation_id: FuelValidationResult}
+    - split_count: number of chains that were split
+    """
+    new_rotations = []
+    validation_results = {}
+    split_count = 0
+    rotation_counter = len(rotations)  # Start numbering after existing
+
+    for rotation in rotations:
+        result = validate_fuel_feasibility(
+            rotation, fuel_config, fuel_stations, deadhead_matrix
+        )
+        validation_results[rotation.bus_id] = result
+
+        if result.is_feasible:
+            # No splits needed, keep rotation as-is
+            new_rotations.append(rotation)
+        else:
+            # Need to split at split_points
+            split_count += 1
+            trips = rotation.trips
+            split_indices = [0] + result.split_points + [len(trips)]
+
+            for j in range(len(split_indices) - 1):
+                start_idx = split_indices[j]
+                end_idx = split_indices[j + 1]
+                subset_trips = trips[start_idx:end_idx]
+
+                if subset_trips:
+                    rotation_counter += 1
+                    new_rotation = BusRotation(
+                        bus_id=f"{rotation.date_str}_{rotation.bus_type[:2]}_{rotation_counter:03d}",
+                        bus_type=rotation.bus_type,
+                        date_str=rotation.date_str,
+                        trips=subset_trips,
+                    )
+                    new_rotations.append(new_rotation)
+
+    return new_rotations, validation_results, split_count
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
@@ -3423,6 +3770,12 @@ def main():
         help="Excel bestand met busspecificaties, tarieven, tankinhoud, etc. "
              "Gegenereerd door create_additional_inputs.py. Standaard: additional_inputs.xlsx",
     )
+    parser.add_argument(
+        "--fuel-constraints",
+        action="store_true",
+        help="Pas brandstofbeperkingen toe: controleer actieradius per bustype en "
+             "splits omlopen als brandstofbereik overschreden wordt zonder tankmogelijkheid.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -3492,6 +3845,18 @@ def main():
         print("ZE configuratie laden...")
         ze_config = load_ze_config(args.inputs)
         charging_stations = load_charging_stations(args.tanklocaties)
+
+    # Load fuel configuration if --fuel-constraints is enabled
+    fuel_config = None
+    fuel_stations = None
+    if args.fuel_constraints:
+        print("Brandstofconfiguratie laden...")
+        fuel_config = load_fuel_config(args.inputs)
+        fuel_stations = load_fuel_stations(args.tanklocaties)
+        # Show range per bus type
+        print("  Actieradius per bustype:")
+        for bt, range_km in fuel_config["diesel_range_km"].items():
+            print(f"    {bt}: {range_km:.0f} km")
 
     # --snel mode: only useful when deadhead is provided + multiple algos
     snel_mode = args.snel and len(algos) > 1 and deadhead_matrix is not None
@@ -3718,6 +4083,17 @@ def main():
             print(f"  Output 1 - Per dienst, geen reserves...")
             rot1 = optimize_rotations(all_trips, baseline_turnaround,
                                       algorithm=algo_key, per_service=True)
+
+            # Apply fuel constraints if enabled
+            if fuel_config and fuel_stations:
+                rot1_orig_count = len(rot1)
+                rot1, fuel_results_1, fuel_splits_1 = apply_fuel_constraints(
+                    rot1, fuel_config, fuel_stations, deadhead_matrix
+                )
+                if fuel_splits_1 > 0:
+                    print(f"    Brandstofcontrole: {fuel_splits_1} omlopen gesplitst "
+                          f"({rot1_orig_count} -> {len(rot1)} bussen)")
+
             n1 = len(rot1)
             n1_idle = sum(r.total_idle_minutes for r in rot1)
             print(f"    {n1} bussen met ritten + {total_reserves} reserve = {n1 + total_reserves} totaal")
@@ -3760,6 +4136,17 @@ def main():
             print(f"  Output 3 - Gecombineerd + reserves + sensitiviteit...")
             rot3 = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                       algorithm=algo_key)
+
+            # Apply fuel constraints if enabled
+            if fuel_config and fuel_stations:
+                rot3_orig_count = len(rot3)
+                rot3, fuel_results_3, fuel_splits_3 = apply_fuel_constraints(
+                    rot3, fuel_config, fuel_stations, deadhead_matrix
+                )
+                if fuel_splits_3 > 0:
+                    print(f"    Brandstofcontrole: {fuel_splits_3} omlopen gesplitst "
+                          f"({rot3_orig_count} -> {len(rot3)} bussen)")
+
             n3_with_trips = len([r for r in rot3 if r.real_trips])
             n3_reserve_only = len([r for r in rot3 if not r.real_trips and r.reserve_trip_list])
             n3_res_planned = sum(len(r.reserve_trip_list) for r in rot3)
@@ -3805,6 +4192,17 @@ def main():
                 rot4 = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                           algorithm=algo_key,
                                           trip_turnaround_overrides=trip_overrides)
+
+                # Apply fuel constraints if enabled
+                if fuel_config and fuel_stations:
+                    rot4_orig_count = len(rot4)
+                    rot4, fuel_results_4, fuel_splits_4 = apply_fuel_constraints(
+                        rot4, fuel_config, fuel_stations, deadhead_matrix
+                    )
+                    if fuel_splits_4 > 0:
+                        print(f"    Brandstofcontrole: {fuel_splits_4} omlopen gesplitst "
+                              f"({rot4_orig_count} -> {len(rot4)} bussen)")
+
                 n4_with_trips = len([r for r in rot4 if r.real_trips])
                 n4_reserve_only = len([r for r in rot4 if not r.real_trips and r.reserve_trip_list])
                 n4_res_planned = sum(len(r.reserve_trip_list) for r in rot4)
@@ -3846,6 +4244,17 @@ def main():
                                       algorithm=algo_key,
                                       deadhead_matrix=deadhead_matrix,
                                       trip_turnaround_overrides=trip_overrides)
+
+            # Apply fuel constraints if enabled
+            if fuel_config and fuel_stations:
+                rot5_orig_count = len(rot5)
+                rot5, fuel_results_5, fuel_splits_5 = apply_fuel_constraints(
+                    rot5, fuel_config, fuel_stations, deadhead_matrix
+                )
+                if fuel_splits_5 > 0:
+                    print(f"    Brandstofcontrole: {fuel_splits_5} omlopen gesplitst "
+                          f"({rot5_orig_count} -> {len(rot5)} bussen)")
+
             n5_with_trips = len([r for r in rot5 if r.real_trips])
             n5_reserve_only = len([r for r in rot5 if not r.real_trips and r.reserve_trip_list])
             n5_res_planned = sum(len(r.reserve_trip_list) for r in rot5)
