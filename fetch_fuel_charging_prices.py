@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-update_financieel_input.py
+fetch_fuel_charging_prices.py
 
 Fetches the latest fuel and electricity prices from public APIs and updates
-the 'Brandstofprijzen' sheet in financieel_input.xlsx.
+the 'Brandstofprijzen' sheet in additional_inputs.xlsx.
 
 Data sources:
   - CBS OData (table 80416ned): daily Dutch diesel B7 pump prices (free, no auth)
@@ -11,11 +11,11 @@ Data sources:
   - Fieten Olie: HVO100 + B7 advisory prices (web scrape)
 
 Usage:
-  python update_financieel_input.py                     # update all prices
-  python update_financieel_input.py --diesel-only       # only diesel from CBS
-  python update_financieel_input.py --electricity-only  # only electricity
-  python update_financieel_input.py --hvo-only          # only HVO100/B7 advisory
-  python update_financieel_input.py --dry-run           # fetch but don't write
+  python fetch_fuel_charging_prices.py                     # update all prices
+  python fetch_fuel_charging_prices.py --diesel-only       # only diesel from CBS
+  python fetch_fuel_charging_prices.py --electricity-only  # only electricity
+  python fetch_fuel_charging_prices.py --hvo-only          # only HVO100/B7 advisory
+  python fetch_fuel_charging_prices.py --dry-run           # fetch but don't write
 
 Requirements:
   pip install openpyxl requests
@@ -39,7 +39,7 @@ except ImportError:
     sys.exit("Error: requests not installed. Run: pip install requests")
 
 
-EXCEL_PATH = Path(__file__).parent / "financieel_input.xlsx"
+EXCEL_PATH = Path(__file__).parent / "additional_inputs.xlsx"
 SHEET_NAME = "Brandstofprijzen"
 
 
@@ -310,7 +310,7 @@ def update_excel(diesel_data, electricity_data, fieten_data, hvo_calc,
                  excel_path=EXCEL_PATH):
     """Write fetched prices into the Brandstofprijzen sheet."""
     if not excel_path.exists():
-        sys.exit(f"Error: {excel_path} not found. Run create_financieel_input.py first.")
+        sys.exit(f"Error: {excel_path} not found.")
 
     wb = openpyxl.load_workbook(excel_path)
     if SHEET_NAME not in wb.sheetnames:
@@ -380,7 +380,7 @@ def update_excel(diesel_data, electricity_data, fieten_data, hvo_calc,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch latest fuel/electricity prices and update financieel_input.xlsx"
+        description="Fetch latest fuel/electricity prices and update additional_inputs.xlsx"
     )
     parser.add_argument("--diesel-only", action="store_true",
                         help="Only fetch diesel B7 from CBS")
@@ -398,7 +398,7 @@ def main():
     fetch_all = not (args.diesel_only or args.electricity_only or args.hvo_only)
 
     print("=" * 60)
-    print("Brandstofprijzen updater for financieel_input.xlsx")
+    print("Fuel & Electricity Price Fetcher")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     print()
