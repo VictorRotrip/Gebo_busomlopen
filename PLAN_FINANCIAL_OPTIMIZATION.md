@@ -16,17 +16,9 @@ types. What the optimizer CAN optimize is:
 - How to schedule fueling/charging stops
 - How to minimize driver costs through smart chaining (reducing ORT, overtime, broken shifts)
 
-All financial variables are sourced from `Commerciele_variabelen.xlsx` (5 data sheets, 206 variables
-total). A focused subset of 83 essential variables has been extracted into **`financieel_input.xlsx`**
-(5 sheets: Tarieven, Chauffeurkosten, Buskosten, Duurzaamheid, Brandstofprijzen) — this is the
-primary input file for versions 7-9.
-
-Original source sheets in Commerciele_variabelen.xlsx:
-- **CAO_variabelen** — driver labor costs (80 variables)
-- **Contract_variabelen** — contract terms, sustainability incentives (18 variables)
-- **Malus_variabelen** — KPI penalties and bonuses (50 variables)
-- **Prijzenblad_variabelen** — hourly rates, start fees (22 variables)
-- **PvEisen_variabelen** — service level requirements (36 variables)
+All financial variables are stored in **`financieel_input.xlsx`** (5 sheets: Tarieven,
+Chauffeurkosten, Buskosten, Duurzaamheid, Brandstofprijzen) — this is the primary input file
+for versions 6-9.
 
 ---
 
@@ -67,12 +59,31 @@ Chains like `[A→B→D]` and `[C→E]`, where each chain = one BusRotation (one
 schedule). The algorithm guarantees the minimum possible number of buses.
 
 ### What Changes for Financial Optimization
-The cost function changes from `deadhead × 2 + idle` to a euro-based cost that considers:
-- Revenue lost during idle/deadhead time (bus earns nothing)
-- Driver cost during idle time (still getting paid)
+
+**Key insight: Versions 6-9 do NOT change the primary objective (minimize buses).**
+
+The min-cost algorithm works by finding augmenting paths in order of increasing cost. Each
+augmenting path reduces the number of buses by one. So:
+
+1. The algorithm keeps finding cheaper ways to merge buses until no more merges are possible
+2. The **number of buses** at the end is determined by the graph structure (which trips CAN connect)
+3. The **cost function** only affects WHICH chaining is chosen when multiple options exist
+
+**If there's only ONE possible chaining that achieves N buses:**
+- Versions 1-5 and versions 7-9 will produce the **exact same result**
+- The cost function doesn't matter because there are no alternatives to choose from
+
+**If there are MULTIPLE chainings that achieve N buses:**
+- Versions 1-5 pick the one with minimum `deadhead × 2 + idle` (time-based)
+- Versions 7-9 pick the one with minimum `driver_cost + fuel_cost - bonuses` (euro-based)
+- This can produce different results with different profit implications
+
+For versions 7-9, the cost function changes from `deadhead × 2 + idle` to a euro-based cost:
+- Driver cost during idle time (still getting paid, not earning revenue)
 - Fuel cost during deadhead drives
 - ORT surcharges if chaining extends shifts into unsocial hours
 - Break deduction impacts from shift length changes
+- Sustainability bonuses/penalties for fuel type choices (version 8+)
 
 ---
 
@@ -154,19 +165,22 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 ### Version 6: Financial Cost Calculation (`6_financieel_basis`)
 **Goal**: Calculate full financial picture on existing efficient roster (from version 5)
 
-- Input: version 5 roster + Commerciele_variabelen.xlsx + fuel config
+- Input: version 5 roster + `financieel_input.xlsx`
 - Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost
 - Output: new Excel sheets "Financieel Overzicht", "CAO Kosten", "Duurzaamheid"
 - No re-optimization; purely analytical overlay on the efficient roster
+- **Same algorithm, same result as version 5** — just adds financial calculations
 
 ### Version 7: Cost-Optimized Roster (`7_financieel_geoptimaliseerd`)
-**Goal**: Re-optimize with profit as objective instead of bus count
+**Goal**: Re-optimize with euro-based cost function (secondary objective changes)
 
-- Modify min-cost flow: edge weights become euro-based costs instead of `deadhead × 2 + idle`
-- New cost per edge (i→j): `driver_cost(shift_with_j) - driver_cost(shift_without_j) + fuel_cost(deadhead) - revenue_from_reduced_buses`
+- **Primary objective unchanged**: still minimizes number of buses
+- **Secondary objective**: among all chainings that achieve minimum buses, pick the most profitable
+- New edge cost: `driver_cost_delta + fuel_cost(deadhead) - sustainability_bonus`
 - Minimize ORT exposure: prefer chaining trips that keep shifts within daytime hours
 - Manage overtime: consider break deduction bracket jumps when extending shifts
 - **Bus types remain fixed** as dictated by NS input — only chaining order changes
+- **Note**: If only one bus-optimal chaining exists, result is identical to version 5
 
 ### Version 8: Sustainability-Optimized (`8_duurzaamheid_geoptimaliseerd`)
 **Goal**: Optimize fuel-type assignment per bus to maximize sustainability bonuses and avoid malus
@@ -428,3 +442,90 @@ New sheets per financial version:
 | Charging station locations | **Automated**: `fetch_tanklocaties.py` | Open Charge Map | ✓ **Implemented** |
 | Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) | Contract negotiation | Manual input needed |
 | Bus range and tank/battery capacity | Fill in Buskosten sheet in financieel_input.xlsx | Manufacturer data | **Template ready** (defaults filled) |
+
+---
+
+## Next Steps to Implement Versions 6-9
+
+### Immediate Next Step: Create `financial_calculator.py`
+
+This is the core module needed for all versions 6-9. It reads `financieel_input.xlsx` and provides:
+
+```python
+# Core functions needed:
+load_financial_config(xlsx_path) → FinancialConfig
+calculate_revenue(rotation, config) → float  # active_hours × hourly_rate
+calculate_driver_cost(rotation, config) → DriverCostBreakdown
+    # - paid_hours (after break deductions)
+    # - base_wage
+    # - ORT_surcharge (per time window)
+    # - overtime_surcharge
+    # - meal_allowance
+    # - break_surcharge (onderbrekingstoeslag)
+calculate_fuel_cost(rotation, fuel_type, config) → float
+calculate_sustainability(rotations, config) → SustainabilityReport
+    # - ZE km and bonus
+    # - HVO100 liters and incentive
+    # - KPI score vs target
+    # - projected malus/bonus
+```
+
+**Estimated effort:** Medium (1-2 days) — mostly translating CAO rules into code.
+
+### Version 6 Implementation
+
+After `financial_calculator.py` exists:
+
+1. Add `--financieel` flag to `busomloop_optimizer.py`
+2. After generating version 5 output, call financial calculator on each rotation
+3. Add new Excel sheets: "Financieel Overzicht", "CAO Kosten Detail", "Duurzaamheid KPI"
+4. No algorithm changes — purely additive
+
+**Estimated effort:** Small (half day) — just output formatting.
+
+### Version 7 Implementation
+
+1. Create new cost function for edge weights:
+   ```python
+   def financial_edge_cost(trip_i, trip_j, current_chain, config):
+       # Calculate driver cost delta if we add trip_j to current_chain
+       chain_with_j = current_chain + [trip_j]
+       cost_with_j = calculate_driver_cost(chain_with_j, config)
+       cost_without_j = calculate_driver_cost(current_chain, config)
+       driver_delta = cost_with_j.total - cost_without_j.total
+
+       # Add fuel cost for deadhead (if different locations)
+       fuel_cost = calculate_deadhead_fuel_cost(trip_i, trip_j, config)
+
+       return driver_delta + fuel_cost
+   ```
+
+2. Modify `_optimize_mincost()` to use this cost function instead of `deadhead × 2 + idle`
+
+3. **Challenge:** The current algorithm calculates edge costs upfront (before knowing the full chain).
+   For version 7, the cost depends on the accumulated chain (shift length affects ORT, break brackets).
+   Options:
+   - **Approximate:** Use average/typical shift assumptions for edge costs
+   - **Iterative:** Run optimization, then refine edge costs based on result, repeat
+   - **Exact:** More complex algorithm that tracks state through the matching
+
+**Estimated effort:** Medium-Large (2-4 days) — algorithm modifications needed.
+
+### Version 8 & 9 Implementation
+
+These build on version 7 and add:
+- **Version 8:** Fuel type assignment per rotation (ZE/HVO/diesel) as a second optimization pass
+- **Version 9:** Integration with `tanklocaties.json` for fueling/charging logistics
+
+**Estimated effort:** Medium each (1-2 days per version).
+
+### Recommended Implementation Order
+
+1. ✅ Step 0: Data preparation scripts (DONE)
+2. **Step 1:** Create `financial_calculator.py` with CAO logic
+3. **Step 2:** Implement Version 6 (financial overlay)
+4. **Step 3:** Test Version 6 thoroughly on real data
+5. **Step 4:** Implement Version 7 (cost function change)
+6. **Step 5:** Compare Version 5 vs 7 results on various inputs
+7. **Step 6:** Implement Version 8 (fuel type assignment)
+8. **Step 7:** Implement Version 9 (fueling logistics)
