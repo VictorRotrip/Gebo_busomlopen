@@ -16,7 +16,12 @@ types. What the optimizer CAN optimize is:
 - How to schedule fueling/charging stops
 - How to minimize driver costs through smart chaining (reducing ORT, overtime, broken shifts)
 
-All financial variables are sourced from `Commerciele_variabelen.xlsx` (5 data sheets):
+All financial variables are sourced from `Commerciele_variabelen.xlsx` (5 data sheets, 206 variables
+total). A focused subset of 83 essential variables has been extracted into **`financieel_input.xlsx`**
+(5 sheets: Tarieven, Chauffeurkosten, Buskosten, Duurzaamheid, Brandstofprijzen) — this is the
+primary input file for versions 7-9.
+
+Original source sheets in Commerciele_variabelen.xlsx:
 - **CAO_variabelen** — driver labor costs (80 variables)
 - **Contract_variabelen** — contract terms, sustainability incentives (18 variables)
 - **Malus_variabelen** — KPI penalties and bonuses (50 variables)
@@ -309,8 +314,39 @@ else:
 
 ## Implementation Steps
 
+### Step 0: Financial Input & Data Fetching (DONE ✓)
+Completed scripts for data preparation:
+
+| Script | Purpose | Status |
+|--------|---------|--------|
+| `create_financieel_input.py` | Generate `financieel_input.xlsx` with 83 essential variables across 5 sheets | ✓ Done |
+| `update_financieel_input.py` | Auto-fetch fuel/electricity prices from CBS, EnergyZero, Fieten Olie APIs | ✓ Done |
+| `fetch_tanklocaties.py` | Fetch nearby fuel stations (OSM) and EV chargers (Open Charge Map) per bus station | ✓ Done |
+
+**`financieel_input.xlsx`** (5 sheets):
+- **Tarieven**: 5 hourly rates per bus type (from Prijzenblad)
+- **Chauffeurkosten**: 66 CAO variables (pauzestaffel, ORT, overtime, etc.)
+- **Buskosten**: fuel consumption per bus type — manual input (yellow cells)
+- **Duurzaamheid**: ZE/HVO incentives, KPI targets, malus rules
+- **Brandstofprijzen**: auto-updated by `update_financieel_input.py` (green cells)
+
+**`update_financieel_input.py`** fetches:
+- CBS OData (table 80416ned): diesel B7 pump price (daily NL average)
+- EnergyZero API: electricity EPEX spot (hourly, incl. BTW)
+- Fieten Olie scraper: HVO100 + B7 advisory prices
+- Calculates HVO100 incentive per NS contract formula
+- CLI flags: `--diesel-only`, `--electricity-only`, `--hvo-only`, `--dry-run`
+
+**`fetch_tanklocaties.py`** fetches:
+- OpenStreetMap Overpass: fuel stations with fuel type tags (diesel, HVO100, LPG, etc.)
+- Open Charge Map: EV charging stations with power ratings, connector types, operator info
+- Geocodes bus stations via Nominatim (or accepts coordinates JSON)
+- Outputs `tanklocaties.json` mapping each bus station to nearby fuel/charging locations
+- CLI flags: `--fuel-only`, `--charging-only`, `--radius N`, `--ocm-key KEY`, `--dry-run`
+- Input options: `--input Bijlage_J.xlsx` (auto-discover), `--coords file.json`, or `--stations "Name1" "Name2"`
+
 ### Step 1: Financial Calculator Module (`financial_calculator.py`)
-New module that reads Commerciele_variabelen.xlsx and exposes:
+New module that reads financieel_input.xlsx and exposes:
 - `load_financial_config(xlsx_path) → dict`
 - `calculate_driver_cost(rotation, date, config) → CostBreakdown`
 - `calculate_revenue(rotation, bus_type, config) → float`
@@ -324,61 +360,20 @@ Key logic:
 - Overtime detection and surcharge calculation
 - Date-dependent rate selection (2025-01-01, 2025-07-01, 2026-01-01)
 
-### Step 2: Fuel Price Fetcher Module (`fuel_prices.py`)
-New module that fetches fuel prices and station data:
-- `fetch_diesel_b7_price() → float` — CBS OData API (daily NL average)
-- `fetch_electricity_price(date, hour) → float` — EnergyZero API (hourly EPEX spot)
-- `fetch_hvo100_incentive(month, year) → HVOIncentive` — scrape Fieten Olie + PK Energy + BP
-  - Gets HVO100 and B7 prices from all 3 contract-specified sources on 1st of month
-  - Calculates average price difference across sources
-  - Applies contract formula: incentive = min(diff, €0.35) + €0.05 if diff > 0, else €0
-- `fetch_fuel_stations(lat, lon, radius) → list` — OpenStreetMap Overpass
-- `fetch_charging_stations(lat, lon, radius) → list` — Open Charge Map
-- Cache results to avoid excessive API calls (fuel prices: 24h cache, stations: 7d cache)
-
-### Step 3: Bus Operating Cost Config
-New JSON config file (`bus_costs.json`) with:
-```json
-{
-  "fuel_prices": {
-    "diesel_b7_eur_per_liter": "auto",
-    "hvo100_eur_per_liter": 2.15,
-    "electricity_eur_per_kwh": "auto"
-  },
-  "consumption_per_100km": {
-    "Dubbeldekker": {"diesel": 45, "hvo100": 45, "electric_kwh": 180},
-    "Touringcar": {"diesel": 32, "hvo100": 32, "electric_kwh": 130},
-    "Lagevloerbus": {"diesel": 38, "hvo100": 38, "electric_kwh": 150},
-    "Midi bus": {"diesel": 25, "hvo100": 25, "electric_kwh": 100},
-    "Taxibus": {"diesel": 12, "hvo100": 12, "electric_kwh": 50}
-  },
-  "range_km": {
-    "Dubbeldekker_ZE": 250,
-    "Touringcar_ZE": 300,
-    "Lagevloerbus_ZE": 280,
-    "Midi bus_ZE": 350,
-    "Taxibus_ZE": 400
-  },
-  "base_hourly_wage_eur": 18.50,
-  "driver_overhead_factor": 1.35
-}
-```
-Values marked `"auto"` are fetched from APIs; others are manually configured.
-
-### Step 4: Extend busomloop_optimizer.py
-- New CLI flags: `--financieel`, `--bus-costs JSON`, `--brandstof-api`
-- Import `financial_calculator` and `fuel_prices` modules
-- Add version 6 output generation (financial overlay)
+### Step 2: Extend busomloop_optimizer.py
+- New CLI flags: `--financieel`, `--financieel-input XLSX`, `--tanklocaties JSON`
+- Import `financial_calculator` module
+- Add version 6 output generation (financial overlay on existing roster)
 - Add version 7 optimization with euro-based cost function
 - Add version 8 with sustainability fuel-type assignment
-- Add version 9 with fueling/charging logistics
+- Add version 9 with fueling/charging logistics (uses `tanklocaties.json`)
 
-### Step 5: Extend Output Excel
+### Step 3: Extend Output Excel
 New sheets per financial version:
 - **Financieel Overzicht**: revenue, costs, profit per bus, per day, per bus type
 - **CAO Kosten Detail**: paid hours, ORT, overtime, surcharges per shift
 - **Duurzaamheid KPI**: sustainability scores, malus/bonus projection
-- **Brandstof/Laden Plan**: fueling schedule, charging windows (version 9)
+- **Brandstof/Laden Plan**: fueling schedule, charging windows, nearest stations (version 9)
 
 ---
 
@@ -423,13 +418,13 @@ New sheets per financial version:
 | Gap | Action | Source | Status |
 |-----|--------|--------|--------|
 | Base hourly wage per driver | Get from CAO loonschalen or estimate | CAO Besluit Personenvervoer | Manual input needed |
-| Fuel consumption per bus type | Get from fleet operator or estimate | Fleet data / manufacturer specs | Manual input needed |
-| Current diesel B7 price | **Automated**: CBS OData API | https://opendata.cbs.nl (table 80416ned) | Ready to implement |
-| Current electricity price | **Automated**: EnergyZero API | https://api.energyzero.nl | Ready to implement |
-| HVO100/B7 price diff (incentive) | **Semi-automated**: scrape contract sources | Fieten Olie, PK Energy, BP Nederland (1st of month) | Sources identified |
-| HVO100 price (absolute) | Scrape Fieten Olie adviesprijzen | https://www.fieten.info/adviesprijzen/ | Source found, needs scraper |
+| Fuel consumption per bus type | Fill in Buskosten sheet in financieel_input.xlsx | Fleet data / manufacturer specs | **Template ready** (defaults filled) |
+| Current diesel B7 price | **Automated**: `update_financieel_input.py` | CBS OData (table 80416ned) | ✓ **Implemented** |
+| Current electricity price | **Automated**: `update_financieel_input.py` | EnergyZero API | ✓ **Implemented** |
+| HVO100/B7 price diff (incentive) | **Semi-automated**: `update_financieel_input.py` | Fieten Olie scraper + contract formula | ✓ **Implemented** (Fieten only; PK Energy + BP manual) |
+| HVO100 price (absolute) | **Automated**: scrape Fieten Olie | https://www.fieten.info/adviesprijzen/ | ✓ **Implemented** |
 | Bus fleet composition (ZE/HVO/diesel) | Get from operator | Fleet inventory | Manual input needed |
-| Fuel station locations | **Automated**: OpenStreetMap Overpass | https://overpass-api.de | Ready to implement |
-| Charging station locations | **Automated**: Open Charge Map | https://openchargemap.org | Ready to implement |
+| Fuel station locations | **Automated**: `fetch_tanklocaties.py` | OpenStreetMap Overpass | ✓ **Implemented** |
+| Charging station locations | **Automated**: `fetch_tanklocaties.py` | Open Charge Map | ✓ **Implemented** |
 | Coordinator/traffic controller rates | Fill in Prijzenblad (currently €0) | Contract negotiation | Manual input needed |
-| Bus range and tank/battery capacity | Get from fleet specs | Manufacturer data | Manual input needed |
+| Bus range and tank/battery capacity | Fill in Buskosten sheet in financieel_input.xlsx | Manufacturer data | **Template ready** (defaults filled) |
