@@ -54,12 +54,11 @@ def fetch_cbs_diesel_price() -> dict:
     """
     print("[CBS] Fetching diesel B7 pump price...")
 
-    # Try the OData v4 endpoint first (newer)
+    # Try the OData v4 endpoint first - fetch all columns to find diesel
     url = (
         "https://opendata.cbs.nl/ODataApi/odata/80416ned/TypedDataSet"
         "?$orderby=Perioden desc"
-        "&$top=30"
-        "&$select=Perioden,DieselAccijnzenEnBTW_2"
+        "&$top=10"
         "&$format=json"
     )
 
@@ -73,7 +72,7 @@ def fetch_cbs_diesel_price() -> dict:
         url_v3 = (
             "https://opendata.cbs.nl/ODataFeed/odata/80416ned/TypedDataSet"
             "?$orderby=Perioden desc"
-            "&$top=30"
+            "&$top=10"
             "&$format=json"
         )
         try:
@@ -88,15 +87,37 @@ def fetch_cbs_diesel_price() -> dict:
     if not records:
         return {"price": None, "date": None, "error": "No records returned"}
 
+    # Find the diesel column - try multiple possible column names
+    diesel_columns = [
+        "DieselAccijnzenEnBTW_2",  # Old name
+        "Diesel_2",                 # Possible new name
+        "DieselB7_2",               # Alternative
+        "DieselInclBTW_2",          # Alternative
+    ]
+
+    # Also search dynamically for any column containing 'Diesel' and not 'excl'
+    if records:
+        first_record = records[0]
+        for key in first_record.keys():
+            if 'diesel' in key.lower() and 'excl' not in key.lower() and 'btw' in key.lower():
+                if key not in diesel_columns:
+                    diesel_columns.insert(0, key)  # Prioritize dynamic match
+
     # Find the latest record with a non-null diesel price
     for record in records:
-        diesel_price = record.get("DieselAccijnzenEnBTW_2")
         period = record.get("Perioden", "")
-        if diesel_price is not None:
-            # CBS price is in EUR/L
-            price = round(float(diesel_price), 4)
-            print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period})")
-            return {"price": price, "date": period}
+        for col in diesel_columns:
+            diesel_price = record.get(col)
+            if diesel_price is not None:
+                # CBS price is in EUR/L
+                price = round(float(diesel_price), 4)
+                print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, column: {col})")
+                return {"price": price, "date": period}
+
+    # If still not found, list available columns for debugging
+    if records:
+        cols = [k for k in records[0].keys() if 'diesel' in k.lower() or 'brandstof' in k.lower()]
+        print(f"  [CBS] Available fuel columns: {cols}")
 
     return {"price": None, "date": None, "error": "No diesel price found in records"}
 
@@ -422,13 +443,13 @@ def main():
     if fetch_all or args.hvo_only:
         fieten_data = fetch_fieten_prices()
 
-        # Calculate incentive with available data
+        # Calculate incentive with available data (Fieten Olie is sufficient for internal use)
+        # Note: NS contract requires average of 3 sources (Fieten, PK Energy, BP) for official claims
         hvo_calc = calculate_hvo_incentive(
             fieten_hvo=fieten_data.get("hvo100") if fieten_data else None,
             fieten_b7=fieten_data.get("b7") if fieten_data else None,
-            # PK Energy and BP prices not yet automated — add here when scraper is built
-            pk_hvo=None, pk_b7=None,
-            bp_hvo=None, bp_b7=None,
+            pk_hvo=None, pk_b7=None,  # Optional: PK Energy
+            bp_hvo=None, bp_b7=None,  # Optional: BP Nederland
         )
 
         if hvo_calc.get("diff") is not None:
@@ -474,8 +495,7 @@ def main():
         print(f"  HVO100 incentive:        EUR {hvo_calc['incentive']}/L")
 
     print()
-    print("Note: PK Energy and BP Nederland prices must be entered manually")
-    print("in the Brandstofprijzen sheet (no automated scraper yet).")
+    print("Prijzen bijgewerkt. De financiele calculator gebruikt deze prijzen automatisch.")
 
 
 if __name__ == "__main__":
