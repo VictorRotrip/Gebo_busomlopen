@@ -99,6 +99,17 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Shows deadhead rows in the bus rotation schedule
 - **Benefit:** Maximum flexibility, potentially fewer buses at cost of fuel/driver time
 
+### Version 6: Fuel/Charging Constraints (NEW)
+**File:** `*_6_brandstof_constraints.xlsx`
+
+- Integrates **fuel and charging constraints** into optimization
+- Tracks cumulative km per bus, validates against fuel range
+- Automatically splits chains when fuel range is exceeded without refuel opportunity
+- Requires `--fuel-constraints` flag and `--tanklocaties` JSON file
+- ZE (Zero Emission) analysis: assigns at least 5 ZE Touringcars (NS K3 requirement)
+- Calculates actual driving times to fuel/charging stations via Google Maps
+- **Benefit:** Realistic fuel logistics planning, ZE feasibility assessment
+
 ## Algorithms
 
 Two optimization algorithms are available (`--algoritme greedy|mincost|all`):
@@ -198,28 +209,39 @@ Each output file contains these sheets:
 
 ### Google Maps Distance Fetcher
 
-Fetches station-to-station travel times for the deadhead matrix:
+Fetches station-to-station travel times and distances for the deadhead matrix:
 
 ```bash
-# Verify addresses first
-python google_maps_distances.py --input Bijlage_J.xlsx --key YOUR_API_KEY --verify
+# Basic deadhead matrix (uses GOOGLE_MAPS_API_KEY from .env)
+python google_maps_distances.py --input Bijlage_J.xlsx
 
-# Fetch full distance matrix
-python google_maps_distances.py --input Bijlage_J.xlsx --key YOUR_API_KEY
+# With traffic-aware time slots (5 weekday + weekend + baseline)
+python google_maps_distances.py --input Bijlage_J.xlsx --traffic
 
-# Output: deadhead_matrix.json, afstanden_stations.xlsx
+# Output: deadhead_matrix.json (basic) or traffic_matrix.json (traffic-aware)
+# Both include distance_km for accurate fuel calculations
 ```
 
-### Financial Input Generator (Versions 7-9 preparation)
+The traffic matrix includes:
+- Time-slot durations (ochtendspits, dal, middagspits, avond, nacht, weekend)
+- Distance in km for each route (used to calculate actual average speed)
+- Baseline (no-traffic) times
 
-Creates a focused Excel with essential financial variables:
+### Financial Input Configuration
+
+All financial and operational variables are stored in `additional_inputs.xlsx` (5 sheets):
+
+| Sheet | Contents |
+|-------|----------|
+| **Tarieven** | Hourly rates per bus type (from Prijzenblad) |
+| **Chauffeurkosten** | CAO variables (pauzestaffel, ORT, overtime) |
+| **Buskosten** | Fuel consumption, tank capacity, ZE range, bus speed factors |
+| **Duurzaamheid** | ZE/HVO incentives, KPI targets, malus rules |
+| **Brandstofprijzen** | Current fuel/electricity prices (auto-update available) |
 
 ```bash
-# Generate financieel_input.xlsx
-python create_financieel_input.py
-
 # Auto-update fuel/electricity prices from APIs
-python update_financieel_input.py
+python fetch_fuel_charging_prices.py
 ```
 
 ### Fuel/Charging Station Fetcher
@@ -230,28 +252,38 @@ Fetches nearby fuel stations and EV chargers for each bus station:
 # Auto-discover stations from input Excel
 python fetch_tanklocaties.py --input Bijlage_J.xlsx
 
+# With Google Maps driving distances (recommended)
+python fetch_tanklocaties.py --input Bijlage_J.xlsx --gmaps
+
 # With specific radius
-python fetch_tanklocaties.py --input Bijlage_J.xlsx --radius 10
+python fetch_tanklocaties.py --input Bijlage_J.xlsx --radius 10 --gmaps
 
 # Output: tanklocaties.json
 ```
 
-## Future Versions (6-9)
+When using `--gmaps`, each fuel/charging station includes:
+- `drive_time_min`: actual driving time from bus station
+- `drive_distance_km`: actual driving distance
+- These are used for accurate refuel/charge feasibility calculations
 
-See `PLAN_FINANCIAL_OPTIMIZATION.md` for planned financial optimization:
+## Future Versions (7-9)
 
-| Version | Description |
-|---------|-------------|
-| 6 | Financial overlay on existing roster (revenue, costs, profit calculation) |
-| 7 | Euro-based cost optimization (driver costs, fuel costs, ORT surcharges) |
-| 8 | Sustainability optimization (ZE/HVO100 fuel type assignment) |
-| 9 | Full fuel logistics (fueling/charging schedule, station routing) |
+Version 6 (fuel/charging constraints) is implemented. See `PLAN_FINANCIAL_OPTIMIZATION.md` for planned financial optimization:
+
+| Version | Status | Description |
+|---------|--------|-------------|
+| 6 | ✅ DONE | Fuel/charging constraints, ZE feasibility, Google Maps integration |
+| 7 | Planned | Financial analysis overlay (revenue, costs, profit calculation) |
+| 8 | Planned | Euro-based cost optimization (driver costs, fuel costs, ORT surcharges) |
+| 9 | Planned | Full profit optimization (may use different bus count for profit) |
 
 ## Command Line Reference
 
 ```
 usage: busomloop_optimizer.py [-h] [--output OUTPUT] [--algoritme {greedy,mincost,all}]
-                               [--deadhead DEADHEAD] [--snel]
+                               [--deadhead DEADHEAD] [--traffic-matrix TRAFFIC]
+                               [--tanklocaties JSON] [--inputs XLSX]
+                               [--ze] [--fuel-constraints] [--snel]
                                [--keer-dd MIN] [--keer-tc MIN] [--keer-lvb MIN]
                                [--keer-midi MIN] [--keer-taxi MIN]
                                invoer.xlsx
@@ -264,6 +296,11 @@ Options:
   --algoritme {greedy,mincost,all}
                            Optimization algorithm (default: greedy)
   --deadhead DEADHEAD      JSON file with deadhead travel times
+  --traffic-matrix TRAFFIC JSON file with traffic-aware travel times (includes distances)
+  --tanklocaties JSON      JSON file with fuel/charging station locations
+  --inputs XLSX            additional_inputs.xlsx with financial/operational config
+  --ze                     Enable ZE (Zero Emission) feasibility analysis
+  --fuel-constraints       Enable diesel fuel range validation
   --snel                   Fast mode: skip non-greedy for versions 1-4
   --keer-dd MIN            Turnaround time Dubbeldekker (default: 8)
   --keer-tc MIN            Turnaround time Touringcar (default: 6)
@@ -275,21 +312,54 @@ Options:
 ## Example Workflow
 
 ```bash
-# 1. Generate deadhead matrix (optional, enables version 5)
-python google_maps_distances.py --input Bijlage_J.xlsx --key $GOOGLE_MAPS_API_KEY
+# 1. Fetch station-to-station distances with traffic data (GOOGLE_MAPS_API_KEY in .env)
+python google_maps_distances.py --input Bijlage_J.xlsx --traffic
 
-# 2. Run optimizer with all versions
-python busomloop_optimizer.py Bijlage_J.xlsx --deadhead deadhead_matrix.json --output project_x
+# 2. Fetch fuel/charging stations with driving times
+python fetch_tanklocaties.py --input Bijlage_J.xlsx --gmaps
 
-# 3. Compare results
-# - project_x_greedy_1_per_dienst.xlsx      → baseline
+# 3. Run optimizer with all features (versions 1-6)
+python busomloop_optimizer.py Bijlage_J.xlsx \
+    --deadhead deadhead_matrix.json \
+    --traffic-matrix traffic_matrix.json \
+    --tanklocaties tanklocaties.json \
+    --fuel-constraints \
+    --ze \
+    --output project_x
+
+# 4. Compare results
+# - project_x_greedy_1_per_dienst.xlsx      → baseline per service
 # - project_x_greedy_3_gecombineerd.xlsx    → cross-service optimization
-# - project_x_greedy_5_deadhead.xlsx        → maximum optimization with repositioning
+# - project_x_greedy_5_deadhead.xlsx        → with deadhead repositioning
+# - project_x_greedy_*_ze.xlsx              → with ZE feasibility analysis
+# - project_x_greedy_*_fuel.xlsx            → with fuel constraint validation
+```
 
-# 4. (Future) Prepare financial data for versions 7-9
-python create_financieel_input.py
-python update_financieel_input.py
-python fetch_tanklocaties.py --input Bijlage_J.xlsx
+### Data Flow (Version 6)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Google Maps API                                   │
+└─────────────────────────┬───────────────────────┬───────────────────────────┘
+                          │                       │
+                          ▼                       ▼
+              ┌───────────────────────┐   ┌───────────────────────┐
+              │ traffic_matrix.json   │   │ tanklocaties.json     │
+              │ - time slots (min)    │   │ - fuel stations       │
+              │ - distances_km        │   │ - charging stations   │
+              │ - baseline times      │   │ - drive_time_min      │
+              └───────────┬───────────┘   │ - drive_distance_km   │
+                          │               └───────────┬───────────┘
+                          │                           │
+                          ▼                           ▼
+              ┌───────────────────────────────────────────────────┐
+              │           busomloop_optimizer.py                  │
+              │  - Calculate avg_speed from Google Maps data      │
+              │  - Apply bus speed factors (from Excel)           │
+              │  - Validate fuel range using actual distances     │
+              │  - Check refuel feasibility with drive times      │
+              │  - Assign ZE buses with charging strategy         │
+              └───────────────────────────────────────────────────┘
 ```
 
 ## License

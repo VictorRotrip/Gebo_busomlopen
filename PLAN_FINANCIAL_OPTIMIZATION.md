@@ -419,9 +419,11 @@ Completed scripts for data preparation:
 **`fetch_tanklocaties.py`** fetches:
 - OpenStreetMap Overpass: fuel stations with fuel type tags (diesel, HVO100, LPG, etc.)
 - Open Charge Map: EV charging stations with power ratings, connector types, operator info
+- Google Maps Distance Matrix (optional): actual driving distances and times to each station
 - Geocodes bus stations via Nominatim (or accepts coordinates JSON)
 - Outputs `tanklocaties.json` mapping each bus station to nearby fuel/charging locations
-- CLI flags: `--fuel-only`, `--charging-only`, `--radius N`, `--ocm-key KEY`, `--dry-run`
+- CLI flags: `--fuel-only`, `--charging-only`, `--radius N`, `--ocm-key KEY`, `--gmaps`, `--dry-run`
+- When `--gmaps` is used, each station includes `drive_time_min` and `drive_distance_km`
 - Input options: `--input Bijlage_J.xlsx` (auto-discover), `--coords file.json`, or `--stations "Name1" "Name2"`
 
 ### Step 1: Version 6 - Fuel/Charging Constraints (DONE ✓)
@@ -444,7 +446,9 @@ Completed scripts for data preparation:
 - [x] Use Google Maps distance_km for deadhead when available
 - [x] Traffic matrix (`--traffic`) now includes distances_km for all routes
 - [x] Calculate actual avg_speed from Google Maps data (distance/duration)
-- [x] Apply bus-type speed factors (0.85-0.95x) to Google Maps car speeds
+- [x] Apply bus-type speed factors (configurable in additional_inputs.xlsx)
+- [x] Fetch Google Maps driving times to fuel/charging stations (`--gmaps` flag)
+- [x] Use actual drive_time_min for refuel/charge feasibility calculations
 - [ ] Add fuel stop planning to Excel output (future work)
 
 ### Step 2: Financial Calculator Module (`financial_calculator.py`)
@@ -549,6 +553,9 @@ New sheets per financial version:
    - Fuel constraint integration into optimization ✓
    - Google Maps distance data for accurate km estimation ✓
    - Automatic avg_speed calculation from Google Maps data ✓
+   - Bus speed factors configurable in additional_inputs.xlsx ✓
+   - Google Maps driving times for fuel/charging stations (`--gmaps`) ✓
+   - Actual drive_time_min used for refuel/charge feasibility ✓
 
 3. **Step 2:** Test Version 6 on real tender casus data
 4. **Step 3:** Create `financial_calculator.py` for versions 7-9
@@ -587,7 +594,9 @@ The cleanest approach is a **post-optimization validation pass**:
 
 **Data needed from `tanklocaties.json`:**
 - Nearest fuel stations per bus station
-- Distance to each station (for drive time calculation)
+- `drive_time_min`: actual driving time from Google Maps (when `--gmaps` used)
+- `drive_distance_km`: actual driving distance from Google Maps
+- Falls back to `distance_km` (straight-line) if Google Maps data not available
 
 ---
 
