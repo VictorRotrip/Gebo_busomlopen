@@ -10,6 +10,7 @@ Data sources:
   - OpenStreetMap Overpass API: fuel stations (diesel, HVO100, LPG, etc.) — free, no auth
   - Open Charge Map API: EV charging stations with power/connector info — free, optional API key
   - Nominatim (OSM): geocoding bus station names to lat/lon — free, no auth
+  - Google Maps Distance Matrix API: actual driving distances/times (optional, requires API key)
 
 Usage:
   # Auto-discover stations from input Excel + fetch nearby fuel/charging:
@@ -27,8 +28,12 @@ Usage:
   # With Open Charge Map API key (optional, for higher rate limit):
   python fetch_tanklocaties.py --input Bijlage_J.xlsx --ocm-key YOUR_KEY
 
+  # With Google Maps driving distances (uses GOOGLE_MAPS_API_KEY from .env):
+  python fetch_tanklocaties.py --input Bijlage_J.xlsx --gmaps
+
 Output:
   tanklocaties.json — structured JSON with nearby fuel and charging stations per bus station
+  When --gmaps is used, each station includes drive_distance_km and drive_time_min fields
 
 Requirements:
   pip install requests openpyxl
@@ -66,6 +71,27 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 # Netherlands bounding box for validation
 NL_BOUNDS = {"lat_min": 50.5, "lat_max": 53.7, "lon_min": 3.3, "lon_max": 7.3}
+
+# Google Maps Distance Matrix API
+GMAPS_DISTANCE_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
+
+
+def load_dotenv():
+    """Load .env file from the script's directory into os.environ."""
+    import os
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                os.environ.setdefault(key, value)
 
 # User-Agent for Nominatim (required by their usage policy)
 USER_AGENT = "BusOmloopOptimizer/1.0 (fuel-station-fetcher; contact: busomloop@gebo.nl)"
@@ -379,11 +405,81 @@ def fetch_charging_stations_ocm(lat: float, lon: float, radius_km: float = 5,
 
 
 # ---------------------------------------------------------------------------
+# Google Maps driving distances
+# ---------------------------------------------------------------------------
+
+def fetch_gmaps_distances(origin_lat: float, origin_lon: float,
+                          stations: list, gmaps_key: str,
+                          max_destinations: int = 25) -> list:
+    """Fetch actual driving distances from origin to fuel/charging stations.
+
+    Uses Google Maps Distance Matrix API to get accurate driving distance and
+    duration, replacing the straight-line distance estimates.
+
+    Args:
+        origin_lat, origin_lon: Bus station coordinates
+        stations: List of fuel/charging station dicts with lat/lon
+        gmaps_key: Google Maps API key
+        max_destinations: Max destinations per API call (API limit is 25)
+
+    Returns:
+        Updated list of stations with drive_distance_km and drive_time_min added
+    """
+    if not stations or not gmaps_key:
+        return stations
+
+    # Process in batches (API limit is 25 destinations per request)
+    origin = f"{origin_lat},{origin_lon}"
+
+    for i in range(0, len(stations), max_destinations):
+        batch = stations[i:i + max_destinations]
+        destinations = "|".join(f"{s['lat']},{s['lon']}" for s in batch)
+
+        try:
+            resp = requests.get(
+                GMAPS_DISTANCE_URL,
+                params={
+                    "origins": origin,
+                    "destinations": destinations,
+                    "key": gmaps_key,
+                    "mode": "driving",
+                    "language": "nl",
+                },
+                timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data["status"] != "OK":
+                print(f"      Google Maps API fout: {data['status']}")
+                continue
+
+            # Parse results
+            for j, element in enumerate(data["rows"][0]["elements"]):
+                if element["status"] == "OK":
+                    batch[j]["drive_distance_km"] = round(
+                        element["distance"]["value"] / 1000, 2
+                    )
+                    batch[j]["drive_time_min"] = round(
+                        element["duration"]["value"] / 60, 1
+                    )
+
+            time.sleep(0.2)  # Rate limit
+
+        except requests.RequestException as e:
+            print(f"      Google Maps verzoek mislukt: {e}")
+            continue
+
+    return stations
+
+
+# ---------------------------------------------------------------------------
 # Bulk fetch: all stations for all bus stops
 # ---------------------------------------------------------------------------
 
 def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
                      ocm_key: str = None,
+                     gmaps_key: str = None,
                      fuel_only: bool = False,
                      charging_only: bool = False) -> dict:
     """Fetch fuel + charging stations near all bus stations.
@@ -392,6 +488,7 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
         station_coords: {station_name: {"lat": .., "lon": ..}}
         radius_km: search radius in km
         ocm_key: optional Open Charge Map API key
+        gmaps_key: optional Google Maps API key for driving distances
         fuel_only: only fetch fuel stations
         charging_only: only fetch charging stations
 
@@ -421,6 +518,13 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
             print(f"    {len(fuel)} tankstations gevonden ({n_hvo} met HVO100)")
             time.sleep(1)  # Rate limit for Overpass
 
+            # Fetch Google Maps driving distances if API key provided
+            if gmaps_key and fuel:
+                print(f"    Rijtijden ophalen via Google Maps...")
+                entry["fuel_stations"] = fetch_gmaps_distances(lat, lon, fuel, gmaps_key)
+                n_with_drive = sum(1 for s in entry["fuel_stations"] if s.get("drive_time_min"))
+                print(f"      {n_with_drive}/{len(fuel)} met rijtijd")
+
         # Fetch charging stations from Open Charge Map
         if not fuel_only:
             print(f"  Laadstations ophalen (Open Charge Map, radius {radius_km} km)...")
@@ -429,6 +533,13 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
             n_fast = sum(1 for s in charging if s.get("max_power_kw", 0) >= 50)
             print(f"    {len(charging)} laadstations gevonden ({n_fast} snelladers ≥50 kW)")
             time.sleep(0.5)
+
+            # Fetch Google Maps driving distances if API key provided
+            if gmaps_key and charging:
+                print(f"    Rijtijden ophalen via Google Maps...")
+                entry["charging_stations"] = fetch_gmaps_distances(lat, lon, charging, gmaps_key)
+                n_with_drive = sum(1 for s in entry["charging_stations"] if s.get("drive_time_min"))
+                print(f"      {n_with_drive}/{len(charging)} met rijtijd")
 
         results[name] = entry
 
@@ -543,6 +654,9 @@ def main():
                         help=f"Search radius in km (default: {DEFAULT_RADIUS_KM})")
     parser.add_argument("--ocm-key", default=None,
                         help="Open Charge Map API key (optional, for higher rate limit)")
+    parser.add_argument("--gmaps", action="store_true",
+                        help="Fetch actual driving distances via Google Maps API "
+                             "(uses GOOGLE_MAPS_API_KEY from .env)")
     parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT,
                         help=f"Output JSON file (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--fuel-only", action="store_true",
@@ -554,10 +668,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Load Google Maps API key from .env if --gmaps is enabled
+    import os
+    gmaps_key = None
+    if args.gmaps:
+        load_dotenv()
+        gmaps_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if not gmaps_key:
+            print("WAARSCHUWING: --gmaps opgegeven maar GOOGLE_MAPS_API_KEY niet gevonden in .env")
+            print("  Rijtijden worden niet opgehaald.")
+
     print("=" * 70)
     print("Tanklocaties & Laadstations Fetcher")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Zoekradius: {args.radius} km")
+    if gmaps_key:
+        print("Google Maps: rijtijden worden opgehaald")
     print("=" * 70)
 
     # Step 1: Get station coordinates
@@ -605,6 +731,7 @@ def main():
         station_coords,
         radius_km=args.radius,
         ocm_key=args.ocm_key,
+        gmaps_key=gmaps_key,
         fuel_only=args.fuel_only,
         charging_only=args.charging_only,
     )
@@ -618,6 +745,8 @@ def main():
         sources.append("OpenStreetMap Overpass")
     if not args.fuel_only:
         sources.append("Open Charge Map")
+    if gmaps_key:
+        sources.append("Google Maps Distance Matrix")
 
     output = {
         "metadata": {
@@ -625,6 +754,7 @@ def main():
             "radius_km": args.radius,
             "num_bus_stations": len(results),
             "sources": sources,
+            "has_drive_times": gmaps_key is not None,
         },
         "stations": results,
     }
