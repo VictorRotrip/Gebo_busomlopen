@@ -58,7 +58,7 @@ def fetch_cbs_diesel_price() -> dict:
     url = (
         "https://opendata.cbs.nl/ODataApi/odata/80416ned/TypedDataSet"
         "?$orderby=Perioden desc"
-        "&$top=10"
+        "&$top=50"
         "&$format=json"
     )
 
@@ -72,7 +72,7 @@ def fetch_cbs_diesel_price() -> dict:
         url_v3 = (
             "https://opendata.cbs.nl/ODataFeed/odata/80416ned/TypedDataSet"
             "?$orderby=Perioden desc"
-            "&$top=10"
+            "&$top=50"
             "&$format=json"
         )
         try:
@@ -87,39 +87,60 @@ def fetch_cbs_diesel_price() -> dict:
     if not records:
         return {"price": None, "date": None, "error": "No records returned"}
 
-    # Find the diesel column - try multiple possible column names
+    # Debug: show available columns and a sample period
+    if records:
+        first_record = records[0]
+        all_cols = list(first_record.keys())
+        diesel_cols = [k for k in all_cols if 'diesel' in k.lower()]
+        print(f"  [CBS] Available diesel columns: {diesel_cols}")
+        print(f"  [CBS] Sample periods: {[r.get('Perioden', '?') for r in records[:5]]}")
+
+    # Find the diesel column - prioritize columns with "BTW" (incl. tax)
     diesel_columns = [
-        "DieselAccijnzenEnBTW_2",  # Old name
-        "Diesel_2",                 # Possible new name
-        "DieselB7_2",               # Alternative
-        "DieselInclBTW_2",          # Alternative
+        "DieselInclBTW_2",          # Preferred: includes tax
+        "DieselAccijnzenEnBTW_2",   # Old name with tax
+        "Diesel_2",                  # Generic
+        "DieselB7_2",                # Specific B7
     ]
 
-    # Also search dynamically for any column containing 'Diesel' and not 'excl'
+    # Also search dynamically for any column containing 'Diesel' and 'BTW' (incl tax)
     if records:
         first_record = records[0]
         for key in first_record.keys():
-            if 'diesel' in key.lower() and 'excl' not in key.lower() and 'btw' in key.lower():
+            key_lower = key.lower()
+            if 'diesel' in key_lower and 'btw' in key_lower and 'excl' not in key_lower:
                 if key not in diesel_columns:
-                    diesel_columns.insert(0, key)  # Prioritize dynamic match
+                    diesel_columns.insert(0, key)  # Prioritize dynamic match with BTW
 
-    # Find the latest record with a non-null diesel price
+    # Current year for validation
+    from datetime import datetime
+    current_year = datetime.now().year
+    min_year = current_year - 2  # Accept data from last 2 years
+
+    # Find the latest record with a non-null diesel price AND recent date
     for record in records:
         period = record.get("Perioden", "")
+
+        # Parse period (format: "YYYYMMDD" or "YYYY" or "YYYYMM")
+        try:
+            period_year = int(str(period)[:4])
+        except (ValueError, IndexError):
+            continue
+
+        # Skip old data (before min_year)
+        if period_year < min_year:
+            continue
+
         for col in diesel_columns:
             diesel_price = record.get(col)
-            if diesel_price is not None:
+            if diesel_price is not None and float(diesel_price) > 0.5:  # Sanity check: price > €0.50
                 # CBS price is in EUR/L
                 price = round(float(diesel_price), 4)
                 print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, column: {col})")
                 return {"price": price, "date": period}
 
-    # If still not found, list available columns for debugging
-    if records:
-        cols = [k for k in records[0].keys() if 'diesel' in k.lower() or 'brandstof' in k.lower()]
-        print(f"  [CBS] Available fuel columns: {cols}")
-
-    return {"price": None, "date": None, "error": "No diesel price found in records"}
+    print(f"  [CBS] No recent diesel price found (looking for {min_year}+)")
+    return {"price": None, "date": None, "error": f"No diesel price found for {min_year}+"}
 
 
 # ---------------------------------------------------------------------------
