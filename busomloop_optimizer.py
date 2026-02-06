@@ -143,6 +143,8 @@ class ChargingStation:
     num_points: int
     connectors: list
     category: str  # ultra_fast, fast, semi_fast, slow
+    drive_time_min: float = None  # Actual driving time from Google Maps (if available)
+    drive_distance_km: float = None  # Actual driving distance from Google Maps (if available)
 
 
 @dataclass
@@ -882,7 +884,8 @@ def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
 def load_fuel_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
     """Load fuel station data from tanklocaties.json.
 
-    Returns: {station_name: [{"name": str, "distance_km": float, "fuel_types": list}, ...]}
+    Returns: {station_name: [{"name": str, "distance_km": float, "fuel_types": list,
+                              "drive_time_min": float, "drive_distance_km": float}, ...]}
     """
     import json
     path = Path(tanklocaties_json)
@@ -895,6 +898,7 @@ def load_fuel_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
             data = json.load(f)
 
         stations_by_location = {}
+        has_drive_times = data.get("metadata", {}).get("has_drive_times", False)
 
         for station_name, station_data in data.get("stations", {}).items():
             fuel_stations = []
@@ -903,6 +907,8 @@ def load_fuel_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
                     "name": fs.get("name", "Unknown"),
                     "distance_km": fs.get("distance_km", 0),
                     "fuel_types": fs.get("fuel_types", ["diesel"]),
+                    "drive_time_min": fs.get("drive_time_min"),
+                    "drive_distance_km": fs.get("drive_distance_km"),
                 })
 
             # Sort by distance (prefer closest)
@@ -910,7 +916,8 @@ def load_fuel_stations(tanklocaties_json: str = "tanklocaties.json") -> dict:
             stations_by_location[station_name] = fuel_stations
 
         total_stations = sum(len(v) for v in stations_by_location.values())
-        print(f"  Tankstations geladen: {len(stations_by_location)} locaties, {total_stations} tankpunten")
+        drive_info = " (met rijtijden)" if has_drive_times else ""
+        print(f"  Tankstations geladen: {len(stations_by_location)} locaties, {total_stations} tankpunten{drive_info}")
         return stations_by_location
     except Exception as e:
         print(f"  Tankstations laden mislukt: {e}")
@@ -947,6 +954,8 @@ def load_charging_stations(tanklocaties_json: str = "tanklocaties.json") -> dict
                     num_points=cs.get("num_points", 1),
                     connectors=cs.get("connectors", []),
                     category=cs.get("category", "slow"),
+                    drive_time_min=cs.get("drive_time_min"),
+                    drive_distance_km=cs.get("drive_distance_km"),
                 ))
 
             # Sort by power (prefer fast chargers) then by distance
@@ -1181,10 +1190,16 @@ def analyze_ze_feasibility(rotation: BusRotation, ze_config: dict,
             best_charger = chargers[0]  # Already sorted by power
 
             # Account for driving time to/from charger
-            # Assume 30 km/h average speed in urban area
-            drive_time_one_way = (best_charger.distance_km / 30) * 60  # minutes
+            # Use Google Maps drive time if available, else estimate from distance
+            if best_charger.drive_time_min:
+                drive_time_one_way = best_charger.drive_time_min
+                extra_km_one_way = best_charger.drive_distance_km or best_charger.distance_km
+            else:
+                # Assume 30 km/h average speed in urban area
+                drive_time_one_way = (best_charger.distance_km / 30) * 60  # minutes
+                extra_km_one_way = best_charger.distance_km
             drive_time_total = 2 * drive_time_one_way  # round trip
-            extra_km = 2 * best_charger.distance_km  # round trip adds to total km
+            extra_km = 2 * extra_km_one_way  # round trip adds to total km
 
             # Actual time available for charging
             actual_charge_time = duration_min - drive_time_total
@@ -1411,7 +1426,11 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
             can_refuel = False
             if stations:
                 nearest = stations[0]
-                drive_time_one_way = (nearest["distance_km"] / speed_to_station) * 60
+                # Use Google Maps drive time if available, else estimate from distance
+                if nearest.get("drive_time_min"):
+                    drive_time_one_way = nearest["drive_time_min"]
+                else:
+                    drive_time_one_way = (nearest["distance_km"] / speed_to_station) * 60
                 drive_time_total = 2 * drive_time_one_way  # round trip
                 total_time_needed = refuel_time + drive_time_total
 
@@ -1420,7 +1439,7 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
                     fuel_stops.append(FuelStop(
                         station_name=station_loc,
                         fuel_station_name=nearest["name"],
-                        fuel_station_distance_km=nearest["distance_km"],
+                        fuel_station_distance_km=nearest.get("drive_distance_km") or nearest["distance_km"],
                         idle_start_min=prev_trip.arrival,
                         idle_end_min=trip.departure,
                         idle_duration_min=idle_gap,
