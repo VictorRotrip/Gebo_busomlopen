@@ -54,11 +54,16 @@ def fetch_cbs_diesel_price() -> dict:
     """
     print("[CBS] Fetching diesel B7 pump price...")
 
-    # Try the OData v4 endpoint first - fetch all columns to find diesel
+    current_year = datetime.now().year
+    min_year = current_year - 1  # Accept data from last year too
+
+    # CBS OData table 80416ned has daily fuel prices
+    # We fetch the latest records (sorted by period descending)
+    # Note: $filter may not work reliably, so we also filter in Python
     url = (
         "https://opendata.cbs.nl/ODataApi/odata/80416ned/TypedDataSet"
         "?$orderby=Perioden desc"
-        "&$top=50"
+        "&$top=100"
         "&$format=json"
     )
 
@@ -72,7 +77,7 @@ def fetch_cbs_diesel_price() -> dict:
         url_v3 = (
             "https://opendata.cbs.nl/ODataFeed/odata/80416ned/TypedDataSet"
             "?$orderby=Perioden desc"
-            "&$top=50"
+            "&$top=100"
             "&$format=json"
         )
         try:
@@ -111,11 +116,6 @@ def fetch_cbs_diesel_price() -> dict:
             if 'diesel' in key_lower and 'btw' in key_lower and 'excl' not in key_lower:
                 if key not in diesel_columns:
                     diesel_columns.insert(0, key)  # Prioritize dynamic match with BTW
-
-    # Current year for validation
-    from datetime import datetime
-    current_year = datetime.now().year
-    min_year = current_year - 2  # Accept data from last 2 years
 
     # Find the latest record with a non-null diesel price AND recent date
     for record in records:
