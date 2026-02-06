@@ -27,6 +27,16 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
+# Financial calculator for version 7+
+try:
+    from financial_calculator import (
+        load_financial_config, calculate_total_financials,
+        calculate_rotation_financials, FinancialConfig
+    )
+    FINANCIAL_CALCULATOR_AVAILABLE = True
+except ImportError:
+    FINANCIAL_CALCULATOR_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -3515,6 +3525,19 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
     ws.cell(row=row, column=1).font = Font(bold=True, size=14)
     row += 2
 
+    # Explanation
+    ws.cell(row=row, column=1, value="Toelichting kolommen:")
+    ws.cell(row=row, column=1).font = Font(bold=True, italic=True)
+    row += 1
+    ws.cell(row=row, column=1, value="• NS Gepland (min): Reistijd zoals gepland in de NS dienstregeling")
+    row += 1
+    ws.cell(row=row, column=1, value="• Rijtijd met verkeer (min): Werkelijke rijtijd volgens Google Maps met verkeer voor dat tijdslot")
+    row += 1
+    ws.cell(row=row, column=1, value="• Rijtijd zonder verkeer (min): Werkelijke rijtijd volgens Google Maps zonder verkeer (baseline)")
+    row += 1
+    ws.cell(row=row, column=1, value="• Marge t.o.v. verkeer (min): NS Gepland - Rijtijd met verkeer (negatief = te krap gepland)")
+    row += 2
+
     # Summary
     n_total = len(risk_report)
     n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
@@ -3526,21 +3549,21 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
     row += 1
     ws.cell(row=row, column=1, value=f"Totaal ritten geanalyseerd: {n_total}")
     row += 1
-    ws.cell(row=row, column=1, value=f"Hoog risico (buffer < 0 min): {n_high}")
+    ws.cell(row=row, column=1, value=f"Hoog risico (marge < 0 min, NS planning korter dan verkeer): {n_high}")
     ws.cell(row=row, column=1).font = Font(color="FF0000")
     row += 1
-    ws.cell(row=row, column=1, value=f"Matig risico (buffer < 5 min): {n_medium}")
+    ws.cell(row=row, column=1, value=f"Matig risico (marge < 5 min): {n_medium}")
     ws.cell(row=row, column=1).font = Font(color="FF8C00")
     row += 1
-    ws.cell(row=row, column=1, value=f"OK (buffer >= 5 min): {n_ok}")
+    ws.cell(row=row, column=1, value=f"OK (marge >= 5 min): {n_ok}")
     ws.cell(row=row, column=1).font = Font(color="008000")
     row += 2
 
     # Detail table
     headers = [
         "Rit ID", "Busdienst", "Richting", "Van", "Naar",
-        "Vertrek", "Aankomst", "Gepland (min)", "Tijdslot",
-        "Verkeer (min)", "Baseline (min)", "Buffer (min)",
+        "Vertrek", "Aankomst", "NS Gepland (min)", "Tijdslot",
+        "Rijtijd met verkeer (min)", "Rijtijd zonder verkeer (min)", "Marge t.o.v. verkeer (min)",
         "Basis keertijd", "Extra keertijd", "Aangepaste keertijd", "Risico",
     ]
 
@@ -3888,6 +3911,143 @@ def write_fuel_analysis_sheet(wb, fuel_results: dict, fuel_stations: dict, fuel_
     ws.column_dimensions["I"].width = 15
     ws.column_dimensions["J"].width = 15
     ws.column_dimensions["K"].width = 40
+
+
+def write_financial_sheet(wb, financials: dict):
+    """Write financial overview sheet showing revenue, costs, and profit per rotation.
+
+    Args:
+        wb: openpyxl workbook
+        financials: Dict from calculate_total_financials() with 'rotations' and 'totals'
+    """
+    ws = wb.create_sheet("Financieel Overzicht")
+
+    # Header styling
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    money_format = '€ #,##0.00'
+    pct_format = '0.0%'
+
+    # Title
+    ws.cell(row=1, column=1, value="Financieel Overzicht - Versie 7")
+    ws.cell(row=1, column=1).font = Font(bold=True, size=14)
+
+    # Summary section
+    row = 3
+    ws.cell(row=row, column=1, value="SAMENVATTING").font = Font(bold=True, size=12)
+    row += 1
+
+    totals = financials['totals']
+    summary_data = [
+        ("Totale omzet (rijtijd × tarief)", totals['total_revenue']),
+        ("Totale chauffeurskosten", totals['total_driver_cost']),
+        ("Totale brandstofkosten", totals['total_fuel_cost']),
+        ("Bruto winst", totals['total_gross_profit']),
+        ("ZE bonus", totals['total_ze_bonus']),
+        ("HVO bonus", totals['total_hvo_bonus']),
+        ("Netto winst", totals['total_net_profit']),
+    ]
+
+    for label, value in summary_data:
+        ws.cell(row=row, column=1, value=label)
+        cell = ws.cell(row=row, column=2, value=value)
+        cell.number_format = money_format
+        if "winst" in label.lower():
+            if value >= 0:
+                cell.font = Font(color="008000", bold=True)  # Green for profit
+            else:
+                cell.font = Font(color="FF0000", bold=True)  # Red for loss
+        row += 1
+
+    # Additional stats
+    row += 1
+    ws.cell(row=row, column=1, value="Totale rij-uren (betaald door NS)")
+    ws.cell(row=row, column=2, value=totals['total_driving_hours'])
+    ws.cell(row=row, column=2).number_format = '0.0'
+    row += 1
+    ws.cell(row=row, column=1, value="Totale dienst-uren (chauffeur)")
+    ws.cell(row=row, column=2, value=totals['total_shift_hours'])
+    ws.cell(row=row, column=2).number_format = '0.0'
+    row += 1
+    ws.cell(row=row, column=1, value="Totale ORT uren")
+    ws.cell(row=row, column=2, value=totals['total_ort_hours'])
+    ws.cell(row=row, column=2).number_format = '0.0'
+    row += 1
+    ws.cell(row=row, column=1, value="Totale ORT kosten")
+    ws.cell(row=row, column=2, value=totals['total_ort_amount'])
+    ws.cell(row=row, column=2).number_format = money_format
+    row += 1
+    ws.cell(row=row, column=1, value="Totale km")
+    ws.cell(row=row, column=2, value=totals['total_km'])
+    ws.cell(row=row, column=2).number_format = '#,##0'
+
+    # Profit margin
+    row += 2
+    if totals['total_revenue'] > 0:
+        margin = totals['total_net_profit'] / totals['total_revenue']
+        ws.cell(row=row, column=1, value="Winstmarge")
+        cell = ws.cell(row=row, column=2, value=margin)
+        cell.number_format = pct_format
+        if margin >= 0:
+            cell.font = Font(color="008000", bold=True)
+        else:
+            cell.font = Font(color="FF0000", bold=True)
+
+    # Detail table header
+    row += 3
+    ws.cell(row=row, column=1, value="DETAIL PER OMLOOP").font = Font(bold=True, size=12)
+    row += 1
+
+    headers = [
+        "Bus ID", "Bustype", "Datum", "Rijtijd (min)", "Dienst (uur)",
+        "Omzet", "Chauffeur", "ORT", "Brandstof", "Bruto winst", "Netto winst"
+    ]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    row += 1
+
+    # Color fills for profit/loss
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    # Data rows
+    for fin in financials['rotations']:
+        ws.cell(row=row, column=1, value=fin.rotation_id)
+        ws.cell(row=row, column=2, value=fin.bus_type)
+        ws.cell(row=row, column=3, value=fin.date_str)
+        ws.cell(row=row, column=4, value=fin.driving_minutes)
+        ws.cell(row=row, column=5, value=round(fin.driver_cost.shift_duration_hours, 1))
+
+        ws.cell(row=row, column=6, value=fin.revenue).number_format = money_format
+        ws.cell(row=row, column=7, value=fin.driver_cost.total_cost).number_format = money_format
+        ws.cell(row=row, column=8, value=fin.driver_cost.ort_amount).number_format = money_format
+        ws.cell(row=row, column=9, value=fin.fuel_cost).number_format = money_format
+
+        gross_cell = ws.cell(row=row, column=10, value=fin.gross_profit)
+        gross_cell.number_format = money_format
+        gross_cell.fill = green_fill if fin.gross_profit >= 0 else red_fill
+
+        net_cell = ws.cell(row=row, column=11, value=fin.net_profit)
+        net_cell.number_format = money_format
+        net_cell.fill = green_fill if fin.net_profit >= 0 else red_fill
+
+        row += 1
+
+    # Column widths
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["B"].width = 15
+    ws.column_dimensions["C"].width = 15
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 12
+    ws.column_dimensions["F"].width = 12
+    ws.column_dimensions["G"].width = 12
+    ws.column_dimensions["H"].width = 10
+    ws.column_dimensions["I"].width = 12
+    ws.column_dimensions["J"].width = 12
+    ws.column_dimensions["K"].width = 12
 
 
 def generate_ze_output(rotations: list, output_file: str, ze_config: dict,
@@ -4302,6 +4462,13 @@ def main():
         help="Pas brandstofbeperkingen toe: controleer actieradius per bustype en "
              "splits omlopen als brandstofbereik overschreden wordt zonder tankmogelijkheid.",
     )
+    # Version 7: Financial analysis
+    parser.add_argument(
+        "--financieel",
+        action="store_true",
+        help="Genereer Output 7: Financieel overzicht met omzet, kosten en winst per omloop "
+             "(bouwt voort op versie 6).",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -4437,6 +4604,17 @@ def main():
         for bt, range_km in fuel_config["diesel_range_km"].items():
             print(f"    {bt}: {range_km:.0f} km")
 
+    # Load financial configuration if --financieel is enabled
+    financial_config = None
+    if args.financieel:
+        if not FINANCIAL_CALCULATOR_AVAILABLE:
+            print("WAARSCHUWING: financial_calculator.py niet gevonden, financieel overzicht overgeslagen")
+        else:
+            print("Financiele configuratie laden...")
+            financial_config = load_financial_config(args.inputs)
+            print(f"  Tarieven geladen: {len(financial_config.rates)} bustypes")
+            print(f"  Diesel prijs: {financial_config.diesel_price:.2f} EUR/liter")
+
     # --snel mode: only useful when deadhead is provided + multiple algos
     snel_mode = args.snel and len(algos) > 1 and deadhead_matrix is not None
 
@@ -4449,6 +4627,9 @@ def main():
     # Version 6: fuel/charging constraints (only when --fuel-constraints enabled)
     if args.fuel_constraints and fuel_config and fuel_stations:
         n_outputs = 6
+    # Version 7: financial analysis (only when --financieel enabled, requires version 6)
+    if args.financieel and financial_config:
+        n_outputs = 7
     if snel_mode:
         # outputs 1-(n_outputs-1) greedy only + last output all algos
         n_basis = n_outputs - 1 if deadhead_matrix else n_outputs
@@ -4874,6 +5055,61 @@ def main():
                                    "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
                                    "file": file6}
 
+            # ---------------------------------------------------------------
+            # OUTPUT 7: Financieel overzicht (financial analysis)
+            # Builds on version 6 rotations, adds financial calculations
+            # ---------------------------------------------------------------
+            if args.financieel and financial_config:
+                print(f"  Output 7 - Financieel overzicht...")
+
+                # Use version 6 rotations if available (fuel constraints), else version 5
+                rot7 = rot6 if (args.fuel_constraints and fuel_config and fuel_stations) else rot5
+
+                # Calculate financials for all rotations
+                financials = calculate_total_financials(rot7, financial_config, fuel_type="diesel")
+
+                totals = financials['totals']
+                print(f"    Totale omzet: {totals['total_revenue']:,.2f} EUR")
+                print(f"    Totale kosten: {totals['total_driver_cost'] + totals['total_fuel_cost']:,.2f} EUR")
+                print(f"    Netto winst: {totals['total_net_profit']:,.2f} EUR")
+
+                # Copy version 6 file as base, add financial sheet
+                file7 = f"{output_base}_{algo_short}_7_financieel_overzicht.xlsx"
+                print(f"    Schrijven {file7}...", end=" ", flush=True)
+
+                # Generate same output as version 6
+                generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
+                                include_sensitivity=True, output_mode=4,
+                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=7)
+
+                # Add fuel analysis sheet (same as v6) if fuel constraints were applied
+                wb7 = openpyxl.load_workbook(file7)
+                if args.fuel_constraints and fuel_config and fuel_stations:
+                    write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
+
+                # Add financial overview sheet
+                write_financial_sheet(wb7, financials)
+                wb7.save(file7)
+                print("OK")
+
+                # Add ZE analysis if enabled (same as v6)
+                if args.ze and ze_config:
+                    generate_ze_output(
+                        rot7, file7, ze_config, charging_stations, args.min_ze,
+                        append_to_existing=True
+                    )
+
+                n7_with_trips = len([r for r in rot7 if r.real_trips])
+                n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
+                n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
+                n7_extra = max(0, total_reserves - n7_res_planned)
+                n7_reserve_bussen = n7_reserve_only + n7_extra
+                n7_idle = sum(r.total_idle_minutes for r in rot7)
+
+                algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
+                                   "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
+                                   "file": file7, "financials": financials}
+
         all_results[algo_key] = algo_results
         print()
 
@@ -4889,6 +5125,7 @@ def main():
         4: "4. Gecombineerd + reserve + risico",
         5: "5. Gecombineerd + reserve + deadhead + risico",
         6: "6. Brandstof/laad strategie",
+        7: "7. Financieel overzicht",
     }
     # Fallback label when output 4 is deadhead without traffic data
     if deadhead_matrix and not (traffic_data and traffic_data.get("time_slots")):
