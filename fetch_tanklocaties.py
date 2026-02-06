@@ -669,15 +669,20 @@ def main():
 
     args = parser.parse_args()
 
-    # Load Google Maps API key from .env if --gmaps is enabled
+    # Load API keys from .env file
     import os
+    load_dotenv()
+
+    # Google Maps API key
     gmaps_key = None
     if args.gmaps:
-        load_dotenv()
         gmaps_key = os.environ.get("GOOGLE_MAPS_API_KEY")
         if not gmaps_key:
             print("WAARSCHUWING: --gmaps opgegeven maar GOOGLE_MAPS_API_KEY niet gevonden in .env")
             print("  Rijtijden worden niet opgehaald.")
+
+    # Open Charge Map API key (from --ocm-key flag or OCM_API_KEY in .env)
+    ocm_key = args.ocm_key or os.environ.get("OCM_API_KEY")
 
     print("=" * 70)
     print("Tanklocaties & Laadstations Fetcher")
@@ -685,6 +690,8 @@ def main():
     print(f"Zoekradius: {args.radius} km")
     if gmaps_key:
         print("Google Maps: rijtijden worden opgehaald")
+    if ocm_key:
+        print("Open Charge Map: API key geconfigureerd")
     print("=" * 70)
 
     # Step 1: Get station coordinates
@@ -731,7 +738,7 @@ def main():
     results = fetch_all_nearby(
         station_coords,
         radius_km=args.radius,
-        ocm_key=args.ocm_key,
+        ocm_key=ocm_key,
         gmaps_key=gmaps_key,
         fuel_only=args.fuel_only,
         charging_only=args.charging_only,
