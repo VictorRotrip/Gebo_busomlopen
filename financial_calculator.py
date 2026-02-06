@@ -182,14 +182,17 @@ def load_financial_config(xlsx_path: str) -> FinancialConfig:
 
     # Load Brandstofprijzen
     ws = wb['Brandstofprijzen']
-    # Try API prices first, fall back to manual
-    diesel_api = get_value(ws, 'diesel_b7_pompprijs_eur_per_liter')
+    # Prefer Fieten business price (adviesprijs) for cost calculations,
+    # fall back to CBS pump price, then manual entry
+    diesel_fieten = get_value(ws, 'diesel_b7_adviesprijs_fieten_eur_per_liter')
+    diesel_cbs = get_value(ws, 'diesel_b7_pompprijs_eur_per_liter')
     diesel_manual = get_value(ws, 'diesel_b7_handmatig_eur_per_liter', 1.65)
-    config.diesel_price = diesel_api if diesel_api else diesel_manual
+    config.diesel_price = diesel_fieten or diesel_cbs or diesel_manual
 
-    hvo_api = get_value(ws, 'hvo100_prijs_eur_per_liter')
+    # HVO100: Fieten first, then manual
+    hvo_fieten = get_value(ws, 'hvo100_adviesprijs_fieten_eur_per_liter')
     hvo_manual = get_value(ws, 'hvo100_handmatig_eur_per_liter', 1.95)
-    config.hvo_price = hvo_api if hvo_api else hvo_manual
+    config.hvo_price = hvo_fieten or hvo_manual
 
     elec_api = get_value(ws, 'elektriciteit_snelladen_eur_per_kwh')
     elec_manual = get_value(ws, 'elektriciteit_handmatig_eur_per_kwh', 0.35)
