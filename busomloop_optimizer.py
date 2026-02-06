@@ -4700,6 +4700,56 @@ def main():
                                      "reserve_bussen": n5_reserve_bussen, "idle_min": n5_idle,
                                      "file": file5}
 
+            # ---------------------------------------------------------------
+            # OUTPUT 6: Brandstof/laad strategie (fuel constraints + ZE)
+            # Only generated when --fuel-constraints is enabled
+            # ---------------------------------------------------------------
+            if args.fuel_constraints and fuel_config and fuel_stations:
+                print(f"  Output 6 - Brandstof/laad strategie...")
+
+                # Apply fuel constraints - this may split rotations
+                rot6_orig_count = len(rot5)
+                rot6, fuel_results_6, fuel_splits_6 = apply_fuel_constraints(
+                    rot5, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+                )
+
+                if fuel_splits_6 > 0:
+                    print(f"    Brandstofcontrole: {fuel_splits_6} omlopen gesplitst "
+                          f"({rot6_orig_count} -> {len(rot6)} bussen)")
+                else:
+                    print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot6)} bussen)")
+
+                n6_with_trips = len([r for r in rot6 if r.real_trips])
+                n6_reserve_only = len([r for r in rot6 if not r.real_trips and r.reserve_trip_list])
+                n6_res_planned = sum(len(r.reserve_trip_list) for r in rot6)
+                n6_extra = max(0, total_reserves - n6_res_planned)
+                n6_reserve_bussen = n6_reserve_only + n6_extra
+                n6_idle = sum(r.total_idle_minutes for r in rot6)
+                print(f"    {n6_with_trips} bussen met ritten + {n6_reserve_bussen} reserve = {n6_with_trips + n6_reserve_bussen} totaal")
+                print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
+
+                file6 = f"{output_base}_{algo_short}_6_brandstof_strategie.xlsx"
+                print(f"    Schrijven {file6}...", end=" ", flush=True)
+
+                # Generate full output with all schedule tabs
+                generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
+                                include_sensitivity=True, output_mode=4,
+                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=6)
+                print("OK")
+
+                # Add ZE analysis if enabled
+                if args.ze and ze_config:
+                    ze_stats = generate_ze_output(
+                        rot6, file6, ze_config, charging_stations, args.min_ze,
+                        append_to_existing=True
+                    )
+                    print(f"    ZE analyse: {ze_stats['ze_feasible']}/{ze_stats['total_touringcar']} "
+                          f"touringcars ZE-geschikt, {ze_stats['assigned_count']} toegewezen")
+
+                algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
+                                   "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
+                                   "file": file6}
+
         all_results[algo_key] = algo_results
         print()
 
@@ -4788,70 +4838,6 @@ def main():
                 print(f"  {algo_label} (output {best_out}): geen overschrijdingen")
         if not any_violation:
             print("  Alle haltes binnen capaciteit.")
-
-    # ===== OUTPUT 6: FUEL/CHARGING CONSTRAINTS (if --fuel-constraints enabled) =====
-    if args.fuel_constraints and fuel_config and fuel_stations:
-        print()
-        print("OUTPUT 6: BRANDSTOF/LAAD STRATEGIE")
-        print("=" * 60)
-
-        # Generate version 6 for each algorithm
-        for algo_key in algo_keys:
-            algo_short = "greedy" if algo_key == "greedy" else "mincost"
-            algo_label = algo_short_names.get(algo_key, algo_key)
-            results = all_results.get(algo_key, {})
-
-            if not results:
-                continue
-
-            # Use the best available rotations (highest output number)
-            best_out = max(results.keys())
-            base_rotations = results[best_out]["rotations"]
-            print(f"\n  {algo_label} (gebaseerd op output {best_out}):")
-
-            # Apply fuel constraints - this may split rotations
-            rot6_orig_count = len(base_rotations)
-            rot6, fuel_results_6, fuel_splits_6 = apply_fuel_constraints(
-                base_rotations, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
-            )
-
-            if fuel_splits_6 > 0:
-                print(f"    Brandstofcontrole: {fuel_splits_6} omlopen gesplitst "
-                      f"({rot6_orig_count} -> {len(rot6)} bussen)")
-            else:
-                print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot6)} bussen)")
-
-            n6_with_trips = len([r for r in rot6 if r.real_trips])
-            n6_reserve_only = len([r for r in rot6 if not r.real_trips and r.reserve_trip_list])
-            n6_res_planned = sum(len(r.reserve_trip_list) for r in rot6)
-            n6_extra = max(0, total_reserves - n6_res_planned)
-            n6_reserve_bussen = n6_reserve_only + n6_extra
-            n6_idle = sum(r.total_idle_minutes for r in rot6)
-            print(f"    {n6_with_trips} bussen met ritten + {n6_reserve_bussen} reserve = {n6_with_trips + n6_reserve_bussen} totaal")
-            print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
-
-            file6 = f"{output_base}_{algo_short}_6_brandstof_strategie.xlsx"
-            print(f"    Schrijven {file6}...", end=" ", flush=True)
-
-            # Generate full output with all schedule tabs
-            generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
-                            include_sensitivity=True, output_mode=4,
-                            risk_report=risk_report if 'risk_report' in dir() else None,
-                            deadhead_matrix=deadhead_matrix, version=6)
-            print("OK")
-
-            # Add ZE analysis if enabled
-            if args.ze and ze_config:
-                ze_stats = generate_ze_output(
-                    rot6, file6, ze_config, charging_stations, args.min_ze,
-                    append_to_existing=True
-                )
-                print(f"    ZE analyse: {ze_stats['ze_feasible']}/{ze_stats['total_touringcar']} "
-                      f"touringcars ZE-geschikt, {ze_stats['assigned_count']} toegewezen")
-
-            all_results[algo_key][6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
-                                        "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
-                                        "file": file6}
 
     print()
     print("Klaar!")
