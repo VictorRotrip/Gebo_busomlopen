@@ -68,8 +68,8 @@ class FinancialConfig:
 
     # Garage/Remise travel (added for v7/v8)
     # Each rotation: garage → first station + last station → garage
-    garage_reistijd_enkel_min: int = 20      # One-way travel time (minutes)
-    garage_afstand_enkel_km: float = 15.0    # One-way distance (km)
+    garage_reistijd_enkel_min: int = 60      # One-way travel time (minutes)
+    garage_afstand_enkel_km: float = 50.0    # One-way distance (km)
     garage_include_in_shift: bool = True     # Count garage travel as paid shift time
 
 
