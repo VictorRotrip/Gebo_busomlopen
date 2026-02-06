@@ -58,94 +58,123 @@ def fetch_cbs_diesel_price() -> dict:
     current_year = datetime.now().year
     min_year = current_year - 1  # Accept data from last year too
 
-    # CBS OData table 81567NED has weekly fuel prices (current data)
-    # Old table 80416ned only had data up to 2006
-    url = (
-        "https://opendata.cbs.nl/ODataApi/odata/81567NED/TypedDataSet"
-        "?$orderby=Perioden desc"
-        "&$top=100"
-        "&$format=json"
-    )
+    # CBS OData table 81567NED: "Pompprijzen motorbrandstoffen; brandstofsoort, per dag"
+    # Note: CBS OData $orderby doesn't work reliably, so we filter for recent periods
+    # and sort in Python. Use $filter with startswith to get only recent data.
 
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        print(f"  [CBS] OData v4 failed: {e}")
-        # Fallback to v3 feed
-        url_v3 = (
-            "https://opendata.cbs.nl/ODataFeed/odata/81567NED/TypedDataSet"
-            "?$orderby=Perioden desc"
-            "&$top=100"
+    # Try fetching recent data first (current year)
+    for year in [current_year, current_year - 1]:
+        year_prefix = str(year)
+        url = (
+            "https://opendata.cbs.nl/ODataApi/odata/81567NED/TypedDataSet"
+            f"?$filter=startswith(Perioden,'{year_prefix}')"
+            "&$format=json"
+        )
+
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            records = data.get("value", [])
+            if records:
+                print(f"  [CBS] Found {len(records)} records for {year}")
+                break
+        except requests.RequestException as e:
+            print(f"  [CBS] Failed to fetch {year} data: {e}")
+            records = []
+            continue
+
+    if not records:
+        # Fallback: try without filter (might get old data)
+        print("  [CBS] Trying fallback without year filter...")
+        url = (
+            "https://opendata.cbs.nl/ODataApi/odata/81567NED/TypedDataSet"
+            "?$top=500"
             "&$format=json"
         )
         try:
-            resp = requests.get(url_v3, timeout=30)
+            resp = requests.get(url, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-        except requests.RequestException as e2:
-            print(f"  [CBS] OData v3 also failed: {e2}")
-            return {"price": None, "date": None, "error": str(e2)}
+            records = data.get("value", [])
+        except requests.RequestException as e:
+            print(f"  [CBS] Fallback also failed: {e}")
+            return {"price": None, "date": None, "error": str(e)}
 
-    records = data.get("value", [])
     if not records:
         return {"price": None, "date": None, "error": "No records returned"}
 
-    # Debug: show available columns and sample periods
-    if records:
-        first_record = records[0]
-        all_cols = list(first_record.keys())
-        # Look for diesel-related columns (case-insensitive)
-        diesel_cols = [k for k in all_cols if 'diesel' in k.lower()]
-        print(f"  [CBS] Available diesel columns: {diesel_cols}")
-        print(f"  [CBS] Sample periods: {[r.get('Perioden', '?') for r in records[:5]]}")
+    # Debug: show available columns
+    first_record = records[0]
+    all_cols = list(first_record.keys())
+    print(f"  [CBS] All columns: {all_cols}")
 
-    # Find the diesel column - table 81567NED uses different column names
-    # Common patterns: "Diesel_1", "DieselB7_1", "PompprDiesel_1", etc.
-    diesel_columns = []
+    # Find price columns - CBS uses various naming patterns
+    # Look for columns containing price-related terms
+    price_columns = []
+    for key in all_cols:
+        key_lower = key.lower()
+        # Skip metadata columns
+        if key in ['ID', 'Perioden', 'BrandstofSoorten']:
+            continue
+        # Look for price/pompprijs columns
+        if any(term in key_lower for term in ['prijs', 'price', 'eur', 'pomppr']):
+            price_columns.append(key)
+        # Also check for numeric-looking column names ending in _1, _2, etc.
+        elif key_lower.endswith(('_1', '_2', '_3')) and key not in price_columns:
+            price_columns.append(key)
 
-    # Dynamically find diesel columns (prefer those with BTW/incl, exclude excl)
-    if records:
-        first_record = records[0]
-        for key in first_record.keys():
-            key_lower = key.lower()
-            if 'diesel' in key_lower:
-                # Prioritize columns with BTW (incl tax), deprioritize excl
-                if 'excl' in key_lower:
-                    diesel_columns.append(key)  # Add at end
-                elif 'btw' in key_lower or 'incl' in key_lower:
-                    diesel_columns.insert(0, key)  # Add at front
-                else:
-                    # Generic diesel column - add in middle
-                    diesel_columns.insert(len(diesel_columns) // 2, key)
+    if not price_columns:
+        # Just try all non-metadata columns
+        price_columns = [k for k in all_cols if k not in ['ID', 'Perioden', 'BrandstofSoorten']]
 
-    if not diesel_columns:
-        print("  [CBS] No diesel columns found in table")
-        return {"price": None, "date": None, "error": "No diesel columns found"}
+    print(f"  [CBS] Price columns to try: {price_columns}")
 
-    # Find the latest record with a non-null diesel price AND recent date
-    for record in records:
+    # Sort records by period (descending) - we need to do this in Python since CBS $orderby doesn't work
+    def get_period_sortkey(rec):
+        p = rec.get("Perioden", "")
+        # Convert to sortable format: "2025MM01" -> "202501", "2025JJ00" -> "202500"
+        return p.replace("MM", "").replace("JJ", "").replace("KW", "")
+
+    records_sorted = sorted(records, key=get_period_sortkey, reverse=True)
+    print(f"  [CBS] Latest periods: {[r.get('Perioden', '?') for r in records_sorted[:5]]}")
+
+    # Find diesel records (BrandstofSoorten might indicate fuel type)
+    # Look for records where BrandstofSoorten contains "Diesel" or similar
+    diesel_records = []
+    for record in records_sorted:
+        brandstof = str(record.get("BrandstofSoorten", "")).lower()
+        if "diesel" in brandstof or not record.get("BrandstofSoorten"):
+            diesel_records.append(record)
+
+    if not diesel_records:
+        diesel_records = records_sorted  # Use all if no diesel-specific found
+
+    # Find the latest record with a valid price
+    for record in diesel_records:
         period = record.get("Perioden", "")
 
-        # Parse period (format: "2025JJ00" for year, "2025KW01" for week, "2025MM01" for month)
+        # Parse period year
         try:
             period_year = int(str(period)[:4])
         except (ValueError, IndexError):
             continue
 
-        # Skip old data (before min_year)
+        # Skip old data
         if period_year < min_year:
             continue
 
-        for col in diesel_columns:
-            diesel_price = record.get(col)
-            if diesel_price is not None:
+        # Try each price column
+        for col in price_columns:
+            price_val = record.get(col)
+            if price_val is not None:
                 try:
-                    price_val = float(diesel_price)
-                    if price_val > 0.5:  # Sanity check: price > €0.50
-                        price = round(price_val, 4)
-                        print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, column: {col})")
+                    price_float = float(price_val)
+                    # CBS prices are in EUR/L, should be between 1.00 and 3.00
+                    if 0.5 < price_float < 5.0:
+                        price = round(price_float, 4)
+                        brandstof = record.get("BrandstofSoorten", "?")
+                        print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, col: {col}, type: {brandstof})")
                         return {"price": price, "date": period}
                 except (ValueError, TypeError):
                     continue
