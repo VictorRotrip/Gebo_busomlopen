@@ -3788,6 +3788,9 @@ def generate_ze_output(rotations: list, output_file: str, ze_config: dict,
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
+    # Write Uitleg sheet first (Version 6)
+    write_uitleg_sheet(wb, 6)
+
     # Write sheets
     write_ze_inzet_sheet(wb, ze_assignments, all_results, rotations, min_ze_count)
     write_ze_laadstrategie_sheet(wb, ze_assignments, rotations)
@@ -3808,10 +3811,205 @@ def generate_ze_output(rotations: list, output_file: str, ze_config: dict,
     }
 
 
+# ---------------------------------------------------------------------------
+# Version explanation texts for Uitleg sheet
+# ---------------------------------------------------------------------------
+
+VERSION_EXPLANATIONS = {
+    1: {
+        "titel": "Versie 1: Per Dienst (Baseline)",
+        "beschrijving": [
+            "Deze versie optimaliseert elke busdienst (Excel-tab) APART.",
+            "Ritten van verschillende diensten worden NIET aan elkaar gekoppeld.",
+            "Reservebussen worden als aparte voertuigen geteld (niet geïntegreerd).",
+        ],
+        "hoe_het_werkt": [
+            "1. Per busdienst worden ritten chronologisch gesorteerd",
+            "2. Ritten worden gekoppeld als: zelfde bustype, zelfde locatie, voldoende keertijd",
+            "3. Resultaat: minimaal aantal bussen per dienst",
+        ],
+        "verschil_vorige": [],  # No previous version
+        "use_case": "Baseline vergelijking, contractuele per-dienst vereisten",
+    },
+    2: {
+        "titel": "Versie 2: Per Dienst + Reserve Matching",
+        "beschrijving": [
+            "Zelfde ritketening als Versie 1, maar met OPTIMALE RESERVE TOEWIJZING.",
+            "Reservediensten worden toegewezen aan bussen tijdens hun wachttijd.",
+            "Bipartite matching zorgt voor optimale dekking van reserve-eisen.",
+        ],
+        "hoe_het_werkt": [
+            "1. Eerst: zelfde ritketening als Versie 1",
+            "2. Dan: voor elke bus, check of wachttijden overlappen met reserve-eisen",
+            "3. Bipartite matching wijst reserves optimaal toe aan beschikbare bussen",
+            "4. Ongedekte reserves vereisen extra standalone bussen",
+        ],
+        "verschil_vorige": [
+            "NIEUW t.o.v. Versie 1:",
+            "• Reservediensten worden slim toegewezen aan bestaande bussen",
+            "• Minder totaal bussen nodig doordat wachttijd benut wordt voor reserve",
+            "• Bipartite matching garandeert optimale reserve-dekking",
+        ],
+        "use_case": "Efficiëntere inzet door reserve-integratie",
+    },
+    3: {
+        "titel": "Versie 3: Gecombineerd + Reserves + Sensitiviteit",
+        "beschrijving": [
+            "Cross-dienst optimalisatie: ritten van VERSCHILLENDE diensten worden gekoppeld.",
+            "Reservebussen als 'phantom trips' geïntegreerd in omlopen.",
+            "Sensitiviteitsanalyse toont impact van keertijd-wijzigingen.",
+        ],
+        "hoe_het_werkt": [
+            "1. ALLE ritten van alle diensten worden samengevoegd",
+            "2. Optimalisatie over de gehele set (niet per dienst)",
+            "3. Reservediensten worden als phantom-ritten toegevoegd",
+            "4. Sensitiviteitsanalyse berekent: wat als keertijd +/- X minuten?",
+        ],
+        "verschil_vorige": [
+            "NIEUW t.o.v. Versie 2:",
+            "• Cross-dienst ketening: een bus kan ritten van meerdere diensten doen",
+            "• Significante busreductie door slimmere ketening",
+            "• Reserves als phantom-trips (niet apart toegewezen)",
+            "• Sensitiviteitsanalyse sheet toegevoegd",
+        ],
+        "use_case": "Maximale efficiëntie zonder locatie-verplaatsing",
+    },
+    4: {
+        "titel": "Versie 4: Gecombineerd + Risico-Gebaseerde Keertijd",
+        "beschrijving": [
+            "Zelfde als Versie 3, maar met VERKEERSAFHANKELIJKE keertijden.",
+            "Google Maps verkeerdata bepaalt risico per rit.",
+            "Keertijden worden verhoogd voor hoog-risico verbindingen.",
+        ],
+        "hoe_het_werkt": [
+            "1. Eerst: laad traffic_matrix.json met tijdslot-specifieke reistijden",
+            "2. Per rit: vergelijk geplande duur met Google Maps verwachting",
+            "3. Als Google Maps > gepland: markeer als risico (HOOG/MATIG/OK)",
+            "4. Verhoog keertijd voor ritten met hoog risico",
+            "5. Optimaliseer met aangepaste keertijden",
+        ],
+        "verschil_vorige": [
+            "NIEUW t.o.v. Versie 3:",
+            "• Verkeersbewuste keertijden (spits vs dal vs weekend)",
+            "• Risico-analyse sheet toont per-rit risicoscore",
+            "• Robuustere planning die rekening houdt met verkeersvertragingen",
+            "• Vereist: --traffic-matrix met Google Maps data",
+        ],
+        "use_case": "Robuuste planning met verkeersrisico-analyse",
+    },
+    5: {
+        "titel": "Versie 5: Gecombineerd + Deadhead Repositionering",
+        "beschrijving": [
+            "Maximale flexibiliteit: bussen kunnen LEEG naar andere locaties rijden.",
+            "Cross-locatie verbindingen mogelijk via deadhead matrix.",
+            "Kostenfunctie weegt deadhead-tijd 2x zwaarder dan wachttijd.",
+        ],
+        "hoe_het_werkt": [
+            "1. Laad deadhead matrix: reistijden tussen alle stations",
+            "2. Een bus op locatie A kan nu een rit pakken die start op locatie B",
+            "3. Voorwaarde: voldoende tijd om leeg van A naar B te rijden + keertijd",
+            "4. Kostenfunctie: deadhead × 2 + wachttijd (straft lege ritten af)",
+            "5. Min-cost matching vindt optimale balans",
+        ],
+        "verschil_vorige": [
+            "NIEUW t.o.v. Versie 4:",
+            "• Cross-locatie verbindingen: bus rijdt leeg naar andere halte",
+            "• Potentieel minder bussen, maar meer lege kilometers",
+            "• Deadhead rijen zichtbaar in het busomloopschema",
+            "• Vereist: --deadhead met station-naar-station reistijden",
+        ],
+        "use_case": "Maximale optimalisatie, trade-off bussen vs lege km",
+    },
+    6: {
+        "titel": "Versie 6: Brandstof/Laad Constraints",
+        "beschrijving": [
+            "Integreert BRANDSTOF en LAAD beperkingen in de optimalisatie.",
+            "Cumulatieve km per bus wordt gevalideerd tegen actieradius.",
+            "Ketens worden gesplitst als bereik overschreden zonder tankgelegenheid.",
+        ],
+        "hoe_het_werkt": [
+            "1. Laad brandstofconfiguratie: actieradius per bustype",
+            "2. Per keten: bereken cumulatieve km (rit-km + deadhead-km)",
+            "3. Bij elke rit-overgang: check of km < resterende actieradius",
+            "4. Als overschreden: zoek tankgelegenheid in wachttijd",
+            "5. Als geen tankgelegenheid: splits keten (extra bus nodig)",
+            "6. ZE-analyse: wijs minimaal 5 ZE Touringcars toe (NS K3 eis)",
+        ],
+        "verschil_vorige": [
+            "NIEUW t.o.v. Versie 5:",
+            "• Brandstofbereik validatie (diesel actieradius per bustype)",
+            "• Automatische keten-splitsing bij bereik-overschrijding",
+            "• Tankstop planning tijdens wachttijden",
+            "• ZE (Zero Emission) haalbaarheidsanalyse",
+            "• Laadstrategie voor elektrische bussen",
+            "• Vereist: --fuel-constraints en --tanklocaties",
+        ],
+        "use_case": "Realistische brandstof-logistiek en ZE planning",
+    },
+}
+
+
+def write_uitleg_sheet(wb, version: int):
+    """Write explanation sheet as first tab in the workbook."""
+    if version not in VERSION_EXPLANATIONS:
+        return
+
+    info = VERSION_EXPLANATIONS[version]
+    ws = wb.create_sheet(title="Uitleg", index=0)
+
+    # Styles
+    from openpyxl.styles import Font, Alignment, PatternFill
+
+    title_font = Font(bold=True, size=14)
+    header_font = Font(bold=True, size=11)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    row = 1
+
+    # Title
+    ws.cell(row, 1, info["titel"]).font = title_font
+    row += 2
+
+    # Beschrijving
+    ws.cell(row, 1, "Beschrijving:").font = header_font
+    row += 1
+    for line in info["beschrijving"]:
+        ws.cell(row, 1, line)
+        row += 1
+    row += 1
+
+    # Hoe het werkt
+    ws.cell(row, 1, "Hoe het werkt:").font = header_font
+    row += 1
+    for line in info["hoe_het_werkt"]:
+        ws.cell(row, 1, line)
+        row += 1
+    row += 1
+
+    # Verschil met vorige versie
+    if info["verschil_vorige"]:
+        ws.cell(row, 1, "Verschil met vorige versie:").font = header_font
+        ws.cell(row, 1).fill = header_fill
+        row += 1
+        for line in info["verschil_vorige"]:
+            ws.cell(row, 1, line)
+            row += 1
+        row += 1
+
+    # Use case
+    ws.cell(row, 1, "Toepassing:").font = header_font
+    row += 1
+    ws.cell(row, 1, info["use_case"])
+
+    # Set column width
+    ws.column_dimensions["A"].width = 80
+
+
 def generate_output(rotations: list, all_trips: list, reserves: list, output_file: str,
                     turnaround_map: dict = None, algorithm: str = "greedy",
                     include_sensitivity: bool = False, output_mode: int = 1,
-                    risk_report: list = None, deadhead_matrix: dict = None):
+                    risk_report: list = None, deadhead_matrix: dict = None,
+                    version: int = 1):
     """Generate the complete output Excel workbook.
 
     output_mode:
@@ -3821,10 +4019,14 @@ def generate_output(rotations: list, all_trips: list, reserves: list, output_fil
         4 = gecombineerd + reserve phantom trips + sensitivity
     risk_report: optional list of dicts from compute_trip_turnaround_overrides.
     deadhead_matrix: optional {origin: {dest: minutes}} for showing repositioning trips.
+    version: version number (1-6) for the Uitleg sheet explanation.
     """
     wb = openpyxl.Workbook()
     # Remove default sheet
     wb.remove(wb.active)
+
+    # Tab 0: Uitleg (explanation of this version)
+    write_uitleg_sheet(wb, version)
 
     # Tab 1: Busomloop (Transvision-stijl)
     write_omloop_sheet(wb, rotations, reserves, deadhead_matrix=deadhead_matrix)
@@ -4356,7 +4558,7 @@ def main():
             file1 = f"{output_base}_{algo_short}_1_per_dienst.xlsx"
             print(f"    Schrijven {file1}...", end=" ", flush=True)
             generate_output(rot1, all_trips, reserves, file1, baseline_turnaround, algo_key,
-                            output_mode=1)
+                            output_mode=1, version=1)
             print("OK")
 
             algo_results[1] = {"rotations": rot1, "buses_met_ritten": n1,
@@ -4370,7 +4572,7 @@ def main():
             file2 = f"{output_base}_{algo_short}_2_per_dienst_reservematch.xlsx"
             print(f"    Schrijven {file2}...", end=" ", flush=True)
             generate_output(rot1, all_trips, reserves, file2, baseline_turnaround, algo_key,
-                            output_mode=2)
+                            output_mode=2, version=2)
             print("OK")
 
             idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
@@ -4413,7 +4615,7 @@ def main():
             file3 = f"{output_base}_{algo_short}_3_gecombineerd_met_reserve.xlsx"
             print(f"    Schrijven {file3}...", end=" ", flush=True)
             generate_output(rot3, trips_with_reserves, reserves, file3, baseline_turnaround, algo_key,
-                            include_sensitivity=True, output_mode=4)
+                            include_sensitivity=True, output_mode=4, version=3)
             print("OK")
 
             algo_results[3] = {"rotations": rot3, "buses_met_ritten": n3_with_trips,
@@ -4470,7 +4672,7 @@ def main():
                 print(f"    Schrijven {file4}...", end=" ", flush=True)
                 generate_output(rot4, trips_with_reserves, reserves, file4, baseline_turnaround, algo_key,
                                 include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report)
+                                risk_report=risk_report, version=4)
                 print("OK")
 
                 algo_results[4] = {"rotations": rot4, "buses_met_ritten": n4_with_trips,
@@ -4522,7 +4724,7 @@ def main():
             print(f"    Schrijven {file5}...", end=" ", flush=True)
             generate_output(rot5, trips_with_reserves, reserves, file5, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
-                            risk_report=risk_report, deadhead_matrix=deadhead_matrix)
+                            risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=5)
             print("OK")
 
             algo_results[out_num] = {"rotations": rot5, "buses_met_ritten": n5_with_trips,
