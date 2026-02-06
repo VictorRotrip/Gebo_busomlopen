@@ -514,10 +514,24 @@ def main():
         )
 
         if hvo_calc.get("diff") is not None:
-            print(f"\n  HVO100 incentive calculation:")
-            print(f"    Average price diff: EUR {hvo_calc['diff']}/L "
-                  f"({hvo_calc['sources_used']} source(s))")
-            print(f"    Incentive per liter: EUR {hvo_calc['incentive']}/L")
+            print(f"\n  NS HVO100 vergoeding (duurzaamheidsstimulans):")
+            print(f"    HVO100 is hernieuwbare diesel (100% plantaardige olie).")
+            print(f"    NS vergoedt het prijsverschil + stimulans aan vervoerders.")
+            print(f"    ")
+            print(f"    HVO100 prijs:        EUR {fieten_data.get('hvo100', '?')}/L")
+            print(f"    Diesel B7 prijs:     EUR {fieten_data.get('b7', '?')}/L")
+            print(f"    Prijsverschil:       EUR {hvo_calc['diff']}/L")
+            print(f"    + Stimulans:         EUR 0.05/L")
+            print(f"    ─────────────────────────────")
+            print(f"    NS vergoeding:       EUR {hvo_calc['incentive']}/L (max €0.40)")
+            print(f"    ")
+            print(f"    → Met HVO100 kost brandstof effectief:")
+            effective_cost = round(fieten_data.get('hvo100', 0) - hvo_calc['incentive'], 4)
+            print(f"      {fieten_data.get('hvo100', '?')} - {hvo_calc['incentive']} = EUR {effective_cost}/L")
+            diesel_cost = fieten_data.get('b7', 0)
+            if diesel_cost and effective_cost:
+                savings = round(diesel_cost - effective_cost, 4)
+                print(f"      Dat is EUR {savings}/L {'goedkoper' if savings > 0 else 'duurder'} dan diesel!")
         print()
 
     # Write to Excel
