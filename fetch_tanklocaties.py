@@ -46,6 +46,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional
 
 try:
     import requests
@@ -101,7 +102,7 @@ USER_AGENT = "BusOmloopOptimizer/1.0 (fuel-station-fetcher; contact: busomloop@g
 # Geocoding: station names → lat/lon
 # ---------------------------------------------------------------------------
 
-def geocode_station_nominatim(station_name: str) -> dict | None:
+def geocode_station_nominatim(station_name: str) -> Optional[dict]:
     """Geocode a Dutch bus station name using OSM Nominatim.
 
     Returns {"lat": float, "lon": float} or None if not found.
@@ -146,7 +147,7 @@ def geocode_station_nominatim(station_name: str) -> dict | None:
     return None
 
 
-def geocode_stations(station_names: list[str]) -> dict:
+def geocode_stations(station_names: List[str]) -> dict:
     """Geocode a list of station names. Returns {name: {"lat": .., "lon": ..}}."""
     print(f"\nGeocodering van {len(station_names)} stations via Nominatim...")
     results = {}
@@ -198,7 +199,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # OpenStreetMap Overpass: Fuel stations
 # ---------------------------------------------------------------------------
 
-def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> list[dict]:
+def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> List[dict]:
     """Fetch fuel stations near a point using OSM Overpass API.
 
     Returns list of dicts with station info including fuel types.
@@ -308,7 +309,7 @@ def _build_address_from_tags(tags: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def fetch_charging_stations_ocm(lat: float, lon: float, radius_km: float = 5,
-                                 api_key: str = None) -> list[dict]:
+                                 api_key: str = None) -> List[dict]:
     """Fetch EV charging stations near a point using Open Charge Map API.
 
     Returns list of dicts with charger info including power and connectors.
@@ -608,7 +609,7 @@ def print_summary(results: dict) -> None:
 # Extract stations from input Excel (reuse optimizer's parser)
 # ---------------------------------------------------------------------------
 
-def extract_stations_from_excel(input_file: str) -> list[str]:
+def extract_stations_from_excel(input_file: str) -> List[str]:
     """Extract station display names from the input Excel using the optimizer's parser."""
     try:
         from busomloop_optimizer import parse_all_sheets, build_station_registry
