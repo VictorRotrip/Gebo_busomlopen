@@ -66,6 +66,12 @@ class FinancialConfig:
     hvo_bonus_per_liter: float = 0.05
     hvo_max_total_per_liter: float = 0.40
 
+    # Garage/Remise travel (added for v7/v8)
+    # Each rotation: garage → first station + last station → garage
+    garage_reistijd_enkel_min: int = 20      # One-way travel time (minutes)
+    garage_afstand_enkel_km: float = 15.0    # One-way distance (km)
+    garage_include_in_shift: bool = True     # Count garage travel as paid shift time
+
 
 @dataclass
 class DriverCostBreakdown:
@@ -98,8 +104,13 @@ class RotationFinancials:
     fuel_cost: float
     fuel_km: float
 
+    # Garage costs (added for v7/v8)
+    garage_travel_minutes: int = 0     # Round-trip time (garage→first + last→garage)
+    garage_travel_km: float = 0.0      # Round-trip distance
+    garage_fuel_cost: float = 0.0      # Fuel cost for garage travel
+
     # Profit
-    gross_profit: float
+    gross_profit: float = 0.0
 
     # Sustainability
     ze_bonus: float = 0.0
@@ -169,6 +180,12 @@ def load_financial_config(xlsx_path: str) -> FinancialConfig:
     # Broken shift
     config.gebroken_dienst_min_onderbreking = int(get_value(ws, 'gebroken_dienst_min_onderbreking_min', 120))
     config.gebroken_dienst_toeslag = get_value(ws, 'gebroken_dienst_toeslag_eur', 15.00)
+
+    # Garage/Remise travel (for v7/v8 cost calculations)
+    config.garage_reistijd_enkel_min = int(get_value(ws, 'garage_reistijd_enkel_min', 20))
+    config.garage_afstand_enkel_km = float(get_value(ws, 'garage_afstand_enkel_km', 15.0))
+    garage_include = get_value(ws, 'garage_include_in_shift', 1)
+    config.garage_include_in_shift = bool(garage_include) if garage_include is not None else True
 
     # Load Buskosten (fuel consumption)
     ws = wb['Buskosten']
@@ -444,9 +461,21 @@ def calculate_rotation_financials(rotation, config: FinancialConfig,
     # Calculate driving minutes (revenue time)
     driving_minutes = sum(t.duration for t in real_trips)
 
-    # Shift times
-    shift_start_min = min(t.departure for t in real_trips)
-    shift_end_min = max(t.arrival for t in real_trips)
+    # Shift times (trips only)
+    trip_start_min = min(t.departure for t in real_trips)
+    trip_end_min = max(t.arrival for t in real_trips)
+
+    # Garage travel: add time before first trip and after last trip
+    garage_travel_min = config.garage_reistijd_enkel_min * 2  # Round-trip
+    garage_travel_km = config.garage_afstand_enkel_km * 2.0
+
+    # Actual shift includes garage travel if configured
+    if config.garage_include_in_shift:
+        shift_start_min = trip_start_min - config.garage_reistijd_enkel_min
+        shift_end_min = trip_end_min + config.garage_reistijd_enkel_min
+    else:
+        shift_start_min = trip_start_min
+        shift_end_min = trip_end_min
 
     # Calculate idle gaps (for broken shift detection)
     sorted_trips = sorted(real_trips, key=lambda t: t.departure)
@@ -456,10 +485,10 @@ def calculate_rotation_financials(rotation, config: FinancialConfig,
         if gap > 0:
             idle_gaps.append(gap)
 
-    # Revenue (NS pays for driving time only)
+    # Revenue (NS pays for driving time only - NOT garage travel)
     revenue = calculate_revenue(driving_minutes, rotation.bus_type, config)
 
-    # Driver cost
+    # Driver cost (includes garage travel time in shift duration)
     driver_cost = calculate_driver_cost(
         shift_start_min, shift_end_min, idle_gaps, rotation.date_str, config
     )
@@ -476,15 +505,22 @@ def calculate_rotation_financials(rotation, config: FinancialConfig,
     if hasattr(rotation, 'deadhead_km'):
         fuel_km += rotation.deadhead_km
 
-    # Fuel cost
+    # Fuel cost for trip driving
     fuel_cost = calculate_fuel_cost(fuel_km, rotation.bus_type, fuel_type, config)
 
-    # Gross profit (before sustainability bonuses)
-    gross_profit = revenue - driver_cost.total_cost - fuel_cost
+    # Garage fuel cost (driving to/from garage)
+    garage_fuel_cost = calculate_fuel_cost(garage_travel_km, rotation.bus_type, fuel_type, config)
 
-    # Sustainability bonuses
+    # Total fuel km including garage
+    total_fuel_km = fuel_km + garage_travel_km
+
+    # Gross profit (before sustainability bonuses)
+    # Includes: revenue - driver cost - trip fuel - garage fuel
+    gross_profit = revenue - driver_cost.total_cost - fuel_cost - garage_fuel_cost
+
+    # Sustainability bonuses (on total km including garage)
     ze_bonus, hvo_bonus = calculate_sustainability_bonus(
-        fuel_km, rotation.bus_type, fuel_type, config
+        total_fuel_km, rotation.bus_type, fuel_type, config
     )
 
     net_profit = gross_profit + ze_bonus + hvo_bonus
@@ -498,6 +534,9 @@ def calculate_rotation_financials(rotation, config: FinancialConfig,
         driver_cost=driver_cost,
         fuel_cost=fuel_cost,
         fuel_km=fuel_km,
+        garage_travel_minutes=garage_travel_min,
+        garage_travel_km=garage_travel_km,
+        garage_fuel_cost=garage_fuel_cost,
         gross_profit=gross_profit,
         ze_bonus=ze_bonus,
         hvo_bonus=hvo_bonus,
@@ -516,6 +555,7 @@ def calculate_total_financials(rotations: list, config: FinancialConfig,
         'total_revenue': 0.0,
         'total_driver_cost': 0.0,
         'total_fuel_cost': 0.0,
+        'total_garage_fuel_cost': 0.0,
         'total_gross_profit': 0.0,
         'total_ze_bonus': 0.0,
         'total_hvo_bonus': 0.0,
@@ -523,8 +563,10 @@ def calculate_total_financials(rotations: list, config: FinancialConfig,
         'total_driving_hours': 0.0,
         'total_shift_hours': 0.0,
         'total_km': 0.0,
+        'total_garage_km': 0.0,
         'total_ort_hours': 0.0,
         'total_ort_amount': 0.0,
+        'num_rotations': 0,
     }
 
     for rotation in rotations:
@@ -534,6 +576,7 @@ def calculate_total_financials(rotations: list, config: FinancialConfig,
         totals['total_revenue'] += fin.revenue
         totals['total_driver_cost'] += fin.driver_cost.total_cost
         totals['total_fuel_cost'] += fin.fuel_cost
+        totals['total_garage_fuel_cost'] += fin.garage_fuel_cost
         totals['total_gross_profit'] += fin.gross_profit
         totals['total_ze_bonus'] += fin.ze_bonus
         totals['total_hvo_bonus'] += fin.hvo_bonus
@@ -541,8 +584,10 @@ def calculate_total_financials(rotations: list, config: FinancialConfig,
         totals['total_driving_hours'] += fin.driving_minutes / 60.0
         totals['total_shift_hours'] += fin.driver_cost.shift_duration_hours
         totals['total_km'] += fin.fuel_km
+        totals['total_garage_km'] += fin.garage_travel_km
         totals['total_ort_hours'] += fin.driver_cost.ort_hours
         totals['total_ort_amount'] += fin.driver_cost.ort_amount
+        totals['num_rotations'] += 1
 
     return {
         'rotations': results,
