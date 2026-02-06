@@ -3978,6 +3978,21 @@ def main():
                 traffic_data = load_matrix_from_cache_traffic(str(tm_path))
                 n_slots = len(traffic_data.get("time_slots", {}))
                 print(f"Traffic matrix geladen: {n_slots} tijdsloten + baseline")
+
+                # Extract distances_km from traffic matrix if available
+                # (distances don't change with traffic, so stored separately)
+                if traffic_data.get("distances_km"):
+                    traffic_km = traffic_data["distances_km"]
+                    # Merge with deadhead_km_matrix (traffic distances take precedence)
+                    if deadhead_km_matrix is None:
+                        deadhead_km_matrix = {}
+                    for origin, dests in traffic_km.items():
+                        if origin not in deadhead_km_matrix:
+                            deadhead_km_matrix[origin] = {}
+                        for dest, km in dests.items():
+                            if km is not None:
+                                deadhead_km_matrix[origin][dest] = km
+                    print(f"  Afstanden (km) uit traffic matrix geëxtraheerd")
             except Exception as e:
                 print(f"WAARSCHUWING: Traffic matrix kon niet geladen worden: {e}")
 

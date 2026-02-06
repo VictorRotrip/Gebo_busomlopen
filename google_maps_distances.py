@@ -739,10 +739,13 @@ def fetch_traffic_aware_matrix(api_key: str, locations: list[str],
                                 batch_size: int = 10) -> dict:
     """Fetch distance matrices for all time slots.
 
-    Returns dict: {"time_slots": {slot_name: {origin: {dest: minutes}}},
-                   "baseline": {origin: {dest: minutes}}}
+    Returns dict: {
+        "time_slots": {slot_name: {origin: {dest: minutes}}},
+        "baseline": {origin: {dest: minutes}},
+        "distances_km": {origin: {dest: km}}  # distances don't change with traffic
+    }
     """
-    result = {"time_slots": {}, "baseline": {}}
+    result = {"time_slots": {}, "baseline": {}, "distances_km": {}}
 
     # Weekday slots
     weekday_slots = ["nacht", "ochtendspits", "dal", "middagspits", "avond"]
@@ -783,16 +786,20 @@ def fetch_traffic_aware_matrix(api_key: str, locations: list[str],
         print("\nGeen weekenddag gevonden in de input, weekend-slot wordt overgeslagen.")
 
     # Baseline = fetch without departure_time (no traffic)
+    # Also extract distances here (distances don't change with traffic)
     print(f"\n--- Baseline (geen verkeer) ---")
     matrix = fetch_distance_matrix(api_key, locations, addresses,
                                    batch_size=batch_size,
                                    departure_time=None)
     for o in locations:
         result["baseline"][o] = {}
+        result["distances_km"][o] = {}
         for d in locations:
             entry = matrix.get((o, d))
             if entry and entry["duration_min"] is not None:
                 result["baseline"][o][d] = entry["duration_min"]
+            if entry and entry.get("distance_km") is not None:
+                result["distances_km"][o][d] = entry["distance_km"]
 
     return result
 
@@ -802,13 +809,16 @@ def save_traffic_aware_json(traffic_data: dict, output_file: str):
     with open(output_file, "w") as f:
         json.dump(traffic_data, f, indent=2, ensure_ascii=False)
     n_slots = len(traffic_data.get("time_slots", {}))
-    print(f"Traffic-aware JSON saved to {output_file} ({n_slots} tijdsloten + baseline)")
+    has_distances = bool(traffic_data.get("distances_km"))
+    dist_info = " + afstanden (km)" if has_distances else ""
+    print(f"Traffic-aware JSON saved to {output_file} ({n_slots} tijdsloten + baseline{dist_info})")
 
 
 def load_matrix_from_cache_traffic(cache_file: str) -> dict:
     """Load traffic-aware or legacy matrix from cached JSON.
 
-    If the file has "time_slots" key, returns the full traffic-aware structure.
+    If the file has "time_slots" key, returns the full traffic-aware structure
+    including optional "distances_km" key for route distances.
     Otherwise, wraps legacy flat format as baseline-only.
     """
     with open(cache_file) as f:

@@ -442,6 +442,7 @@ Completed scripts for data preparation:
 - [x] Split chains when fuel range exceeded without refuel opportunity
 - [x] CLI flag `--fuel-constraints` to enable fuel validation
 - [x] Use Google Maps distance_km for deadhead when available
+- [x] Traffic matrix (`--traffic`) now includes distances_km for all routes
 - [x] Calculate actual avg_speed from Google Maps data (distance/duration)
 - [x] Apply bus-type speed factors (0.85-0.95x) to Google Maps car speeds
 - [ ] Add fuel stop planning to Excel output (future work)
