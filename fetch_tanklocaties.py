@@ -61,8 +61,12 @@ except ImportError:
 DEFAULT_RADIUS_KM = 5
 DEFAULT_OUTPUT = "tanklocaties.json"
 
-# Overpass API for OpenStreetMap queries
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Overpass API mirrors for OpenStreetMap queries (try in order if one fails)
+OVERPASS_SERVERS = [
+    "https://overpass-api.de/api/interpreter",           # Main (Germany)
+    "https://overpass.kumi.systems/api/interpreter",     # Alternative mirror
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",  # Russia mirror
+]
 
 # Open Charge Map API
 OCM_URL = "https://api.openchargemap.io/v3/poi/"
@@ -200,16 +204,16 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ---------------------------------------------------------------------------
 
 def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000,
-                            max_retries: int = 3) -> List[dict]:
+                            max_retries: int = 4) -> List[dict]:
     """Fetch fuel stations near a point using OSM Overpass API.
 
     Returns list of dicts with station info including fuel types.
-    Includes retry logic with exponential backoff for rate limiting.
+    Tries multiple Overpass servers with exponential backoff on failure.
     """
     # Overpass QL: find fuel amenities within radius
     # We query both nodes and ways (some stations are mapped as areas)
     query = f"""
-    [out:json][timeout:30];
+    [out:json][timeout:45];
     (
       node["amenity"="fuel"](around:{radius_m},{lat},{lon});
       way["amenity"="fuel"](around:{radius_m},{lat},{lon});
@@ -218,28 +222,58 @@ def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000,
     """
 
     data = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(
-                OVERPASS_URL,
-                data={"data": query},
-                timeout=45,
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            break  # Success
-        except requests.RequestException as e:
-            wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
-            if attempt < max_retries - 1:
+    last_error = None
+
+    # Try each Overpass server
+    for server_idx, server_url in enumerate(OVERPASS_SERVERS):
+        # Try each server with retries
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(
+                    server_url,
+                    data={"data": query},
+                    timeout=60,  # Increased timeout
+                    headers={"User-Agent": USER_AGENT},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if server_idx > 0:
+                    print(f"    [OSM] Success with mirror server {server_idx + 1}")
+                return _parse_osm_fuel_stations(data, lat, lon)  # Success!
+
+            except requests.RequestException as e:
+                last_error = e
                 status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
-                if status_code in (429, 504, 503):
+
+                # Retry on rate limit or timeout
+                if status_code in (429, 503):
+                    wait_time = 2 ** (attempt + 1)  # 2, 4, 8, 16 seconds
                     print(f"    [OSM] Rate limited, wacht {wait_time}s en probeer opnieuw...")
                     time.sleep(wait_time)
                     continue
-            print(f"    [OSM] Overpass query failed: {e}")
-            return []
+                elif status_code == 504 or "timeout" in str(e).lower():
+                    # Server timeout - try next server immediately
+                    print(f"    [OSM] Server timeout, probeer alternatieve server...")
+                    break  # Break inner retry loop, try next server
+                else:
+                    # Other error - wait and retry
+                    wait_time = 2 ** (attempt + 1)
+                    if attempt < max_retries - 1:
+                        print(f"    [OSM] Fout, wacht {wait_time}s: {e}")
+                        time.sleep(wait_time)
+                    continue
 
+        # If we get here, this server failed - small delay before trying next
+        if server_idx < len(OVERPASS_SERVERS) - 1:
+            time.sleep(1)
+
+    # All servers failed
+    print(f"    [OSM] Alle Overpass servers gefaald: {last_error}")
+    return []
+
+
+def _parse_osm_fuel_stations(data: dict, origin_lat: float, origin_lon: float) -> List[dict]:
+    """Parse OSM Overpass response into fuel station list."""
     if data is None:
         return []
 
@@ -281,7 +315,7 @@ def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000,
         if not fuels and tags.get("amenity") == "fuel":
             fuels["diesel"] = True  # Assumed — not tagged explicitly
 
-        distance = haversine_km(lat, lon, s_lat, s_lon)
+        distance = haversine_km(origin_lat, origin_lon, s_lat, s_lon)
 
         station_info = {
             "osm_id": element.get("id"),
