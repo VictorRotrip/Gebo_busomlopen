@@ -3773,12 +3773,12 @@ def write_ze_samenvatting_sheet(wb, ze_assignments: dict, all_results: dict,
     ws.column_dimensions["B"].width = 35
 
 
-def write_fuel_analysis_sheet(wb, fuel_results: list, fuel_stations: dict, fuel_config: dict):
+def write_fuel_analysis_sheet(wb, fuel_results: dict, fuel_stations: dict, fuel_config: dict):
     """Write fuel analysis sheet showing diesel range validation per rotation.
 
     Args:
         wb: openpyxl workbook
-        fuel_results: List of FuelValidationResult objects
+        fuel_results: Dict of {rotation_id: FuelValidationResult} objects
         fuel_stations: Dict of fuel stations per location
         fuel_config: Fuel configuration with ranges and speeds
     """
@@ -3805,7 +3805,7 @@ def write_fuel_analysis_sheet(wb, fuel_results: list, fuel_stations: dict, fuel_
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
     row = 2
-    for result in fuel_results:
+    for result in fuel_results.values():
         # Calculate percentage of range used
         pct_range = (result.total_km / result.fuel_range_km * 100) if result.fuel_range_km > 0 else 0
 
@@ -3851,9 +3851,9 @@ def write_fuel_analysis_sheet(wb, fuel_results: list, fuel_stations: dict, fuel_
     row += 1
 
     total_rotations = len(fuel_results)
-    ok_count = sum(1 for r in fuel_results if r.is_feasible and not r.needs_refuel)
-    refuel_count = sum(1 for r in fuel_results if r.is_feasible and r.needs_refuel)
-    split_count = sum(1 for r in fuel_results if not r.is_feasible)
+    ok_count = sum(1 for r in fuel_results.values() if r.is_feasible and not r.needs_refuel)
+    refuel_count = sum(1 for r in fuel_results.values() if r.is_feasible and r.needs_refuel)
+    split_count = sum(1 for r in fuel_results.values() if not r.is_feasible)
 
     ws.cell(row=row, column=1, value="Totaal omlopen:")
     ws.cell(row=row, column=2, value=total_rotations)
