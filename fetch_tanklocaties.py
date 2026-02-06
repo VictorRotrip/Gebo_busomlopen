@@ -199,10 +199,12 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # OpenStreetMap Overpass: Fuel stations
 # ---------------------------------------------------------------------------
 
-def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> List[dict]:
+def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000,
+                            max_retries: int = 3) -> List[dict]:
     """Fetch fuel stations near a point using OSM Overpass API.
 
     Returns list of dicts with station info including fuel types.
+    Includes retry logic with exponential backoff for rate limiting.
     """
     # Overpass QL: find fuel amenities within radius
     # We query both nodes and ways (some stations are mapped as areas)
@@ -215,17 +217,30 @@ def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> Lis
     out center tags;
     """
 
-    try:
-        resp = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            timeout=45,
-            headers={"User-Agent": USER_AGENT},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        print(f"    [OSM] Overpass query failed: {e}")
+    data = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                OVERPASS_URL,
+                data={"data": query},
+                timeout=45,
+                headers={"User-Agent": USER_AGENT},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break  # Success
+        except requests.RequestException as e:
+            wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+            if attempt < max_retries - 1:
+                status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
+                if status_code in (429, 504, 503):
+                    print(f"    [OSM] Rate limited, wacht {wait_time}s en probeer opnieuw...")
+                    time.sleep(wait_time)
+                    continue
+            print(f"    [OSM] Overpass query failed: {e}")
+            return []
+
+    if data is None:
         return []
 
     stations = []
@@ -482,7 +497,8 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
                      ocm_key: str = None,
                      gmaps_key: str = None,
                      fuel_only: bool = False,
-                     charging_only: bool = False) -> dict:
+                     charging_only: bool = False,
+                     min_charger_power: int = 0) -> dict:
     """Fetch fuel + charging stations near all bus stations.
 
     Args:
@@ -492,6 +508,7 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
         gmaps_key: optional Google Maps API key for driving distances
         fuel_only: only fetch fuel stations
         charging_only: only fetch charging stations
+        min_charger_power: minimum charger power in kW (0 = no filter)
 
     Returns: {station_name: {"lat": .., "lon": .., "fuel_stations": [...], "charging_stations": [...]}}
     """
@@ -517,7 +534,7 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
             entry["fuel_stations"] = fuel
             n_hvo = sum(1 for s in fuel if s.get("has_hvo100"))
             print(f"    {len(fuel)} tankstations gevonden ({n_hvo} met HVO100)")
-            time.sleep(1)  # Rate limit for Overpass
+            time.sleep(2)  # Rate limit for Overpass (increased to avoid 429 errors)
 
             # Fetch Google Maps driving distances if API key provided
             if gmaps_key and fuel:
@@ -528,11 +545,20 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
 
         # Fetch charging stations from Open Charge Map
         if not fuel_only:
-            print(f"  Laadstations ophalen (Open Charge Map, radius {radius_km} km)...")
+            power_filter = f" ≥{min_charger_power} kW" if min_charger_power > 0 else ""
+            print(f"  Laadstations ophalen (Open Charge Map, radius {radius_km} km{power_filter})...")
             charging = fetch_charging_stations_ocm(lat, lon, radius_km, api_key=ocm_key)
+
+            # Filter by minimum power if specified
+            if min_charger_power > 0:
+                charging_before = len(charging)
+                charging = [s for s in charging if s.get("max_power_kw", 0) >= min_charger_power]
+                print(f"    {charging_before} gevonden, {len(charging)} met ≥{min_charger_power} kW")
+            else:
+                n_fast = sum(1 for s in charging if s.get("max_power_kw", 0) >= 50)
+                print(f"    {len(charging)} laadstations gevonden ({n_fast} snelladers ≥50 kW)")
+
             entry["charging_stations"] = charging
-            n_fast = sum(1 for s in charging if s.get("max_power_kw", 0) >= 50)
-            print(f"    {len(charging)} laadstations gevonden ({n_fast} snelladers ≥50 kW)")
             time.sleep(0.5)
 
             # Fetch Google Maps driving distances if API key provided
@@ -662,6 +688,8 @@ def main():
                         help=f"Output JSON file (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--fuel-only", action="store_true",
                         help="Only fetch fuel stations (skip charging)")
+    parser.add_argument("--min-charger-power", type=int, default=0,
+                        help="Minimum charger power in kW (e.g., 150 for ultra-fast only)")
     parser.add_argument("--charging-only", action="store_true",
                         help="Only fetch charging stations (skip fuel)")
     parser.add_argument("--dry-run", action="store_true",
@@ -688,6 +716,8 @@ def main():
     print("Tanklocaties & Laadstations Fetcher")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Zoekradius: {args.radius} km")
+    if args.min_charger_power > 0:
+        print(f"Minimum lader vermogen: {args.min_charger_power} kW (ultra-fast)")
     if gmaps_key:
         print("Google Maps: rijtijden worden opgehaald")
     if ocm_key:
@@ -742,6 +772,7 @@ def main():
         gmaps_key=gmaps_key,
         fuel_only=args.fuel_only,
         charging_only=args.charging_only,
+        min_charger_power=args.min_charger_power,
     )
 
     # Step 3: Print summary
@@ -760,6 +791,7 @@ def main():
         "metadata": {
             "fetched_at": datetime.now().isoformat(),
             "radius_km": args.radius,
+            "min_charger_power_kw": args.min_charger_power,
             "num_bus_stations": len(results),
             "sources": sources,
             "has_drive_times": gmaps_key is not None,
