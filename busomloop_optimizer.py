@@ -1010,8 +1010,62 @@ def calculate_gmaps_avg_speed(deadhead_matrix: dict = None,
     return round(avg_speed, 1)
 
 
+def load_bus_speed_factors(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
+    """Load bus speed factors from additional_inputs.xlsx.
+
+    These factors convert Google Maps car speed to bus speed (buses are slower).
+
+    Returns dict: {bus_type: factor} where factor is typically 0.85-0.95
+    """
+    # Default factors (used if Excel doesn't have them)
+    factors = {
+        "Touringcar": 0.95,
+        "Dubbeldekker": 0.90,
+        "Lagevloerbus": 0.85,
+        "Midi bus": 0.92,
+        "Taxibus": 0.95,
+    }
+
+    path = Path(inputs_xlsx)
+    if not path.exists():
+        return factors
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        if "Buskosten" not in wb.sheetnames:
+            wb.close()
+            return factors
+
+        ws = wb["Buskosten"]
+
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+            if not row or not row[0]:
+                continue
+            var_name = str(row[0]).lower()
+            value = row[1]
+
+            if "snelheidsfactor" in var_name and value:
+                if "dubbeldekker" in var_name:
+                    factors["Dubbeldekker"] = float(value)
+                elif "touringcar" in var_name:
+                    factors["Touringcar"] = float(value)
+                elif "lagevloer" in var_name:
+                    factors["Lagevloerbus"] = float(value)
+                elif "midi" in var_name:
+                    factors["Midi bus"] = float(value)
+                elif "taxi" in var_name:
+                    factors["Taxibus"] = float(value)
+
+        wb.close()
+    except Exception as e:
+        print(f"  Snelheidsfactoren laden mislukt ({e}), standaardwaarden gebruikt")
+
+    return factors
+
+
 def update_config_with_gmaps_speed(config: dict, deadhead_matrix: dict = None,
-                                    deadhead_km_matrix: dict = None) -> dict:
+                                    deadhead_km_matrix: dict = None,
+                                    inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
     """Update fuel/ZE config with calculated average speed from Google Maps.
 
     If Google Maps distance data is available, calculates the actual average
@@ -1022,6 +1076,7 @@ def update_config_with_gmaps_speed(config: dict, deadhead_matrix: dict = None,
         config: Fuel or ZE config dict with avg_speed_kmh key
         deadhead_matrix: {origin: {dest: duration_min}}
         deadhead_km_matrix: {origin: {dest: distance_km}}
+        inputs_xlsx: Path to additional_inputs.xlsx for speed factors
 
     Returns:
         Updated config dict with potentially adjusted avg_speed_kmh values.
@@ -1033,24 +1088,18 @@ def update_config_with_gmaps_speed(config: dict, deadhead_matrix: dict = None,
 
     print(f"  Google Maps gemiddelde snelheid berekend: {gmaps_speed} km/h")
 
-    # Apply a factor per bus type (buses are slightly slower than cars due to size)
-    # Google Maps calculates car speeds, buses are typically 5-10% slower
-    bus_speed_factor = {
-        "Touringcar": 0.95,      # Large, highway-capable
-        "Dubbeldekker": 0.90,    # Large, slightly slower
-        "Lagevloerbus": 0.85,    # Urban, frequent stops design
-        "Midi bus": 0.92,        # Medium size
-        "Taxibus": 0.95,         # Small, agile
-    }
+    # Load bus speed factors from Excel (buses are slower than cars)
+    bus_speed_factor = load_bus_speed_factors(inputs_xlsx)
 
     for bus_type in config["avg_speed_kmh"]:
         factor = bus_speed_factor.get(bus_type, 0.90)
         adjusted_speed = round(gmaps_speed * factor, 1)
         config["avg_speed_kmh"][bus_type] = adjusted_speed
 
-    print(f"  Snelheden aangepast op basis van Google Maps data:")
+    print(f"  Snelheden aangepast op basis van Google Maps data (factoren uit {inputs_xlsx}):")
     for bus_type, speed in sorted(config["avg_speed_kmh"].items()):
-        print(f"    {bus_type}: {speed} km/h")
+        factor = bus_speed_factor.get(bus_type, 0.90)
+        print(f"    {bus_type}: {speed} km/h (factor {factor})")
 
     return config
 
@@ -4022,7 +4071,7 @@ def main():
         # Update avg_speed with calculated values from Google Maps if available
         if deadhead_km_matrix:
             ze_config = update_config_with_gmaps_speed(
-                ze_config, deadhead_matrix, deadhead_km_matrix
+                ze_config, deadhead_matrix, deadhead_km_matrix, args.inputs
             )
 
     # Load fuel configuration if --fuel-constraints is enabled
@@ -4036,7 +4085,7 @@ def main():
         # Update avg_speed with calculated values from Google Maps if available
         if deadhead_km_matrix:
             fuel_config = update_config_with_gmaps_speed(
-                fuel_config, deadhead_matrix, deadhead_km_matrix
+                fuel_config, deadhead_matrix, deadhead_km_matrix, args.inputs
             )
 
         # Show range per bus type
