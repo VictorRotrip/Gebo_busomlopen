@@ -3773,6 +3773,123 @@ def write_ze_samenvatting_sheet(wb, ze_assignments: dict, all_results: dict,
     ws.column_dimensions["B"].width = 35
 
 
+def write_fuel_analysis_sheet(wb, fuel_results: list, fuel_stations: dict, fuel_config: dict):
+    """Write fuel analysis sheet showing diesel range validation per rotation.
+
+    Args:
+        wb: openpyxl workbook
+        fuel_results: List of FuelValidationResult objects
+        fuel_stations: Dict of fuel stations per location
+        fuel_config: Fuel configuration with ranges and speeds
+    """
+    ws = wb.create_sheet("Brandstof Analyse")
+
+    # Header styling
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    # Headers
+    headers = [
+        "Bus ID", "Bustype", "Totale km", "Bereik (km)", "% Bereik",
+        "Status", "Tankstops", "Dichtstbijzijnde Tank", "Afstand Tank (km)",
+        "Rijtijd Tank (min)", "Toelichting"
+    ]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+
+    # Status colors
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    row = 2
+    for result in fuel_results:
+        # Calculate percentage of range used
+        pct_range = (result.total_km / result.fuel_range_km * 100) if result.fuel_range_km > 0 else 0
+
+        # Determine status
+        if result.is_feasible and not result.needs_refuel:
+            status = "OK"
+            status_fill = green_fill
+        elif result.is_feasible and result.needs_refuel:
+            status = f"Tankstop nodig"
+            status_fill = yellow_fill
+        else:
+            status = "Gesplitst"
+            status_fill = red_fill
+
+        # Find nearest fuel station info from the first fuel stop if available
+        nearest_name = "-"
+        nearest_dist = "-"
+        nearest_time = "-"
+        if result.fuel_stops:
+            stop = result.fuel_stops[0]
+            nearest_name = stop.fuel_station_name
+            nearest_dist = f"{stop.fuel_station_distance_km:.1f}"
+            nearest_time = f"{stop.drive_time_min:.0f}"
+
+        ws.cell(row=row, column=1, value=result.rotation_id)
+        ws.cell(row=row, column=2, value=result.bus_type)
+        ws.cell(row=row, column=3, value=round(result.total_km, 1))
+        ws.cell(row=row, column=4, value=round(result.fuel_range_km, 0))
+        ws.cell(row=row, column=5, value=f"{pct_range:.0f}%")
+        status_cell = ws.cell(row=row, column=6, value=status)
+        status_cell.fill = status_fill
+        ws.cell(row=row, column=7, value=len(result.fuel_stops))
+        ws.cell(row=row, column=8, value=nearest_name)
+        ws.cell(row=row, column=9, value=nearest_dist)
+        ws.cell(row=row, column=10, value=nearest_time)
+        ws.cell(row=row, column=11, value=result.reason)
+
+        row += 1
+
+    # Summary section
+    row += 2
+    ws.cell(row=row, column=1, value="SAMENVATTING").font = Font(bold=True)
+    row += 1
+
+    total_rotations = len(fuel_results)
+    ok_count = sum(1 for r in fuel_results if r.is_feasible and not r.needs_refuel)
+    refuel_count = sum(1 for r in fuel_results if r.is_feasible and r.needs_refuel)
+    split_count = sum(1 for r in fuel_results if not r.is_feasible)
+
+    ws.cell(row=row, column=1, value="Totaal omlopen:")
+    ws.cell(row=row, column=2, value=total_rotations)
+    row += 1
+    ws.cell(row=row, column=1, value="Binnen bereik (geen tankstop):")
+    ws.cell(row=row, column=2, value=ok_count)
+    row += 1
+    ws.cell(row=row, column=1, value="Tankstop nodig:")
+    ws.cell(row=row, column=2, value=refuel_count)
+    row += 1
+    ws.cell(row=row, column=1, value="Gesplitst (onhaalbaar):")
+    ws.cell(row=row, column=2, value=split_count)
+
+    # Fuel range info per bus type
+    row += 2
+    ws.cell(row=row, column=1, value="BEREIK PER BUSTYPE").font = Font(bold=True)
+    row += 1
+    for bus_type, range_km in fuel_config.get("diesel_range_km", {}).items():
+        ws.cell(row=row, column=1, value=bus_type)
+        ws.cell(row=row, column=2, value=f"{range_km:.0f} km")
+        row += 1
+
+    # Column widths
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 15
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 15
+    ws.column_dimensions["G"].width = 12
+    ws.column_dimensions["H"].width = 30
+    ws.column_dimensions["I"].width = 15
+    ws.column_dimensions["J"].width = 15
+    ws.column_dimensions["K"].width = 40
+
+
 def generate_ze_output(rotations: list, output_file: str, ze_config: dict,
                         charging_stations: dict, min_ze_count: int = 5,
                         append_to_existing: bool = False) -> dict:
@@ -4735,6 +4852,13 @@ def main():
                 generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
                                 include_sensitivity=True, output_mode=4,
                                 risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=6)
+                print("OK")
+
+                # Add fuel analysis sheet to version 6 output
+                print(f"    Toevoegen Brandstof Analyse sheet...", end=" ", flush=True)
+                wb6 = openpyxl.load_workbook(file6)
+                write_fuel_analysis_sheet(wb6, fuel_results_6, fuel_stations, fuel_config)
+                wb6.save(file6)
                 print("OK")
 
                 # Add ZE analysis if enabled
