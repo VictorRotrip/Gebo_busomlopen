@@ -209,23 +209,35 @@ Each output file contains these sheets:
 
 ### Google Maps Distance Fetcher
 
-Fetches station-to-station travel times and distances for the deadhead matrix:
+Fetches station-to-station travel times and distances. This data is used for:
+1. **Deadhead repositioning** — empty drives between stations
+2. **Trip validation / risk analysis** — comparing scheduled NS trip times vs actual Google Maps times
+3. **Fuel calculations** — estimating km driven using actual distances
 
 ```bash
-# Basic deadhead matrix (uses GOOGLE_MAPS_API_KEY from .env)
+# Basic matrix: baseline times + distances (uses GOOGLE_MAPS_API_KEY from .env)
 python google_maps_distances.py --input Bijlage_J.xlsx
+# Output: deadhead_matrix.json
 
-# With traffic-aware time slots (5 weekday + weekend + baseline)
+# Traffic-aware matrix: times per time slot + distances (recommended)
 python google_maps_distances.py --input Bijlage_J.xlsx --traffic
-
-# Output: deadhead_matrix.json (basic) or traffic_matrix.json (traffic-aware)
-# Both include distance_km for accurate fuel calculations
+# Output: traffic_matrix.json
 ```
 
-The traffic matrix includes:
-- Time-slot durations (ochtendspits, dal, middagspits, avond, nacht, weekend)
-- Distance in km for each route (used to calculate actual average speed)
-- Baseline (no-traffic) times
+**Difference between the two:**
+
+| | `deadhead_matrix.json` | `traffic_matrix.json` |
+|---|---|---|
+| **Travel times** | Baseline only (no traffic) | 6 time slots + baseline |
+| **Distances (km)** | ✅ Yes | ✅ Yes |
+| **Risk analysis** | ❌ No (no time slots) | ✅ Yes |
+| **Fuel estimates** | ✅ Yes | ✅ Yes |
+
+**Time slots in traffic matrix:**
+- `nacht` (00:00-06:00), `ochtendspits` (07:00-09:00), `dal` (10:00-15:00)
+- `middagspits` (16:00-18:00), `avond` (19:00-23:00), `weekend`
+
+The **risk analysis** (Version 4+) compares each scheduled NS trip against the appropriate time slot. For example, a trip departing at 08:15 is compared against "ochtendspits" times — if the scheduled duration is shorter than Google Maps predicts with traffic, it's flagged as high risk.
 
 ### Financial Input Configuration
 
