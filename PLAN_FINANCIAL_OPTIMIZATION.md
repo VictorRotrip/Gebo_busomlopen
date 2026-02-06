@@ -435,7 +435,7 @@ Completed scripts for data preparation:
 - [x] Split chains when fuel range exceeded without refuel opportunity
 - [x] Bus-type speed factors configurable in `additional_inputs.xlsx`
 - [x] Use actual driving distances/times when available (see README.md)
-- [ ] Add fuel stop planning to Excel output (future work)
+- [x] "Brandstof Analyse" sheet in version 6 output showing per-rotation fuel validation
 
 ### Step 2: Financial Calculator Module (`financial_calculator.py`)
 New module that reads additional_inputs.xlsx and exposes:
@@ -537,50 +537,23 @@ New sheets per financial version:
    - Diesel fuel range validation ✓
    - Fuel constraint integration into optimization ✓
    - All parameters configurable in `additional_inputs.xlsx` ✓
+   - "Brandstof Analyse" Excel sheet showing per-rotation fuel status ✓
 
-3. **Step 2:** Test Version 6 on real tender casus data
-4. **Step 3:** Create `financial_calculator.py` for versions 7-9
+3. ✅ **Step 2:** Test Version 6 on real tender casus data (DONE)
+   - Tested with Bijlage J casus — all rotations within diesel range ✓
+   - ZE analysis: 40-43/135 touringcars ZE-feasible, 5 assigned ✓
+
+4. **Step 3:** Create `financial_calculator.py` for versions 7-9 ← NEXT
 5. **Step 4:** Implement Version 7 — Financial Analysis (internal)
 6. **Step 5:** Implement Version 8 — Cost-Optimized Chaining (internal)
 7. **Step 6:** Implement Version 9 — Full Profit Optimization (internal)
 
 ---
 
-### Current Implementation Focus: Fuel Constraint Integration
+### Current Implementation Focus: Version 7 — Financial Calculator
 
-The ZE functionality is already implemented. The remaining work for Version 6 is integrating
-**diesel fuel constraints** into the optimization algorithm.
-
-**Algorithm change for fuel-constrained optimization:**
-
-The cleanest approach is a **post-optimization validation pass**:
-1. Run the standard min-cost optimization (unchanged)
-2. For each resulting chain, calculate cumulative km
-3. At each trip transition, check: `cumulative_km + next_trip_km > fuel_range?`
-4. If yes, check the idle window before the next trip:
-   - If `idle_window >= refuel_time + 2 × drive_to_station`: can refuel, reset cumulative km
-   - If not: must split the chain at this point (creates additional bus)
-5. Re-number buses after splits
-
-**Why this approach:**
-- Keeps the core optimization algorithm unchanged and correct
-- Fuel constraints are validated after matching, not during
-- Easy to add different fuel types (diesel, HVO, ZE) with different ranges
-- Refueling opportunities are checked against actual idle windows
-
-**Data needed from `additional_inputs.xlsx`:**
-- `actieradius_*_diesel_km`: diesel range per bus type
-- `tanktijd_diesel_min` + `tanktijd_buffer_min`: refuel time (~20 min)
-- `avg_snelheid_naar_tankstation_kmh`: drive speed to fuel station (30 km/h)
-
-**Data needed from `tanklocaties.json`:**
-- Nearest fuel stations per bus station (with distance/drive time)
-
----
-
-### Version 7: Financial Calculator Module
-
-After Version 6 is done, create `financial_calculator.py` for internal analysis:
+Version 6 (fuel/charging constraints) is now complete. The next step is creating
+`financial_calculator.py` for internal financial analysis (versions 7-9).
 
 ```python
 # Core functions needed:

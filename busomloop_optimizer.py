@@ -3515,6 +3515,19 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
     ws.cell(row=row, column=1).font = Font(bold=True, size=14)
     row += 2
 
+    # Explanation
+    ws.cell(row=row, column=1, value="Toelichting kolommen:")
+    ws.cell(row=row, column=1).font = Font(bold=True, italic=True)
+    row += 1
+    ws.cell(row=row, column=1, value="• NS Gepland (min): Reistijd zoals gepland in de NS dienstregeling")
+    row += 1
+    ws.cell(row=row, column=1, value="• Rijtijd met verkeer (min): Werkelijke rijtijd volgens Google Maps met verkeer voor dat tijdslot")
+    row += 1
+    ws.cell(row=row, column=1, value="• Rijtijd zonder verkeer (min): Werkelijke rijtijd volgens Google Maps zonder verkeer (baseline)")
+    row += 1
+    ws.cell(row=row, column=1, value="• Marge t.o.v. verkeer (min): NS Gepland - Rijtijd met verkeer (negatief = te krap gepland)")
+    row += 2
+
     # Summary
     n_total = len(risk_report)
     n_high = sum(1 for r in risk_report if r["risk"] == "HOOG")
@@ -3526,21 +3539,21 @@ def write_risk_analysis_sheet(wb_out, risk_report: list):
     row += 1
     ws.cell(row=row, column=1, value=f"Totaal ritten geanalyseerd: {n_total}")
     row += 1
-    ws.cell(row=row, column=1, value=f"Hoog risico (buffer < 0 min): {n_high}")
+    ws.cell(row=row, column=1, value=f"Hoog risico (marge < 0 min, NS planning korter dan verkeer): {n_high}")
     ws.cell(row=row, column=1).font = Font(color="FF0000")
     row += 1
-    ws.cell(row=row, column=1, value=f"Matig risico (buffer < 5 min): {n_medium}")
+    ws.cell(row=row, column=1, value=f"Matig risico (marge < 5 min): {n_medium}")
     ws.cell(row=row, column=1).font = Font(color="FF8C00")
     row += 1
-    ws.cell(row=row, column=1, value=f"OK (buffer >= 5 min): {n_ok}")
+    ws.cell(row=row, column=1, value=f"OK (marge >= 5 min): {n_ok}")
     ws.cell(row=row, column=1).font = Font(color="008000")
     row += 2
 
     # Detail table
     headers = [
         "Rit ID", "Busdienst", "Richting", "Van", "Naar",
-        "Vertrek", "Aankomst", "Gepland (min)", "Tijdslot",
-        "Verkeer (min)", "Baseline (min)", "Buffer (min)",
+        "Vertrek", "Aankomst", "NS Gepland (min)", "Tijdslot",
+        "Rijtijd met verkeer (min)", "Rijtijd zonder verkeer (min)", "Marge t.o.v. verkeer (min)",
         "Basis keertijd", "Extra keertijd", "Aangepaste keertijd", "Risico",
     ]
 
