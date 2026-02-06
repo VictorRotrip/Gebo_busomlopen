@@ -2216,15 +2216,110 @@ def _matching_to_chains(n, match_l):
 
 
 # ---------------------------------------------------------------------------
+# Euro-based edge cost calculation for Version 8
+# ---------------------------------------------------------------------------
+
+def calculate_euro_edge_cost(trip_i, trip_j, deadhead_min: int, deadhead_km: float,
+                              financial_config, fuel_config: dict) -> float:
+    """
+    Calculate euro-based cost for connecting trip_i to trip_j.
+
+    This is used in Version 8 cost-optimized chaining to prefer connections
+    that minimize actual operational costs rather than just time.
+
+    Cost components:
+    1. Driver idle cost: paid time with no revenue
+    2. Deadhead fuel cost: fuel burned driving empty
+    3. ORT penalty: extra cost if connection time falls in unsocial hours
+
+    Args:
+        trip_i: First trip (ending)
+        trip_j: Second trip (starting)
+        deadhead_min: Deadhead driving time in minutes
+        deadhead_km: Deadhead distance in km (from matrix)
+        financial_config: FinancialConfig object with rates
+        fuel_config: Dict with fuel consumption and prices
+
+    Returns:
+        Cost in euros (lower is better)
+    """
+    cost = 0.0
+
+    # 1. Idle time cost (driver paid but no revenue)
+    idle_minutes = trip_j.departure - trip_i.arrival
+    driver_hourly_rate = getattr(financial_config, 'base_hourly_wage', 22.0)  # Default €22/hour
+    idle_cost = (idle_minutes / 60.0) * driver_hourly_rate
+    cost += idle_cost
+
+    # 2. Deadhead fuel cost
+    if deadhead_km > 0:
+        # Get bus type consumption (L/100km for diesel)
+        bus_type = trip_i.bus_type
+        consumption_map = fuel_config.get('consumption', {})
+        consumption_per_100km = consumption_map.get(bus_type, 30)  # Default 30 L/100km
+        consumption_per_km = consumption_per_100km / 100.0
+
+        # Fuel price
+        fuel_price = fuel_config.get('diesel_price', 1.70)  # Default €1.70/L
+
+        deadhead_fuel_cost = deadhead_km * consumption_per_km * fuel_price
+        cost += deadhead_fuel_cost
+
+    # 3. ORT penalty estimate (for idle/deadhead in unsocial hours)
+    # ORT windows: weekdays 19:00-07:30, all Saturday, all Sunday
+    # We check if the connection time (arrival to departure) overlaps ORT windows
+
+    # Get connection time window
+    connection_start = trip_i.arrival  # Minutes from midnight
+    connection_end = trip_j.departure
+
+    # Check for evening ORT (19:00 = 1140 min, 07:30 = 450 min next day)
+    evening_start = 19 * 60  # 1140
+    morning_end = 7 * 60 + 30  # 450
+
+    ort_minutes = 0
+
+    # Simplified ORT check (weekday evening 19:00-24:00)
+    if connection_start < 24 * 60:  # Same day
+        if connection_end > evening_start:
+            # Some time in evening ORT window
+            ort_start = max(connection_start, evening_start)
+            ort_end = min(connection_end, 24 * 60)
+            ort_minutes += max(0, ort_end - ort_start)
+
+        # Early morning (00:00-07:30)
+        if connection_start < morning_end:
+            ort_start = max(connection_start, 0)
+            ort_end = min(connection_end, morning_end)
+            ort_minutes += max(0, ort_end - ort_start)
+
+    # ORT surcharge (average €5.50/hour for evening, higher for night)
+    if ort_minutes > 0:
+        ort_hourly_rate = 5.50  # Average ORT surcharge
+        ort_cost = (ort_minutes / 60.0) * ort_hourly_rate
+        cost += ort_cost
+
+    return cost
+
+
+# ---------------------------------------------------------------------------
 # Algorithm 2: Minimum-cost maximum matching (successive shortest path)
 #   Minimizes buses first, then minimizes total idle time.
 # ---------------------------------------------------------------------------
 
 def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
-                      deadhead_matrix=None, trip_turnaround_overrides=None):
+                      deadhead_matrix=None, trip_turnaround_overrides=None,
+                      euro_cost_mode=False, financial_config=None, fuel_config=None,
+                      distance_matrix=None):
     """
     Min-cost max matching via successive shortest path (SPFA).
     Minimizes number of buses (primary) and total deadhead+idle time (secondary).
+
+    Args:
+        euro_cost_mode: If True, use euro-based costs instead of time-based (Version 8)
+        financial_config: FinancialConfig for euro costs (required if euro_cost_mode=True)
+        fuel_config: Fuel config dict for euro costs (required if euro_cost_mode=True)
+        distance_matrix: Dict with distances in km for fuel cost calculation
     """
     from collections import deque
 
@@ -2232,7 +2327,8 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
     n = len(group_trips)
 
     # Build adjacency with costs
-    # Cost = deadhead time (penalizes empty driving) + idle time
+    # Default: Cost = deadhead time (penalizes empty driving) + idle time
+    # Euro mode: Cost = driver idle cost + deadhead fuel cost + ORT penalty
     adj = [[] for _ in range(n)]
     cost_map = {}
     for i in range(n):
@@ -2241,9 +2337,31 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
                                  service_constraint, deadhead_matrix,
                                  trip_turnaround_overrides)
             if ok:
-                idle = group_trips[j].departure - group_trips[i].arrival
-                # Weight deadhead more heavily: it costs fuel and driver time
-                cost = dh * 2 + idle if dh > 0 else idle
+                if euro_cost_mode and financial_config and fuel_config:
+                    # Version 8: Euro-based cost
+                    # Get deadhead km from distance matrix if available
+                    dh_km = 0.0
+                    if distance_matrix and dh > 0:
+                        from_st = group_trips[i].to_station.lower()
+                        to_st = group_trips[j].from_station.lower()
+                        if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
+                            dh_km = distance_matrix[from_st].get(to_st, 0)
+                        elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
+                            dh_km = distance_matrix[to_st].get(from_st, 0)
+
+                    cost = calculate_euro_edge_cost(
+                        group_trips[i], group_trips[j],
+                        deadhead_min=dh,
+                        deadhead_km=dh_km,
+                        financial_config=financial_config,
+                        fuel_config=fuel_config
+                    )
+                else:
+                    # Default: Time-based cost
+                    idle = group_trips[j].departure - group_trips[i].arrival
+                    # Weight deadhead more heavily: it costs fuel and driver time
+                    cost = dh * 2 + idle if dh > 0 else idle
+
                 adj[i].append(j)
                 cost_map[(i, j)] = cost
 
@@ -4469,6 +4587,14 @@ def main():
         help="Genereer Output 7: Financieel overzicht met omzet, kosten en winst per omloop "
              "(bouwt voort op versie 6).",
     )
+    # Version 8: Cost-optimized chaining
+    parser.add_argument(
+        "--kosten-optimalisatie",
+        action="store_true",
+        help="Genereer Output 8: Kosten-geoptimaliseerde koppeling met euro-gebaseerde "
+             "kostenberekening (ORT, brandstof, idle-tijd). Kiest de meest winstgevende "
+             "koppeling bij gelijk aantal bussen.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -4630,6 +4756,9 @@ def main():
     # Version 7: financial analysis (only when --financieel enabled, requires version 6)
     if args.financieel and financial_config:
         n_outputs = 7
+    # Version 8: cost-optimized chaining (only when --kosten-optimalisatie enabled)
+    if getattr(args, 'kosten_optimalisatie', False) and financial_config and fuel_config:
+        n_outputs = 8
     if snel_mode:
         # outputs 1-(n_outputs-1) greedy only + last output all algos
         n_basis = n_outputs - 1 if deadhead_matrix else n_outputs
@@ -5110,6 +5239,89 @@ def main():
                                    "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
                                    "file": file7, "financials": financials}
 
+            # ---------------------------------------------------------------
+            # OUTPUT 8: Kosten-geoptimaliseerde koppeling
+            # Re-runs optimization with euro-based cost function
+            # ---------------------------------------------------------------
+            if getattr(args, 'kosten_optimalisatie', False) and financial_config and fuel_config:
+                print(f"  Output 8 - Kosten-geoptimaliseerde koppeling...")
+
+                # Re-run mincost optimization with euro-based costs
+                # This produces the same number of buses but chooses
+                # the most profitable chaining among alternatives
+                rot8 = []
+
+                # Group trips by date and bus type (same as other outputs)
+                from collections import defaultdict
+                groups_by_date_type = defaultdict(list)
+                for t in all_trips:
+                    groups_by_date_type[(t.date_str, t.bus_type)].append(t)
+
+                for (date_str, bus_type), group_trips in groups_by_date_type.items():
+                    if not group_trips:
+                        continue
+
+                    # Run mincost with euro costs
+                    chains = _optimize_mincost(
+                        group_trips, baseline_turnaround,
+                        service_constraint=True,
+                        deadhead_matrix=deadhead_matrix,
+                        trip_turnaround_overrides=trip_turnaround_overrides,
+                        euro_cost_mode=True,
+                        financial_config=financial_config,
+                        fuel_config=fuel_config,
+                        distance_matrix=deadhead_km_matrix
+                    )
+
+                    for chain in chains:
+                        trips = [group_trips[i] for i in chain]
+                        rot = BusRotation(trips[0].bus_type, trips[0].date_str)
+                        for t in trips:
+                            rot.add_trip(t)
+                        rot8.append(rot)
+
+                # Add reserves
+                rot8 = match_reserves_combined(rot8, reserves)
+
+                # Calculate financials
+                financials8 = calculate_total_financials(rot8, financial_config, fuel_type="diesel")
+                totals8 = financials8['totals']
+                print(f"    Totale omzet: {totals8['total_revenue']:,.2f} EUR")
+                print(f"    Totale kosten: {totals8['total_driver_cost'] + totals8['total_fuel_cost']:,.2f} EUR")
+                print(f"    Netto winst: {totals8['total_net_profit']:,.2f} EUR")
+
+                # Compare with version 7
+                if 7 in algo_results and 'financials' in algo_results[7]:
+                    profit7 = algo_results[7]['financials']['totals']['total_net_profit']
+                    profit8 = totals8['total_net_profit']
+                    diff = profit8 - profit7
+                    print(f"    Winstverschil t.o.v. v7: {diff:+,.2f} EUR "
+                          f"({'+' if diff >= 0 else ''}{(diff/profit7*100) if profit7 else 0:.2f}%)")
+
+                file8 = f"{output_base}_{algo_short}_8_kosten_geoptimaliseerd.xlsx"
+                print(f"    Schrijven {file8}...", end=" ", flush=True)
+
+                generate_output(rot8, trips_with_reserves, reserves, file8, baseline_turnaround, algo_key,
+                                include_sensitivity=True, output_mode=4,
+                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=8)
+
+                # Add financial sheet
+                wb8 = openpyxl.load_workbook(file8)
+                write_financial_sheet(wb8, financials8)
+                wb8.save(file8)
+                print("OK")
+
+                n8_with_trips = len([r for r in rot8 if r.real_trips])
+                n8_reserve_only = len([r for r in rot8 if not r.real_trips and r.reserve_trip_list])
+                n8_res_planned = sum(len(r.reserve_trip_list) for r in rot8)
+                n8_extra = max(0, total_reserves - n8_res_planned)
+                n8_reserve_bussen = n8_reserve_only + n8_extra
+                n8_idle = sum(r.total_idle_minutes for r in rot8)
+
+                algo_results[8] = {"rotations": rot8, "buses_met_ritten": n8_with_trips,
+                                   "reserve_bussen": n8_reserve_bussen, "idle_min": n8_idle,
+                                   "file": file8, "financials": financials8}
+
         all_results[algo_key] = algo_results
         print()
 
@@ -5126,6 +5338,7 @@ def main():
         5: "5. Gecombineerd + reserve + deadhead + risico",
         6: "6. Brandstof/laad strategie",
         7: "7. Financieel overzicht",
+        8: "8. Kosten-geoptimaliseerd",
     }
     # Fallback label when output 4 is deadhead without traffic data
     if deadhead_matrix and not (traffic_data and traffic_data.get("time_slots")):
