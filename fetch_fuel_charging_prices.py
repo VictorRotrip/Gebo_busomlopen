@@ -49,19 +49,19 @@ SHEET_NAME = "Brandstofprijzen"
 
 def fetch_cbs_diesel_price() -> dict:
     """
-    Fetch the latest diesel B7 pump price from CBS OData table 80416ned.
+    Fetch the latest diesel B7 pump price from CBS OData table 81567NED.
+    This table has weekly fuel prices (pompprijzen motorbrandstoffen).
     Returns dict with price (EUR/L) and date.
     """
-    print("[CBS] Fetching diesel B7 pump price...")
+    print("[CBS] Fetching diesel B7 pump price from table 81567NED...")
 
     current_year = datetime.now().year
     min_year = current_year - 1  # Accept data from last year too
 
-    # CBS OData table 80416ned has daily fuel prices
-    # We fetch the latest records (sorted by period descending)
-    # Note: $filter may not work reliably, so we also filter in Python
+    # CBS OData table 81567NED has weekly fuel prices (current data)
+    # Old table 80416ned only had data up to 2006
     url = (
-        "https://opendata.cbs.nl/ODataApi/odata/80416ned/TypedDataSet"
+        "https://opendata.cbs.nl/ODataApi/odata/81567NED/TypedDataSet"
         "?$orderby=Perioden desc"
         "&$top=100"
         "&$format=json"
@@ -75,7 +75,7 @@ def fetch_cbs_diesel_price() -> dict:
         print(f"  [CBS] OData v4 failed: {e}")
         # Fallback to v3 feed
         url_v3 = (
-            "https://opendata.cbs.nl/ODataFeed/odata/80416ned/TypedDataSet"
+            "https://opendata.cbs.nl/ODataFeed/odata/81567NED/TypedDataSet"
             "?$orderby=Perioden desc"
             "&$top=100"
             "&$format=json"
@@ -92,36 +92,43 @@ def fetch_cbs_diesel_price() -> dict:
     if not records:
         return {"price": None, "date": None, "error": "No records returned"}
 
-    # Debug: show available columns and a sample period
+    # Debug: show available columns and sample periods
     if records:
         first_record = records[0]
         all_cols = list(first_record.keys())
+        # Look for diesel-related columns (case-insensitive)
         diesel_cols = [k for k in all_cols if 'diesel' in k.lower()]
         print(f"  [CBS] Available diesel columns: {diesel_cols}")
         print(f"  [CBS] Sample periods: {[r.get('Perioden', '?') for r in records[:5]]}")
 
-    # Find the diesel column - prioritize columns with "BTW" (incl. tax)
-    diesel_columns = [
-        "DieselInclBTW_2",          # Preferred: includes tax
-        "DieselAccijnzenEnBTW_2",   # Old name with tax
-        "Diesel_2",                  # Generic
-        "DieselB7_2",                # Specific B7
-    ]
+    # Find the diesel column - table 81567NED uses different column names
+    # Common patterns: "Diesel_1", "DieselB7_1", "PompprDiesel_1", etc.
+    diesel_columns = []
 
-    # Also search dynamically for any column containing 'Diesel' and 'BTW' (incl tax)
+    # Dynamically find diesel columns (prefer those with BTW/incl, exclude excl)
     if records:
         first_record = records[0]
         for key in first_record.keys():
             key_lower = key.lower()
-            if 'diesel' in key_lower and 'btw' in key_lower and 'excl' not in key_lower:
-                if key not in diesel_columns:
-                    diesel_columns.insert(0, key)  # Prioritize dynamic match with BTW
+            if 'diesel' in key_lower:
+                # Prioritize columns with BTW (incl tax), deprioritize excl
+                if 'excl' in key_lower:
+                    diesel_columns.append(key)  # Add at end
+                elif 'btw' in key_lower or 'incl' in key_lower:
+                    diesel_columns.insert(0, key)  # Add at front
+                else:
+                    # Generic diesel column - add in middle
+                    diesel_columns.insert(len(diesel_columns) // 2, key)
+
+    if not diesel_columns:
+        print("  [CBS] No diesel columns found in table")
+        return {"price": None, "date": None, "error": "No diesel columns found"}
 
     # Find the latest record with a non-null diesel price AND recent date
     for record in records:
         period = record.get("Perioden", "")
 
-        # Parse period (format: "YYYYMMDD" or "YYYY" or "YYYYMM")
+        # Parse period (format: "2025JJ00" for year, "2025KW01" for week, "2025MM01" for month)
         try:
             period_year = int(str(period)[:4])
         except (ValueError, IndexError):
@@ -133,11 +140,15 @@ def fetch_cbs_diesel_price() -> dict:
 
         for col in diesel_columns:
             diesel_price = record.get(col)
-            if diesel_price is not None and float(diesel_price) > 0.5:  # Sanity check: price > €0.50
-                # CBS price is in EUR/L
-                price = round(float(diesel_price), 4)
-                print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, column: {col})")
-                return {"price": price, "date": period}
+            if diesel_price is not None:
+                try:
+                    price_val = float(diesel_price)
+                    if price_val > 0.5:  # Sanity check: price > €0.50
+                        price = round(price_val, 4)
+                        print(f"  [CBS] Diesel B7: EUR {price}/L (period: {period}, column: {col})")
+                        return {"price": price, "date": period}
+                except (ValueError, TypeError):
+                    continue
 
     print(f"  [CBS] No recent diesel price found (looking for {min_year}+)")
     return {"price": None, "date": None, "error": f"No diesel price found for {min_year}+"}
