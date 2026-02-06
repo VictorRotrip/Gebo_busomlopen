@@ -199,10 +199,12 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # OpenStreetMap Overpass: Fuel stations
 # ---------------------------------------------------------------------------
 
-def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> List[dict]:
+def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000,
+                            max_retries: int = 3) -> List[dict]:
     """Fetch fuel stations near a point using OSM Overpass API.
 
     Returns list of dicts with station info including fuel types.
+    Includes retry logic with exponential backoff for rate limiting.
     """
     # Overpass QL: find fuel amenities within radius
     # We query both nodes and ways (some stations are mapped as areas)
@@ -215,17 +217,30 @@ def fetch_fuel_stations_osm(lat: float, lon: float, radius_m: int = 5000) -> Lis
     out center tags;
     """
 
-    try:
-        resp = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            timeout=45,
-            headers={"User-Agent": USER_AGENT},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        print(f"    [OSM] Overpass query failed: {e}")
+    data = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                OVERPASS_URL,
+                data={"data": query},
+                timeout=45,
+                headers={"User-Agent": USER_AGENT},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break  # Success
+        except requests.RequestException as e:
+            wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+            if attempt < max_retries - 1:
+                status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
+                if status_code in (429, 504, 503):
+                    print(f"    [OSM] Rate limited, wacht {wait_time}s en probeer opnieuw...")
+                    time.sleep(wait_time)
+                    continue
+            print(f"    [OSM] Overpass query failed: {e}")
+            return []
+
+    if data is None:
         return []
 
     stations = []
@@ -517,7 +532,7 @@ def fetch_all_nearby(station_coords: dict, radius_km: float = 5,
             entry["fuel_stations"] = fuel
             n_hvo = sum(1 for s in fuel if s.get("has_hvo100"))
             print(f"    {len(fuel)} tankstations gevonden ({n_hvo} met HVO100)")
-            time.sleep(1)  # Rate limit for Overpass
+            time.sleep(2)  # Rate limit for Overpass (increased to avoid 429 errors)
 
             # Fetch Google Maps driving distances if API key provided
             if gmaps_key and fuel:
