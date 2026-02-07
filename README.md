@@ -13,7 +13,7 @@ This tool reads a trip schedule (Bijlage J Excel format) and generates optimized
 - Deadhead repositioning (empty driving between stations)
 - Traffic-based risk analysis (adjusting turnaround times for congestion)
 
-The optimizer produces **up to 9 output versions** with progressively more sophisticated optimization.
+The optimizer produces **up to 10 output versions** with progressively more sophisticated optimization.
 
 ## Installation
 
@@ -28,7 +28,7 @@ pip install requests python-dotenv
 ## Quick Start
 
 ```bash
-# Basic usage — generates all 5 versions
+# Basic usage — generates versions 1-5
 python busomloop_optimizer.py Bijlage_J.xlsx
 
 # With custom output prefix
@@ -36,6 +36,18 @@ python busomloop_optimizer.py Bijlage_J.xlsx --output rooster_2026
 
 # With deadhead matrix (enables version 5 cross-location optimization)
 python busomloop_optimizer.py Bijlage_J.xlsx --deadhead deadhead_matrix.json
+
+# Full analysis with all features (versions 1-10)
+python busomloop_optimizer.py Bijlage_J.xlsx \
+    --algoritme all \
+    --deadhead deadhead_matrix.json \
+    --traffic-matrix traffic_matrix.json \
+    --multiday \
+    --fuel-constraints \
+    --tanklocaties tanklocaties.json \
+    --inputs additional_inputs.xlsx \
+    --financieel \
+    --kosten-optimalisatie
 
 # Fast mode — only greedy algorithm for outputs 1-4
 python busomloop_optimizer.py Bijlage_J.xlsx --snel
@@ -53,9 +65,9 @@ The input Excel file (Bijlage J) must have:
 2. **Reserve sheet** — Named `Reservebussen` or `Reserve`, containing:
    - Station name, number of reserve buses, day(s), start time, end time
 
-## Output Versions (1-5)
+## Output Versions (1-10)
 
-The optimizer generates 5 Excel files per algorithm, each building on the previous:
+The optimizer generates up to 10 Excel files per algorithm, each building on the previous:
 
 ### Version 1: Per Dienst (Per Service)
 **File:** `*_1_per_dienst.xlsx`
@@ -85,7 +97,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 **File:** `*_4_gecombineerd_risico.xlsx`
 
 - Same as Version 3, but with **traffic-aware turnaround times**
-- Requires `--deadhead` with traffic data (time-slot specific travel times)
+- Requires `--traffic-matrix` with traffic data (time-slot specific travel times)
 - Increases turnaround time for trips with high-traffic connections
 - Includes risk analysis sheet showing per-trip risk levels (HOOG/MATIG/OK)
 - **Benefit:** More robust schedules that account for traffic delays
@@ -99,7 +111,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Shows deadhead rows in the bus rotation schedule
 - **Benefit:** Maximum flexibility, potentially fewer buses at cost of fuel/driver time
 
-### Version 6: Multi-Day Optimization (NEW)
+### Version 6: Multi-Day Optimization
 **File:** `*_6_meerdaags.xlsx`
 
 - Combines trips across **consecutive days** so the same bus can work multiple days
@@ -109,7 +121,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Groups trips by bus type only (not by date) for cross-day chaining
 - **With `--deadhead`:** Bus can end at one station, start next day at another (empty driving)
 - **Without `--deadhead`:** Bus must end at the same station where it starts the next day
-- **Benefit:** Significant bus reduction for multi-day operations
+- **Benefit:** Significant bus reduction for multi-day operations (e.g., 180 → 50 buses)
 
 **Example:** A bus that finishes at 23:00 on Thursday at Utrecht Centraal can start again at 06:00 on Friday at Utrecht Centraal (or anywhere if deadhead is enabled).
 
@@ -118,13 +130,30 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 
 - Integrates **fuel and charging constraints** into optimization
 - Tracks cumulative km per bus, validates against fuel range
-- Automatically splits chains when fuel range is exceeded without refuel opportunity
+- Automatically re-optimizes when fuel range is exceeded without refuel opportunity
 - Requires `--fuel-constraints` flag and `--tanklocaties` JSON file
 - ZE (Zero Emission) analysis: assigns at least 5 ZE Touringcars (NS K3 requirement)
 - Calculates actual driving times to fuel/charging stations via Google Maps
+- Correctly handles overnight refueling opportunities for multi-day rotations
 - **Benefit:** Realistic fuel logistics planning, ZE feasibility assessment
 
-### Version 8: Financial Analysis (All Permutations)
+### Version 8: Garage Travel (Depot ↔ Start/End)
+**File:** `*_8_garage_reistijden.xlsx`
+
+- Shows explicit **garage travel** for each rotation:
+  - Depot → First station (start of day)
+  - Last station → Depot (end of day)
+- Includes "Garage Reistijden" sheet with per-bus breakdown:
+  - First/last station, departure/arrival times at depot
+  - Total service time including garage travel
+  - Garage km per bus
+- Uses garage parameters from `additional_inputs.xlsx`:
+  - `garage_reistijd_enkel_min`: One-way travel time (default 60 min)
+  - `garage_afstand_enkel_km`: One-way distance (default 50 km)
+- Requires `--financieel` flag
+- **Benefit:** Complete picture of bus movements including depot travel
+
+### Version 9: Financial Analysis (All Permutations)
 **Files:** Multiple output files per permutation, plus comparison file
 
 - Generates **complete financial analysis for ALL optimization permutations** across 4 dimensions:
@@ -133,20 +162,20 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
   - **Risico**: With/without traffic-based risk-adjusted turnaround times
   - **Brandstof**: With/without fuel constraint validation
 
-- **Base permutations** (without fuel constraints):
-  - **8a - Basis**: No deadhead, no multiday, no risk (same as v3)
-  - **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (same as v4)
-  - **8b - Deadhead**: With deadhead repositioning (same as v5)
-  - **8b_risico**: Deadhead with risk-adjusted turnaround times
-  - **8c - Multidag**: Multi-day optimization without deadhead
-  - **8c_risico**: Multidag with risk-adjusted turnaround times
-  - **8d - Deadhead+Multidag**: Both features combined (same as v6)
-  - **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+- **Base permutations** (8 variants):
+  - **9a - Basis**: No deadhead, no multiday, no risk (same as v3)
+  - **9a_risico**: Basis with traffic-based risk-adjusted turnaround times (same as v4)
+  - **9b - Deadhead**: With deadhead repositioning (same as v5)
+  - **9b_risico**: Deadhead with risk-adjusted turnaround times
+  - **9c - Multidag**: Multi-day optimization without deadhead
+  - **9c_risico**: Multidag with risk-adjusted turnaround times
+  - **9d - Deadhead+Multidag**: Both features combined (same as v6)
+  - **9d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
 
 - **Fuel permutations** (with `--fuel-constraints`): Each base variant + fuel constraint validation
-  - **8a_brandstof**, **8a_risico_brandstof**, **8b_brandstof**, **8b_risico_brandstof**
-  - **8c_brandstof**, **8c_risico_brandstof**, **8d_brandstof**, **8d_risico_brandstof**
-  - Fuel variants may have MORE buses due to range-based chain splits
+  - **9a_brandstof**, **9a_risico_brandstof**, **9b_brandstof**, **9b_risico_brandstof**
+  - **9c_brandstof**, **9c_risico_brandstof**, **9d_brandstof**, **9d_risico_brandstof**
+  - Fuel variants may have MORE buses due to range-based re-optimization
 
 - **Up to 16 permutations** when all options enabled (4 base × with/without risk × with/without fuel)
 
@@ -155,7 +184,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
   - Revenue (active hours × rate), driver cost (CAO), fuel cost
   - ORT surcharges, pauzestaffel, overtime calculations
   - **Kostenberekening Uitleg** sheet: step-by-step explanation of cost calculations
-- **Comparison file** (`*_8_financieel_vergelijking.xlsx`):
+- **Comparison file** (`*_9_financieel_vergelijking.xlsx`):
   - Side-by-side comparison of all permutations
   - Highlights best option based on net profit
   - Shows profit difference vs basis
@@ -163,25 +192,35 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Optional: `--fuel-constraints` adds fuel dimension, `--deadhead` required for deadhead dimension
 - **Benefit:** Compare financial impact of deadhead, multiday, risk-adjusted optimization, and fuel constraints
 
-### Version 9: Profit Maximization
-**File:** `*_9_winstmaximalisatie.xlsx`
+### Version 10: Profit Maximization
+**File:** `*_10_winstmaximalisatie.xlsx`
 
 - **True profit maximization** — explores different bus counts to find maximum profit
 - Instead of minimizing buses, balances trade-offs between:
   - More buses = shorter shifts = less ORT, overtime, break deductions
   - More buses = more garage travel costs
-- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v7)
+- **Respects all flags:**
+  - `--deadhead`: Uses deadhead repositioning
+  - `--traffic-matrix`: Uses risk-adjusted turnaround times
+  - `--fuel-constraints`: Applies fuel range validation with re-optimization
+  - `--multiday`: Uses multi-day cross-day optimization (significantly reduces garage costs)
 - Uses all financial variables from `additional_inputs.xlsx`
 - Requires `--kosten-optimalisatie` flag (implies `--financieel`)
 - **Benefit:** May find that using more buses increases profit significantly
 
-**Example result:**
+**Example result (without multiday):**
 ```
-Version 8: 180 buses → €17,631 profit
-Version 9: 230 buses → €24,940 profit (+41% improvement)
+Version 9: 180 buses → €17,631 profit
+Version 10: 230 buses → €24,940 profit (+41% improvement)
 ```
 
-See [Input Variables Impact on Version 9](#input-variables-impact-on-version-9) for how each variable affects the optimization.
+**Example result (with multiday):**
+```
+Version 10 (single-day): 223 buses, €22,300 garage km → -€3,195 profit
+Version 10 (multi-day): 50 buses, €5,000 garage km → +€42,000 profit
+```
+
+See [Input Variables Impact on Version 10](#input-variables-impact-on-version-10) for how each variable affects the optimization.
 
 ## Algorithms
 
@@ -240,7 +279,7 @@ Minimum time required between a bus arriving and departing for the next trip:
 A bus can connect trip A to trip B if ALL of the following are true:
 
 1. **Same bus type:** A.bus_type == B.bus_type
-2. **Same date:** A.date == B.date
+2. **Same date:** A.date == B.date (unless multiday mode)
 3. **Time feasible:** B.departure >= A.arrival + turnaround + deadhead_time
 4. **Location feasible:**
    - Same location: A.destination == B.origin (no deadhead needed)
@@ -277,6 +316,9 @@ Each output file contains these sheets:
 | **Berekeningen** | Summary statistics, algorithm details, turnaround analysis |
 | **Sensitiviteit** | (V3+) Impact of turnaround changes on bus count |
 | **Risico-analyse** | (V4+) Per-trip traffic risk and turnaround adjustments |
+| **Garage Reistijden** | (V8+) Per-bus depot travel times and distances |
+| **Financieel Overzicht** | (V9+) Per-rotation revenue, costs, profit |
+| **Kostenberekening Uitleg** | (V9+) Step-by-step cost calculation explanation |
 
 ## Additional Tools
 
@@ -356,10 +398,11 @@ When using `--gmaps`, each fuel/charging station includes:
 | Version | Status | Description |
 |---------|--------|-------------|
 | 1-5 | ✅ DONE | Bus minimization, reserves, deadhead, risk analysis |
-| 6 | ✅ DONE | Fuel/charging constraints, ZE feasibility |
-| 7 | ✅ DONE | Financial analysis overlay (revenue, costs, profit) |
-| 8 | ✅ DONE | Profit maximization (explores different bus counts) |
-| 9 | Planned | Full profit optimization with fuel type assignment |
+| 6 | ✅ DONE | Multi-day cross-day optimization |
+| 7 | ✅ DONE | Fuel/charging constraints, ZE feasibility |
+| 8 | ✅ DONE | Garage travel (depot ↔ start/end) |
+| 9 | ✅ DONE | Financial analysis (all permutations) |
+| 10 | ✅ DONE | Profit maximization (with multiday support) |
 
 See `PLAN_FINANCIAL_OPTIMIZATION.md` for detailed implementation notes.
 
@@ -369,8 +412,8 @@ See `PLAN_FINANCIAL_OPTIMIZATION.md` for detailed implementation notes.
 usage: busomloop_optimizer.py [-h] [--output OUTPUT] [--algoritme {greedy,mincost,all}]
                                [--deadhead DEADHEAD] [--traffic-matrix TRAFFIC]
                                [--tanklocaties JSON] [--inputs XLSX]
-                               [--ze] [--fuel-constraints] [--financieel]
-                               [--kosten-optimalisatie] [--snel]
+                               [--ze] [--fuel-constraints] [--multiday]
+                               [--financieel] [--kosten-optimalisatie] [--snel]
                                [--keer-dd MIN] [--keer-tc MIN] [--keer-lvb MIN]
                                [--keer-midi MIN] [--keer-taxi MIN]
                                invoer.xlsx
@@ -389,8 +432,8 @@ Options:
   --ze                     Enable ZE (Zero Emission) feasibility analysis
   --fuel-constraints       Enable diesel fuel range validation
   --multiday               Generate Version 6: Multi-day cross-day optimization
-  --financieel             Generate Version 8: Financial analysis overlay
-  --kosten-optimalisatie   Generate Version 9: Profit maximization
+  --financieel             Generate Version 8-9: Garage travel + Financial analysis
+  --kosten-optimalisatie   Generate Version 10: Profit maximization
   --snel                   Fast mode: skip non-greedy for versions 1-4
   --keer-dd MIN            Turnaround time Dubbeldekker (default: 8)
   --keer-tc MIN            Turnaround time Touringcar (default: 6)
@@ -408,24 +451,28 @@ python google_maps_distances.py --input Bijlage_J.xlsx --traffic
 # 2. Fetch fuel/charging stations with driving times
 python fetch_tanklocaties.py --input Bijlage_J.xlsx --gmaps
 
-# 3. Run optimizer with all features (versions 1-6)
+# 3. Run optimizer with all features (versions 1-10)
 python busomloop_optimizer.py Bijlage_J.xlsx \
+    --algoritme all \
     --deadhead deadhead_matrix.json \
     --traffic-matrix traffic_matrix.json \
     --tanklocaties tanklocaties.json \
+    --inputs additional_inputs.xlsx \
+    --multiday \
     --fuel-constraints \
-    --ze \
+    --financieel \
+    --kosten-optimalisatie \
     --output project_x
 
-# 4. Compare results
-# - project_x_greedy_1_per_dienst.xlsx      → baseline per service
-# - project_x_greedy_3_gecombineerd.xlsx    → cross-service optimization
-# - project_x_greedy_5_deadhead.xlsx        → with deadhead repositioning
-# - project_x_greedy_*_ze.xlsx              → with ZE feasibility analysis
-# - project_x_greedy_*_fuel.xlsx            → with fuel constraint validation
+# 4. Compare results - key files:
+# - project_x_greedy_3_gecombineerd.xlsx        → cross-service optimization
+# - project_x_greedy_6_meerdaags.xlsx           → multi-day (fewer buses)
+# - project_x_greedy_8_garage_reistijden.xlsx   → with garage travel
+# - project_x_greedy_9_financieel_vergelijking.xlsx → comparison of all permutations
+# - project_x_greedy_10_winstmaximalisatie.xlsx → profit-maximized solution
 ```
 
-### Data Flow (Version 6)
+### Data Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -449,12 +496,14 @@ python busomloop_optimizer.py Bijlage_J.xlsx \
               │  - Validate fuel range using actual distances     │
               │  - Check refuel feasibility with drive times      │
               │  - Assign ZE buses with charging strategy         │
+              │  - Calculate financials per rotation              │
+              │  - Find profit-maximizing bus count               │
               └───────────────────────────────────────────────────┘
 ```
 
-## Input Variables Impact on Version 9
+## Input Variables Impact on Version 10
 
-Version 9 uses all financial variables from `additional_inputs.xlsx` to calculate profit. Here's how each variable impacts the optimization:
+Version 10 uses all financial variables from `additional_inputs.xlsx` to calculate profit. Here's how each variable impacts the optimization:
 
 ### Revenue Variables (Sheet: Tarieven)
 
@@ -519,9 +568,10 @@ Version 9 uses all financial variables from `additional_inputs.xlsx` to calculat
 | `garage_include_in_shift` | Yes (1) | If yes, garage travel counts as paid shift time. |
 
 **Key trade-off:** Each bus makes a round trip (depot → first station → last station → depot).
-- 180 buses × 100 km round trip = 18,000 km garage travel
-- 230 buses × 100 km round trip = 23,000 km garage travel (+5,000 km)
-- But 230 buses may have shorter shifts → less ORT/overtime → higher profit!
+- Single-day: 180 buses × 100 km = 18,000 km garage travel
+- Multi-day: 50 buses × 100 km = 5,000 km garage travel (70% reduction!)
+
+This is why `--multiday` dramatically improves profit in Version 10.
 
 ### Fuel Cost Variables (Sheet: Buskosten + Brandstofprijzen)
 
@@ -541,46 +591,35 @@ Version 9 uses all financial variables from `additional_inputs.xlsx` to calculat
 | `hvo_bonus_per_liter` | €0.05 | HVO100 stimulans bonus. |
 | `hvo_max_total_per_liter` | €0.40 | Max HVO incentive (price diff capped at €0.35 + €0.05). |
 
-### How Version 9 Uses These Variables
+### How Version 10 Uses These Variables
 
 The profit-maximizing algorithm:
 
-1. **Runs its own optimization** — does NOT inherit from Version 8. Re-runs min-cost max-matching from scratch
-2. **Finds minimum buses** — using the same algorithm as Version 5 (service-constrained min-cost matching)
-3. **Explores different bus counts** — from minimum feasible up to +50% (configurable via `max_extra_buses_pct`)
-4. **For each bus count**, calculates total cost:
-   - Driver costs (base + ORT + pauzestaffel + overtime + meals)
-   - Fuel costs (trips + deadhead + garage travel)
-   - Sustainability bonuses (reduces net cost)
-5. **Picks the bus count with maximum profit**
+1. **Groups trips** — by date+bus_type (single-day) or just bus_type (multi-day with `--multiday`)
+2. **Runs optimization** — using the selected algorithm (greedy or mincost)
+3. **Applies constraints** — risk-adjusted turnaround (if `--traffic-matrix`), fuel constraints (if `--fuel-constraints`)
+4. **Calculates profit** for the resulting rotations:
+   - Revenue = driving hours × hourly rate
+   - Driver costs = base + ORT + pauzestaffel + overtime + meals
+   - Fuel costs = trips + deadhead + garage travel
+   - Sustainability bonuses reduce net cost
+5. **Reports results** with comparison to Version 9
 
 **Relationship between versions:**
-| Version | What it does | Fuel constraints | Bus count |
-|---------|--------------|------------------|-----------|
-| 5 | Min buses with deadhead repositioning | No | Minimum feasible |
-| 6 | Multi-day: chains buses across consecutive days | No | Fewer buses (multi-day reuse) |
-| 7 | Same as v5/v6, but splits chains if fuel range exceeded | Yes | ≥ base (more if fuel-constrained) |
-| 8 | Financial analysis on best available rotations | Yes (inherits or applies) | Same as base |
-| 9 | **Re-runs optimization** to maximize profit | Yes (applies after) | Explores min to min+50% |
+| Version | What it does | Flags respected | Bus count |
+|---------|--------------|-----------------|-----------|
+| 5 | Min buses with deadhead | `--deadhead` | Minimum feasible |
+| 6 | Multi-day optimization | `--multiday`, `--deadhead` | Fewer (multi-day reuse) |
+| 7 | Fuel constraint validation | `--fuel-constraints` | ≥ base |
+| 8 | Garage travel display | `--financieel` | Same as base |
+| 9 | Financial analysis (all permutations) | `--financieel`, all flags | Varies by permutation |
+| 10 | Profit maximization | **ALL flags** | Explores for max profit |
 
-**Key insight:** Version 9 may find that using MORE buses than the minimum is MORE profitable, because shorter shifts have lower driver costs (less ORT, overtime, break deductions).
-
-**Why more buses can mean more profit:**
-
-| Factor | Fewer Buses | More Buses |
-|--------|-------------|------------|
-| Shift length | Longer (more trips/bus) | Shorter |
-| ORT exposure | Higher (shifts into evening) | Lower |
-| Pauzestaffel | Higher bracket (more unpaid time) | Lower bracket |
-| Overtime risk | Higher | Lower |
-| Garage travel | Less total km | More total km |
-| Fuel cost | Less garage fuel | More garage fuel |
-
-The optimizer finds the sweet spot where driver cost savings exceed extra garage costs.
+**Key insight:** Version 10 with `--multiday` can achieve dramatic profit improvements by reducing garage travel from 180+ buses to ~50 buses, each paying garage costs only once for the entire multi-day period.
 
 ### Excel Output: Financieel Overzicht Sheet
 
-Version 8 and 9 output includes a "Financieel Overzicht" sheet showing:
+Version 9 and 10 output includes a "Financieel Overzicht" sheet showing:
 
 | Column | Description |
 |--------|-------------|
