@@ -5544,6 +5544,8 @@ def main():
                     continue
 
                 # Run profit-maximizing optimization
+                # Use configurable max_extra_buses_pct (default 50%)
+                max_extra_pct = getattr(financial_config, 'max_extra_buses_pct', 50)
                 chains, profit_info = _optimize_profit_maximizing(
                     group_trips, baseline_turnaround,
                     service_constraint=True,
@@ -5552,7 +5554,7 @@ def main():
                     financial_config=financial_config,
                     fuel_config=fuel_config,
                     distance_matrix=deadhead_km_matrix,
-                    max_extra_buses_pct=30  # Try up to 30% more buses
+                    max_extra_buses_pct=max_extra_pct
                 )
 
                 if profit_info:
