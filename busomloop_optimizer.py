@@ -2454,7 +2454,8 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
 def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=False,
                                  deadhead_matrix=None, trip_turnaround_overrides=None,
                                  financial_config=None, fuel_config=None,
-                                 distance_matrix=None, max_extra_buses_pct=30):
+                                 distance_matrix=None, max_extra_buses_pct=30,
+                                 algorithm="mincost"):
     """
     Profit-maximizing optimization that explores different bus counts.
 
@@ -2475,6 +2476,7 @@ def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=
         fuel_config: Fuel config dict
         distance_matrix: Distances in km for fuel calculations
         max_extra_buses_pct: Maximum % extra buses to try beyond minimum
+        algorithm: Which algorithm to use for initial chaining ("greedy" or "mincost")
 
     Returns:
         Tuple of (chains, profit_info) where profit_info contains the analysis
@@ -2482,9 +2484,10 @@ def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=
     from collections import deque
 
     if not financial_config:
-        # Fallback to min-cost if no financial config
-        return _optimize_mincost(group_trips, turnaround_map, service_constraint,
-                                 deadhead_matrix, trip_turnaround_overrides), None
+        # Fallback to selected algorithm if no financial config
+        algo_func = _optimize_greedy if algorithm == "greedy" else _optimize_mincost
+        return algo_func(group_trips, turnaround_map, service_constraint,
+                         deadhead_matrix, trip_turnaround_overrides), None
 
     group_trips_sorted = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
     n = len(group_trips_sorted)
@@ -2492,104 +2495,113 @@ def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=
     if n == 0:
         return [], {'best_buses': 0, 'best_profit': 0, 'explored': []}
 
-    # Build connection graph with euro costs
-    adj = [[] for _ in range(n)]
-    cost_map = {}  # (i, j) -> euro cost of connection
+    # Get initial minimum-buses solution using selected algorithm
+    if algorithm == "greedy":
+        # Use greedy algorithm for initial chains
+        min_buses_chains = _optimize_greedy(group_trips_sorted, turnaround_map,
+                                            service_constraint, deadhead_matrix,
+                                            trip_turnaround_overrides)
+    else:
+        # Use euro-cost based mincost matching for better profit optimization
+        # Build connection graph with euro costs
+        adj = [[] for _ in range(n)]
+        cost_map = {}  # (i, j) -> euro cost of connection
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            ok, dh = can_connect(group_trips_sorted[i], group_trips_sorted[j],
-                                 turnaround_map, service_constraint, deadhead_matrix,
-                                 trip_turnaround_overrides)
-            if ok:
-                # Calculate euro cost for this connection
-                dh_km = 0.0
-                if distance_matrix and dh > 0:
-                    from_st = group_trips_sorted[i].dest_code.lower()
-                    to_st = group_trips_sorted[j].origin_code.lower()
-                    if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
-                        dh_km = distance_matrix[from_st].get(to_st, 0)
-                    elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
-                        dh_km = distance_matrix[to_st].get(from_st, 0)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ok, dh = can_connect(group_trips_sorted[i], group_trips_sorted[j],
+                                     turnaround_map, service_constraint, deadhead_matrix,
+                                     trip_turnaround_overrides)
+                if ok:
+                    # Calculate euro cost for this connection
+                    dh_km = 0.0
+                    if distance_matrix and dh > 0:
+                        from_st = group_trips_sorted[i].dest_code.lower()
+                        to_st = group_trips_sorted[j].origin_code.lower()
+                        if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
+                            dh_km = distance_matrix[from_st].get(to_st, 0)
+                        elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
+                            dh_km = distance_matrix[to_st].get(from_st, 0)
 
-                cost = calculate_euro_edge_cost(
-                    group_trips_sorted[i], group_trips_sorted[j],
-                    deadhead_min=dh, deadhead_km=dh_km,
-                    financial_config=financial_config,
-                    fuel_config=fuel_config
-                )
-                adj[i].append(j)
-                cost_map[(i, j)] = cost
+                    cost = calculate_euro_edge_cost(
+                        group_trips_sorted[i], group_trips_sorted[j],
+                        deadhead_min=dh, deadhead_km=dh_km,
+                        financial_config=financial_config,
+                        fuel_config=fuel_config
+                    )
+                    adj[i].append(j)
+                    cost_map[(i, j)] = cost
 
-    # First find minimum buses solution via max matching
-    match_l = [-1] * n
-    match_r = [-1] * n
+        # Find minimum buses solution via max matching with euro costs
+        match_l = [-1] * n
+        match_r = [-1] * n
 
-    def spfa_augment():
-        """Find minimum-cost augmenting path using SPFA."""
-        dist = [float('inf')] * n
-        prev_l = [-1] * n
-        in_queue = [False] * n
-        queue = deque()
+        def spfa_augment():
+            """Find minimum-cost augmenting path using SPFA."""
+            dist = [float('inf')] * n
+            prev_l = [-1] * n
+            in_queue = [False] * n
+            queue = deque()
 
-        dist_left = [float('inf')] * n
-        for u in range(n):
-            if match_l[u] == -1:
-                dist_left[u] = 0
-                for v in adj[u]:
-                    c = cost_map[(u, v)]
-                    if c < dist[v]:
-                        dist[v] = c
-                        prev_l[v] = u
-                        if not in_queue[v]:
-                            queue.append(v)
-                            in_queue[v] = True
+            dist_left = [float('inf')] * n
+            for u in range(n):
+                if match_l[u] == -1:
+                    dist_left[u] = 0
+                    for v in adj[u]:
+                        c = cost_map[(u, v)]
+                        if c < dist[v]:
+                            dist[v] = c
+                            prev_l[v] = u
+                            if not in_queue[v]:
+                                queue.append(v)
+                                in_queue[v] = True
 
-        while queue:
-            v = queue.popleft()
-            in_queue[v] = False
+            while queue:
+                v = queue.popleft()
+                in_queue[v] = False
 
-            w = match_r[v]
-            if w == -1:
-                continue
+                w = match_r[v]
+                if w == -1:
+                    continue
 
-            new_dist_w = dist[v]
-            if new_dist_w < dist_left[w]:
-                dist_left[w] = new_dist_w
-                for v2 in adj[w]:
-                    c = new_dist_w + cost_map[(w, v2)]
-                    if c < dist[v2]:
-                        dist[v2] = c
-                        prev_l[v2] = w
-                        if not in_queue[v2]:
-                            queue.append(v2)
-                            in_queue[v2] = True
+                new_dist_w = dist[v]
+                if new_dist_w < dist_left[w]:
+                    dist_left[w] = new_dist_w
+                    for v2 in adj[w]:
+                        c = new_dist_w + cost_map[(w, v2)]
+                        if c < dist[v2]:
+                            dist[v2] = c
+                            prev_l[v2] = w
+                            if not in_queue[v2]:
+                                queue.append(v2)
+                                in_queue[v2] = True
 
-        best_v = -1
-        best_d = float('inf')
-        for v in range(n):
-            if match_r[v] == -1 and dist[v] < best_d:
-                best_d = dist[v]
-                best_v = v
+            best_v = -1
+            best_d = float('inf')
+            for v in range(n):
+                if match_r[v] == -1 and dist[v] < best_d:
+                    best_d = dist[v]
+                    best_v = v
 
-        if best_v == -1:
-            return False
+            if best_v == -1:
+                return False
 
-        v = best_v
-        while v != -1:
-            u = prev_l[v]
-            old_v = match_l[u]
-            match_l[u] = v
-            match_r[v] = u
-            v = old_v
+            v = best_v
+            while v != -1:
+                u = prev_l[v]
+                old_v = match_l[u]
+                match_l[u] = v
+                match_r[v] = u
+                v = old_v
 
-        return True
+            return True
 
-    # Find max matching
-    while spfa_augment():
-        pass
+        # Find max matching
+        while spfa_augment():
+            pass
 
-    min_buses_chains = _matching_to_chains(n, match_l)
+        min_buses_chains = _matching_to_chains(n, match_l)
+
     min_buses = len(min_buses_chains)
 
     # Calculate max buses to try
@@ -5570,7 +5582,8 @@ def main():
                     financial_config=financial_config,
                     fuel_config=fuel_config,
                     distance_matrix=deadhead_km_matrix,
-                    max_extra_buses_pct=max_extra_pct
+                    max_extra_buses_pct=max_extra_pct,
+                    algorithm=algo_key
                 )
 
                 if profit_info:
