@@ -5464,15 +5464,27 @@ def main():
         if args.financieel and financial_config:
             print(f"  Output 7 - Financieel overzicht...")
 
-            # Use best available rotations: rot6 > rot5 > rot3
+            # Use best available rotations: rot6 > rot5 > rot4 > rot3
+            used_v6 = False
             if 6 in algo_results:
                 rot7 = algo_results[6]['rotations']
+                used_v6 = True
             elif 5 in algo_results:
                 rot7 = algo_results[5]['rotations']
             elif 4 in algo_results:
                 rot7 = algo_results[4]['rotations']
             else:
                 rot7 = algo_results[3]['rotations']
+
+            # Apply fuel constraints if enabled but not already applied via v6
+            fuel_results_7 = None
+            if args.fuel_constraints and fuel_config and fuel_stations and not used_v6:
+                rot7_before = len(rot7)
+                rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
+                    rot7, fuel_config, fuel_stations, deadhead_km_matrix
+                )
+                if len(rot7) > rot7_before:
+                    print(f"    Brandstofvalidatie: {len(rot7) - rot7_before} extra bussen door tankbeperkingen")
 
             # Calculate financials for all rotations
             financials = calculate_total_financials(rot7, financial_config, fuel_type="diesel")
@@ -5493,8 +5505,12 @@ def main():
 
             # Add fuel analysis sheet if fuel constraints were applied
             wb7 = openpyxl.load_workbook(file7)
-            if args.fuel_constraints and fuel_config and fuel_stations and 6 in algo_results:
-                write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
+            if args.fuel_constraints and fuel_config and fuel_stations:
+                # Use fuel_results_7 if v7 applied its own constraints, else use fuel_results_6 from v6
+                if fuel_results_7:
+                    write_fuel_analysis_sheet(wb7, fuel_results_7, fuel_stations, fuel_config)
+                elif 6 in algo_results:
+                    write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
 
             # Add financial overview sheet
             write_financial_sheet(wb7, financials)
@@ -5584,6 +5600,16 @@ def main():
             # Note: Version 8 doesn't include phantom reserve trips in optimization
             # Reserves are handled separately in output generation
 
+            # Apply fuel constraints if enabled (same as Version 6)
+            fuel_results_8 = None
+            if args.fuel_constraints and fuel_config and fuel_stations:
+                rot8_before = len(rot8)
+                rot8, fuel_results_8, fuel_splits_8 = apply_fuel_constraints(
+                    rot8, fuel_config, fuel_stations, deadhead_km_matrix
+                )
+                if len(rot8) > rot8_before:
+                    print(f"    Brandstofvalidatie: {len(rot8) - rot8_before} extra bussen door tankbeperkingen")
+
             # Calculate financials
             financials8 = calculate_total_financials(rot8, financial_config, fuel_type="diesel")
             totals8 = financials8['totals']
@@ -5619,8 +5645,10 @@ def main():
                             risk_report=risk_report if 'risk_report' in dir() else None,
                             deadhead_matrix=deadhead_matrix, version=8)
 
-            # Add financial sheet
+            # Add financial sheet and fuel analysis if applicable
             wb8 = openpyxl.load_workbook(file8)
+            if fuel_results_8 and args.fuel_constraints:
+                write_fuel_analysis_sheet(wb8, fuel_results_8, fuel_stations, fuel_config)
             write_financial_sheet(wb8, financials8)
             wb8.save(file8)
             print("OK")

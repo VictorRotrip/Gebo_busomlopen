@@ -116,6 +116,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Adds **complete financial calculations** to the roster
 - Per rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel cost
 - Includes ORT surcharges (unsocial hours), pauzestaffel (break deductions), overtime calculations
+- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v6)
 - Requires `--financieel` flag and `additional_inputs.xlsx` with financial config
 - **Benefit:** Full profit/loss visibility per bus rotation
 
@@ -126,6 +127,7 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Instead of minimizing buses, balances trade-offs between:
   - More buses = shorter shifts = less ORT, overtime, break deductions
   - More buses = more garage travel costs
+- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v6)
 - Uses all financial variables from `additional_inputs.xlsx`
 - Requires `--kosten-optimalisatie` flag (implies `--financieel`)
 - **Benefit:** May find that using more buses increases profit significantly
@@ -509,12 +511,12 @@ The profit-maximizing algorithm:
 5. **Picks the bus count with maximum profit**
 
 **Relationship between versions:**
-| Version | What it does | Bus count |
-|---------|--------------|-----------|
-| 5 | Min buses with deadhead repositioning | Minimum feasible |
-| 6 | Same as v5, but splits chains if fuel range exceeded | ≥ v5 (more if fuel-constrained) |
-| 7 | Financial analysis on v6 rotations (no re-optimization) | Same as v6 |
-| 8 | **Re-runs optimization** to maximize profit | Explores min to min+50% |
+| Version | What it does | Fuel constraints | Bus count |
+|---------|--------------|------------------|-----------|
+| 5 | Min buses with deadhead repositioning | No | Minimum feasible |
+| 6 | Same as v5, but splits chains if fuel range exceeded | Yes | ≥ v5 (more if fuel-constrained) |
+| 7 | Financial analysis on best available rotations | Yes (inherits or applies) | Same as base |
+| 8 | **Re-runs optimization** to maximize profit | Yes (applies after) | Explores min to min+50% |
 
 **Key insight:** Version 8 may find that using MORE buses than the minimum is MORE profitable, because shorter shifts have lower driver costs (less ORT, overtime, break deductions).
 
