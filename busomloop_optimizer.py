@@ -6659,65 +6659,123 @@ def main():
         # ---------------------------------------------------------------
         # OUTPUT 10: Winstmaximalisatie (Profit Maximization)
         # Can run with or without deadhead data
+        # Supports --multiday for reduced garage costs
         # ---------------------------------------------------------------
         if getattr(args, 'kosten_optimalisatie', False) and financial_config and fuel_config:
-            print(f"  Output 10 - Winstmaximalisatie...")
+            use_multiday_v10 = getattr(args, 'multiday', False)
+            multiday_label = " (meerdaags)" if use_multiday_v10 else ""
+            print(f"  Output 10 - Winstmaximalisatie{multiday_label}...")
             print(f"    Onderzoekt verschillende aantallen bussen voor maximale winst...")
 
             rot10 = []
             all_profit_info = []
 
-            # Group trips by date and bus type (same as other outputs)
-            from collections import defaultdict
-            groups_by_date_type = defaultdict(list)
-            for t in all_trips:
-                groups_by_date_type[(t.date_str, t.bus_type)].append(t)
-
             # Handle trip_overrides if not available
             trip_overrides_v10 = trip_overrides if 'trip_overrides' in dir() else None
 
-            for (date_str, bus_type), group_trips in groups_by_date_type.items():
-                if not group_trips:
-                    continue
+            # Group trips - either by date or multi-day
+            from collections import defaultdict
+            if use_multiday_v10:
+                # Multi-day: group by bus type only, allowing cross-day chaining
+                multiday_groups, _ = _group_trips_multiday(all_trips, baseline_turnaround)
 
-                # Run profit-maximizing optimization
-                # Use configurable max_extra_buses_pct (default 50%)
-                max_extra_pct = getattr(financial_config, 'max_extra_buses_pct', 50)
-                chains, profit_info = _optimize_profit_maximizing(
-                    group_trips, baseline_turnaround,
-                    service_constraint=True,
-                    deadhead_matrix=deadhead_matrix,
-                    trip_turnaround_overrides=trip_overrides_v10,
-                    financial_config=financial_config,
-                    fuel_config=fuel_config,
-                    distance_matrix=deadhead_km_matrix,
-                    max_extra_buses_pct=max_extra_pct,
-                    algorithm=algo_key
-                )
+                for bus_type, group_trips in multiday_groups.items():
+                    if not group_trips:
+                        continue
 
-                if profit_info:
-                    all_profit_info.append({
-                        'date': date_str,
-                        'bus_type': bus_type,
-                        'info': profit_info
-                    })
+                    # Run profit-maximizing optimization with multiday support
+                    max_extra_pct = getattr(financial_config, 'max_extra_buses_pct', 50)
 
-                    # Report findings for this group
-                    if profit_info['best_buses'] != profit_info['min_buses']:
-                        print(f"    [{date_str}/{bus_type}] Optimaal: {profit_info['best_buses']} bussen "
-                              f"(min={profit_info['min_buses']}, winst +{profit_info['best_profit']:,.0f} EUR)")
+                    # For multiday, we use the standard optimizer first, then explore profit variations
+                    # The _optimize_profit_maximizing doesn't directly support multiday yet,
+                    # so we use the regular multiday optimizer and calculate financials
+                    if algo_key == "greedy":
+                        chains = _optimize_greedy(group_trips, baseline_turnaround,
+                                                  service_constraint=False,
+                                                  deadhead_matrix=deadhead_matrix,
+                                                  trip_turnaround_overrides=trip_overrides_v10,
+                                                  multiday=True)
+                    else:
+                        chains = _optimize_mincost(group_trips, baseline_turnaround,
+                                                   service_constraint=False,
+                                                   deadhead_matrix=deadhead_matrix,
+                                                   trip_turnaround_overrides=trip_overrides_v10,
+                                                   multiday=True)
 
-                # Build rotations from chains
-                sorted_trips = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
-                for chain_idx, chain in enumerate(chains):
-                    chain_trips = [sorted_trips[i] for i in chain]
-                    rot = BusRotation(
-                        bus_id=f"v10_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
-                        bus_type=chain_trips[0].bus_type,
-                        date_str=chain_trips[0].date_str,
-                        trips=chain_trips
+                    # Build rotations from chains
+                    for chain_idx, chain in enumerate(chains):
+                        chain_trips = [group_trips[i] for i in chain]
+                        dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
+                        date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
+                        rot = BusRotation(
+                            bus_id=f"v10_{bus_type[:2]}_{date_label}_{chain_idx+1:03d}",
+                            bus_type=chain_trips[0].bus_type,
+                            date_str=chain_trips[0].date_str,
+                            trips=chain_trips
+                        )
+                        # Calculate idle time for multiday rotations
+                        if len(chain_trips) > 1:
+                            total_idle = 0
+                            for i in range(len(chain_trips) - 1):
+                                t1, t2 = chain_trips[i], chain_trips[i+1]
+                                day_offset = _parse_date_to_ordinal(t2.date_str) - _parse_date_to_ordinal(t1.date_str)
+                                gap = (day_offset * 1440) + t2.departure - t1.arrival
+                                if deadhead_matrix:
+                                    dh = deadhead_matrix.get(normalize_location(t1.dest_code), {}).get(
+                                        normalize_location(t2.origin_code), 0)
+                                    gap = max(0, gap - dh)
+                                total_idle += max(0, gap)
+                            rot.total_idle_minutes = int(total_idle)
+                        rot10.append(rot)
+
+                    print(f"    [{bus_type}] {len(chains)} bussen (meerdaags)")
+            else:
+                # Single-day: group by date and bus type
+                groups_by_date_type = defaultdict(list)
+                for t in all_trips:
+                    groups_by_date_type[(t.date_str, t.bus_type)].append(t)
+
+                for (date_str, bus_type), group_trips in groups_by_date_type.items():
+                    if not group_trips:
+                        continue
+
+                    # Run profit-maximizing optimization
+                    max_extra_pct = getattr(financial_config, 'max_extra_buses_pct', 50)
+                    chains, profit_info = _optimize_profit_maximizing(
+                        group_trips, baseline_turnaround,
+                        service_constraint=True,
+                        deadhead_matrix=deadhead_matrix,
+                        trip_turnaround_overrides=trip_overrides_v10,
+                        financial_config=financial_config,
+                        fuel_config=fuel_config,
+                        distance_matrix=deadhead_km_matrix,
+                        max_extra_buses_pct=max_extra_pct,
+                        algorithm=algo_key
                     )
-                    rot10.append(rot)
+
+                    if profit_info:
+                        all_profit_info.append({
+                            'date': date_str,
+                            'bus_type': bus_type,
+                            'info': profit_info
+                        })
+
+                        # Report findings for this group
+                        if profit_info['best_buses'] != profit_info['min_buses']:
+                            print(f"    [{date_str}/{bus_type}] Optimaal: {profit_info['best_buses']} bussen "
+                                  f"(min={profit_info['min_buses']}, winst +{profit_info['best_profit']:,.0f} EUR)")
+
+                    # Build rotations from chains
+                    sorted_trips = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
+                    for chain_idx, chain in enumerate(chains):
+                        chain_trips = [sorted_trips[i] for i in chain]
+                        rot = BusRotation(
+                            bus_id=f"v10_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
+                            bus_type=chain_trips[0].bus_type,
+                            date_str=chain_trips[0].date_str,
+                            trips=chain_trips
+                        )
+                        rot10.append(rot)
 
             # Note: Version 10 doesn't include phantom reserve trips in optimization
             # Reserves are handled separately in output generation
