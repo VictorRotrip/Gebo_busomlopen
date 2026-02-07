@@ -230,41 +230,67 @@ Version 6 now integrates energy constraints directly into the optimization algor
 
 ---
 
-### Version 7: Financial Analysis Overlay (`7_financieel_analyse`)
+### Version 7: Financial Analysis Overlay (`7_financieel_analyse`) ✅ DONE
 **Goal**: Calculate full financial picture on the roster (INTERNAL)
 
-- Input: version 5/6 roster + `financieel_input.xlsx`
-- Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost
-- Output: new Excel sheets "Financieel Overzicht", "CAO Kosten", "Duurzaamheid"
+- Input: version 5/6 roster + `additional_inputs.xlsx`
+- Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel
+- Output: new Excel sheet "Financieel Overzicht" with per-rotation breakdown
 - No re-optimization; purely analytical overlay
 - **Same roster as version 5/6** — just adds financial calculations
 - Helps understand: "How much profit do we actually make on this roster?"
 
----
-
-### Version 8: Cost-Optimized Chaining (`8_kosten_geoptimaliseerd`)
-**Goal**: Re-optimize with euro-based cost function (INTERNAL)
-
-- **Primary objective unchanged**: still minimizes number of buses
-- **Secondary objective**: among all chainings that achieve minimum buses, pick the most profitable
-- New edge cost: `driver_cost_delta + fuel_cost(deadhead) - sustainability_bonus`
-- Minimize ORT exposure: prefer chaining trips that keep shifts within daytime hours
-- Manage overtime: consider break deduction bracket jumps when extending shifts
-- **Bus types remain fixed** as dictated by NS input — only chaining order changes
-- **Note**: If only one bus-optimal chaining exists, result is identical to version 5
+**Implementation (Feb 2026):**
+- Created `financial_calculator.py` module with:
+  - `FinancialConfig` dataclass for all variables
+  - `calculate_rotation_financials()` for per-rotation calculations
+  - `calculate_total_financials()` for aggregated totals
+  - `load_financial_config()` to load from additional_inputs.xlsx
+- CAO logic implemented: pauzestaffel, ORT, overtime, meal allowances
+- Garage travel costs included (configurable distance/time)
+- CLI flag: `--financieel`
 
 ---
 
-### Version 9: Full Profit Optimization (`9_winst_maximalisatie`)
-**Goal**: Maximize actual profit, potentially using different number of buses (INTERNAL)
+### Version 8: Profit Maximization (`8_winstmaximalisatie`) ✅ DONE
+**Goal**: True profit maximization, potentially using different number of buses (INTERNAL)
+
+**Original plan was cost-optimized chaining (same buses, different chaining). Updated to TRUE profit maximization:**
 
 - Does NOT force minimum buses as primary objective
-- Instead: directly minimizes total operational cost
+- Instead: explores different bus counts to find maximum profit
 - May use MORE buses if that reduces driver costs (ORT, overtime, break brackets)
-- May use FEWER buses if fixed costs dominate
-- Includes fuel type assignment (ZE/HVO/diesel) as part of optimization
-- Complete profit calculation: revenue − all costs − penalties + all bonuses
-- **This might produce a DIFFERENT roster than version 5**
+- Garage travel costs now included in trade-off analysis
+- Complete profit calculation: revenue − driver costs − fuel costs − garage costs + bonuses
+
+**Implementation (Feb 2026):**
+- Added `_optimize_profit_maximizing()` algorithm in busomloop_optimizer.py
+- Algorithm:
+  1. Find minimum buses via min-cost max-matching (baseline)
+  2. Try up to +30% more buses by splitting chains
+  3. For each configuration, calculate full profit using financial_calculator
+  4. Return configuration with maximum profit
+- Added garage config to FinancialConfig: `garage_reistijd_enkel_min`, `garage_afstand_enkel_km`
+- CLI flag: `--kosten-optimalisatie`
+
+**Results on test data:**
+```
+Version 7: 180 buses → €17,631 profit (minimum buses)
+Version 8: 230 buses → €24,940 profit (+41% improvement!)
+```
+
+The 50 extra buses cost more in garage travel but save MORE in driver costs (less ORT, overtime, shorter shifts).
+
+---
+
+### Version 9: Full Profit Optimization with Fuel Type Assignment (PLANNED)
+**Goal**: Add fuel type assignment (ZE/HVO/diesel) as optimization variable
+
+- All of Version 8 capabilities
+- Plus: automatically assign ZE/HVO/diesel to maximize profit
+- Consider ZE bonus (€0.12/km) and HVO incentive (up to €0.40/L)
+- Balance sustainability bonuses vs charging/fueling constraints
+- May require different bus counts for different fuel strategies
 
 ---
 
@@ -543,43 +569,55 @@ New sheets per financial version:
    - Tested with Bijlage J casus — all rotations within diesel range ✓
    - ZE analysis: 40-43/135 touringcars ZE-feasible, 5 assigned ✓
 
-4. **Step 3:** Create `financial_calculator.py` for versions 7-9 ← NEXT
-5. **Step 4:** Implement Version 7 — Financial Analysis (internal)
-6. **Step 5:** Implement Version 8 — Cost-Optimized Chaining (internal)
-7. **Step 6:** Implement Version 9 — Full Profit Optimization (internal)
+4. ✅ **Step 3:** Create `financial_calculator.py` (DONE)
+   - FinancialConfig dataclass with all CAO variables ✓
+   - CAO logic: pauzestaffel, ORT, overtime, meal allowances ✓
+   - Garage travel costs (configurable distance/time) ✓
+   - Load config from additional_inputs.xlsx ✓
+
+5. ✅ **Step 4:** Implement Version 7 — Financial Analysis (DONE)
+   - Per-rotation financial breakdown ✓
+   - Aggregated totals ✓
+   - Financieel Overzicht Excel sheet ✓
+   - CLI flag: `--financieel` ✓
+
+6. ✅ **Step 5:** Implement Version 8 — Profit Maximization (DONE)
+   - `_optimize_profit_maximizing()` algorithm ✓
+   - Explores different bus counts ✓
+   - Balances driver costs vs garage costs ✓
+   - CLI flag: `--kosten-optimalisatie` ✓
+   - Test result: +41% profit improvement ✓
+
+7. **Step 6:** Implement Version 9 — Fuel Type Assignment ← NEXT
 
 ---
 
-### Current Implementation Focus: Version 7 — Financial Calculator
+### Current Implementation Status (Feb 2026)
 
-Version 6 (fuel/charging constraints) is now complete. The next step is creating
-`financial_calculator.py` for internal financial analysis (versions 7-9).
+Versions 7 and 8 are now complete. The `financial_calculator.py` module provides:
 
 ```python
-# Core functions needed:
+# Implemented functions:
 load_financial_config(xlsx_path) → FinancialConfig
-calculate_revenue(rotation, config) → float
-calculate_driver_cost(rotation, config) → DriverCostBreakdown
-calculate_fuel_cost(rotation, fuel_type, config) → float
-calculate_sustainability(rotations, config) → SustainabilityReport
+calculate_rotation_financials(rotation, config, fuel_type) → RotationFinancials
+calculate_total_financials(rotations, config, fuel_type) → Dict
+write_financial_sheet(workbook, financials)  # Excel output
 ```
 
-**Key CAO logic to implement:**
-- Break deduction brackets (Pauzestaffel)
-- ORT time-window overlap calculation
-- Overtime detection and surcharges
-- Meal allowances for long shifts
+**CAO logic implemented:**
+- Break deduction brackets (Pauzestaffel) ✓
+- ORT time-window overlap calculation ✓
+- Overtime detection and surcharges ✓
+- Meal allowances for long shifts ✓
+- Garage travel costs ✓
 
 ---
 
-### Versions 8 & 9: Internal Optimization
+### Next Steps: Version 9
 
-**Version 8 (Cost-Optimized Chaining):**
-- Change secondary cost function from `deadhead×2 + idle` to euro-based
-- Challenge: edge costs depend on accumulated chain state
-- Options: approximate, iterative, or exact algorithm
-
-**Version 9 (Full Profit Optimization):**
-- Remove "minimize buses" as primary constraint
-- Directly minimize total operational cost
-- May produce different roster than version 5
+**Version 9 (Fuel Type Assignment):**
+- Build on Version 8 profit maximization
+- Add ZE/HVO/diesel assignment as optimization variable
+- Consider ZE bonus (€0.12/km) and HVO incentive (up to €0.40/L)
+- Balance sustainability bonuses vs charging constraints
+- May require coordination with fuel station availability

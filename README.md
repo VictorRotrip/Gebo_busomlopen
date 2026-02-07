@@ -110,6 +110,34 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Calculates actual driving times to fuel/charging stations via Google Maps
 - **Benefit:** Realistic fuel logistics planning, ZE feasibility assessment
 
+### Version 7: Financial Analysis (NEW)
+**File:** `*_7_financieel_overzicht.xlsx`
+
+- Adds **complete financial calculations** to the roster
+- Per rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel cost
+- Includes ORT surcharges (unsocial hours), pauzestaffel (break deductions), overtime calculations
+- Requires `--financieel` flag and `additional_inputs.xlsx` with financial config
+- **Benefit:** Full profit/loss visibility per bus rotation
+
+### Version 8: Profit Maximization (NEW)
+**File:** `*_8_winstmaximalisatie.xlsx`
+
+- **True profit maximization** — explores different bus counts to find maximum profit
+- Instead of minimizing buses, balances trade-offs between:
+  - More buses = shorter shifts = less ORT, overtime, break deductions
+  - More buses = more garage travel costs
+- Uses all financial variables from `additional_inputs.xlsx`
+- Requires `--kosten-optimalisatie` flag (implies `--financieel`)
+- **Benefit:** May find that using more buses increases profit significantly
+
+**Example result:**
+```
+Version 7: 180 buses → €17,631 profit
+Version 8: 230 buses → €24,940 profit (+41% improvement)
+```
+
+See [Input Variables Impact on Version 8](#input-variables-impact-on-version-8) for how each variable affects the optimization.
+
 ## Algorithms
 
 Two optimization algorithms are available (`--algoritme greedy|mincost|all`):
@@ -278,16 +306,17 @@ When using `--gmaps`, each fuel/charging station includes:
 - `drive_distance_km`: actual driving distance
 - These are used for accurate refuel/charge feasibility calculations
 
-## Future Versions (7-9)
-
-Version 6 (fuel/charging constraints) is implemented. See `PLAN_FINANCIAL_OPTIMIZATION.md` for planned financial optimization:
+## Version Status
 
 | Version | Status | Description |
 |---------|--------|-------------|
-| 6 | ✅ DONE | Fuel/charging constraints, ZE feasibility, Google Maps integration |
-| 7 | Planned | Financial analysis overlay (revenue, costs, profit calculation) |
-| 8 | Planned | Euro-based cost optimization (driver costs, fuel costs, ORT surcharges) |
-| 9 | Planned | Full profit optimization (may use different bus count for profit) |
+| 1-5 | ✅ DONE | Bus minimization, reserves, deadhead, risk analysis |
+| 6 | ✅ DONE | Fuel/charging constraints, ZE feasibility |
+| 7 | ✅ DONE | Financial analysis overlay (revenue, costs, profit) |
+| 8 | ✅ DONE | Profit maximization (explores different bus counts) |
+| 9 | Planned | Full profit optimization with fuel type assignment |
+
+See `PLAN_FINANCIAL_OPTIMIZATION.md` for detailed implementation notes.
 
 ## Command Line Reference
 
@@ -295,7 +324,8 @@ Version 6 (fuel/charging constraints) is implemented. See `PLAN_FINANCIAL_OPTIMI
 usage: busomloop_optimizer.py [-h] [--output OUTPUT] [--algoritme {greedy,mincost,all}]
                                [--deadhead DEADHEAD] [--traffic-matrix TRAFFIC]
                                [--tanklocaties JSON] [--inputs XLSX]
-                               [--ze] [--fuel-constraints] [--snel]
+                               [--ze] [--fuel-constraints] [--financieel]
+                               [--kosten-optimalisatie] [--snel]
                                [--keer-dd MIN] [--keer-tc MIN] [--keer-lvb MIN]
                                [--keer-midi MIN] [--keer-taxi MIN]
                                invoer.xlsx
@@ -313,6 +343,8 @@ Options:
   --inputs XLSX            additional_inputs.xlsx with financial/operational config
   --ze                     Enable ZE (Zero Emission) feasibility analysis
   --fuel-constraints       Enable diesel fuel range validation
+  --financieel             Generate Version 7: Financial analysis overlay
+  --kosten-optimalisatie   Generate Version 8: Profit maximization
   --snel                   Fast mode: skip non-greedy for versions 1-4
   --keer-dd MIN            Turnaround time Dubbeldekker (default: 8)
   --keer-tc MIN            Turnaround time Touringcar (default: 6)
@@ -373,6 +405,136 @@ python busomloop_optimizer.py Bijlage_J.xlsx \
               │  - Assign ZE buses with charging strategy         │
               └───────────────────────────────────────────────────┘
 ```
+
+## Input Variables Impact on Version 8
+
+Version 8 uses all financial variables from `additional_inputs.xlsx` to calculate profit. Here's how each variable impacts the optimization:
+
+### Revenue Variables (Sheet: Tarieven)
+
+| Variable | Default | Impact on Optimization |
+|----------|---------|------------------------|
+| `tarief_dubbeldekker_eur_h` | €116.37 | Higher rate → more revenue per driving hour. Fixed by NS contract. |
+| `tarief_touringcar_eur_h` | €80.455 | Revenue for Touringcar rotations. |
+| `tarief_lagevloerbus_eur_h` | €80.445 | Revenue for Lagevloerbus rotations. |
+| `tarief_midibus_eur_h` | €74.85 | Revenue for Midi bus rotations. |
+| `tarief_taxibus_eur_h` | €50.455 | Revenue for Taxibus rotations. |
+
+**Revenue formula:** `driving_hours × hourly_rate` (only paid for active driving, not idle time)
+
+### Driver Cost Variables (Sheet: Chauffeurkosten)
+
+| Variable | Default | Impact on Optimization |
+|----------|---------|------------------------|
+| `base_uurloon_eur` | €22.00 | Base driver wage. Higher → optimizer prefers shorter shifts to reduce total paid hours. |
+| `vakantietoeslag_pct` | 8% | Holiday allowance added on top. Increases all driver costs by 8%. |
+
+**ORT Surcharges (Onregelmatigheidstoeslag):**
+
+| Variable | Default | Hours | Impact |
+|----------|---------|-------|--------|
+| `ort_percentage_evening` | 31% | 19:00-24:00 | Shifts extending into evening cost +31% per hour. Optimizer may split shifts to avoid evening work. |
+| `ort_percentage_night` | 40% | 00:00-06:00 | Night work is most expensive. Strong incentive to avoid night shifts. |
+| `ort_percentage_early` | 22.5% | 06:00-07:30 | Early morning surcharge. |
+| `ort_percentage_saturday` | 45% | All Saturday | Weekend work costly. |
+| `ort_percentage_sunday` | 70% | All Sunday | Sunday most expensive day. |
+
+**Pauzestaffel (Break Deductions):**
+
+| Shift Length | Unpaid Break | Variable | Impact |
+|--------------|--------------|----------|--------|
+| ≤4.5 hours | 0 min | `pauze_staffel_1_uur` | Short shifts = no break deduction = lower cost/hour. |
+| ≤7.5 hours | 30 min | `pauze_staffel_2_uur` | |
+| ≤10.5 hours | 60 min | `pauze_staffel_3_uur` | |
+| ≤13.5 hours | 90 min | `pauze_staffel_4_uur` | Longer shifts have proportionally MORE unpaid time. |
+| ≤16.5 hours | 120 min | `pauze_staffel_5_uur` | Optimizer may use more buses to avoid long shifts. |
+| >16.5 hours | 150 min | `pauze_staffel_6_uur` | |
+
+**Overtime (Meeruren):**
+
+| Variable | Default | Impact |
+|----------|---------|--------|
+| `overwerk_toeslag_rijdend_pct` | 35% | Overtime during driving = +35%. Very expensive. |
+| `overwerk_drempel_maand_uur` | 173.33 | Monthly threshold. Shifts pushing total over this trigger overtime. |
+
+**Meal Allowances:**
+
+| Variable | Default | Impact |
+|----------|---------|--------|
+| `maaltijd_threshold_1_uren` | 11 | Shifts ≥11h get €22.50 meal allowance. |
+| `maaltijd_threshold_2_uren` | 14 | Shifts ≥14h get €36.72. |
+
+### Garage/Remise Travel (Sheet: Chauffeurkosten)
+
+| Variable | Default | Impact on Optimization |
+|----------|---------|------------------------|
+| `garage_reistijd_enkel_min` | 60 min | One-way travel time from depot to first station. Longer → more paid driver time per bus. |
+| `garage_afstand_enkel_km` | 50 km | One-way distance. Higher → more fuel cost per bus. |
+| `garage_include_in_shift` | Yes (1) | If yes, garage travel counts as paid shift time. |
+
+**Key trade-off:** Each bus makes a round trip (depot → first station → last station → depot).
+- 180 buses × 100 km round trip = 18,000 km garage travel
+- 230 buses × 100 km round trip = 23,000 km garage travel (+5,000 km)
+- But 230 buses may have shorter shifts → less ORT/overtime → higher profit!
+
+### Fuel Cost Variables (Sheet: Buskosten + Brandstofprijzen)
+
+| Variable | Default | Impact on Optimization |
+|----------|---------|------------------------|
+| `verbruik_touringcar_diesel_l_per_100km` | 32 L | Fuel consumption per bus type. Higher → more fuel cost per km. |
+| `verbruik_dubbeldekker_diesel_l_per_100km` | 45 L | Dubbeldekkers use more fuel. |
+| `diesel_prijs_eur_l` | ~€1.65 | Diesel price (auto-updated by fetch_fuel_charging_prices.py). |
+
+**Fuel cost formula:** `(driving_km + deadhead_km + garage_km) × consumption × price`
+
+### Sustainability Bonuses (Sheet: Duurzaamheid)
+
+| Variable | Default | Impact |
+|----------|---------|--------|
+| `ze_bonus_per_km` | €0.12 | ZE buses earn bonus per km driven. Reduces effective fuel cost. |
+| `hvo_bonus_per_liter` | €0.05 | HVO100 stimulans bonus. |
+| `hvo_max_total_per_liter` | €0.40 | Max HVO incentive (price diff capped at €0.35 + €0.05). |
+
+### How Version 8 Uses These Variables
+
+The profit-maximizing algorithm:
+
+1. **Calculates fixed revenue** — same for all bus configurations (all trips must be covered)
+2. **Explores different bus counts** — from minimum feasible up to +30%
+3. **For each bus count**, calculates total cost:
+   - Driver costs (base + ORT + pauzestaffel + overtime + meals)
+   - Fuel costs (trips + deadhead + garage travel)
+   - Sustainability bonuses (reduces net cost)
+4. **Picks the bus count with maximum profit**
+
+**Why more buses can mean more profit:**
+
+| Factor | Fewer Buses | More Buses |
+|--------|-------------|------------|
+| Shift length | Longer (more trips/bus) | Shorter |
+| ORT exposure | Higher (shifts into evening) | Lower |
+| Pauzestaffel | Higher bracket (more unpaid time) | Lower bracket |
+| Overtime risk | Higher | Lower |
+| Garage travel | Less total km | More total km |
+| Fuel cost | Less garage fuel | More garage fuel |
+
+The optimizer finds the sweet spot where driver cost savings exceed extra garage costs.
+
+### Excel Output: Financieel Overzicht Sheet
+
+Version 8 output includes a "Financieel Overzicht" sheet showing:
+
+| Column | Description |
+|--------|-------------|
+| Bus ID | Rotation identifier |
+| Driving Hours | Revenue-earning hours |
+| Shift Hours | Total paid hours (incl. idle, garage travel) |
+| Revenue | Driving hours × hourly rate |
+| Driver Cost | Base + ORT + break surcharge |
+| Fuel Cost | Trip km × consumption × price |
+| Garage Fuel | Round-trip garage travel fuel cost |
+| Gross Profit | Revenue - Driver Cost - Fuel Cost |
+| Net Profit | Gross Profit + ZE/HVO bonuses |
 
 ## License
 
