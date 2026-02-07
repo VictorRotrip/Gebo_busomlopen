@@ -1616,11 +1616,17 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                            deadhead_matrix: dict = None,
                            deadhead_km_matrix: dict = None,
                            turnaround_map: dict = None) -> tuple:
-    """Apply fuel constraints to rotations with smart reassignment.
+    """Apply fuel constraints to rotations with iterative re-optimization.
 
-    Instead of just splitting rotations when fuel constraints are violated,
-    this function tries to reassign orphan trips to other rotations that
-    have fuel headroom and compatible timing.
+    When fuel constraints cause splits, the remaining trips are re-optimized
+    using mincost algorithm instead of just being assigned greedily.
+
+    Algorithm:
+    1. Validate all rotations for fuel feasibility
+    2. Keep feasible rotations and trips up to first split point
+    3. Collect remaining trips after split points
+    4. Re-run mincost on remaining trips
+    5. Repeat until no more splits needed
 
     Args:
         rotations: List of bus rotations
@@ -1631,168 +1637,129 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         turnaround_map: Optional {bus_type: min_turnaround_minutes}
 
     Returns: (new_rotations, validation_results, split_count)
-    - new_rotations: list of rotations after applying constraints
-    - validation_results: {rotation_id: FuelValidationResult}
-    - split_count: number of original chains that had fuel issues
     """
     if turnaround_map is None:
         turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
 
-    # Phase 1: Validate all rotations and collect orphans
-    feasible_rotations = []
-    orphan_trips = []  # Trips that need reassignment
+    all_feasible_rotations = []
     validation_results = {}
-    split_count = 0
+    total_split_count = 0
+    iteration = 0
+    max_iterations = 10  # Safety limit
 
-    for rotation in rotations:
-        result = validate_fuel_feasibility(
-            rotation, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
-        )
-        validation_results[rotation.bus_id] = result
+    # Current rotations to process
+    current_rotations = list(rotations)
 
-        if result.is_feasible:
-            feasible_rotations.append(rotation)
-        else:
-            split_count += 1
-            trips = rotation.trips
-            split_indices = [0] + result.split_points + [len(trips)]
+    while current_rotations and iteration < max_iterations:
+        iteration += 1
+        remaining_trips = []  # Trips that need re-optimization
 
-            # First segment stays as a rotation
-            first_segment = trips[split_indices[0]:split_indices[1]]
-            if first_segment:
-                new_rot = BusRotation(
-                    bus_id=f"{rotation.bus_id}_a",
-                    bus_type=rotation.bus_type,
-                    date_str=rotation.date_str,
-                    trips=first_segment,
-                )
-                feasible_rotations.append(new_rot)
+        for rotation in current_rotations:
+            result = validate_fuel_feasibility(
+                rotation, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+            )
+            validation_results[rotation.bus_id] = result
 
-            # Remaining segments become orphans for reassignment
-            for j in range(1, len(split_indices) - 1):
-                start_idx = split_indices[j]
-                end_idx = split_indices[j + 1]
-                for trip in trips[start_idx:end_idx]:
-                    orphan_trips.append(trip)
+            if result.is_feasible:
+                # No splits needed, keep rotation as-is
+                all_feasible_rotations.append(rotation)
+            else:
+                # Need to split
+                total_split_count += 1
+                trips = rotation.trips
+                first_split = result.split_points[0] if result.split_points else len(trips)
 
-    # Phase 2: Try to reassign orphan trips to existing rotations
-    reassigned = set()
+                # Keep trips before first split as a rotation
+                first_segment = trips[:first_split]
+                if first_segment:
+                    new_rot = BusRotation(
+                        bus_id=f"{rotation.bus_id}_s{iteration}",
+                        bus_type=rotation.bus_type,
+                        date_str=rotation.date_str,
+                        trips=list(first_segment),
+                    )
+                    all_feasible_rotations.append(new_rot)
 
-    for orphan in orphan_trips:
-        best_rotation = None
-        best_gap = float('inf')
-        best_pos = None
-        best_refuel_info = None
+                # Collect remaining trips for re-optimization
+                remaining_segment = trips[first_split:]
+                remaining_trips.extend(remaining_segment)
 
-        for rot in feasible_rotations:
-            # Must be same bus type
-            if rot.bus_type != orphan.bus_type:
+        if not remaining_trips:
+            break  # All rotations are feasible
+
+        # Re-optimize remaining trips using mincost
+        # Group by date and bus type
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for trip in remaining_trips:
+            key = (trip.date_str, trip.bus_type)
+            groups[key].append(trip)
+
+        # Run mincost on each group and convert to rotations
+        new_rotations = []
+        for (date_str, bus_type), group_trips in groups.items():
+            if not group_trips:
                 continue
 
-            # Try inserting at end
-            if rot.trips:
-                last_trip = rot.trips[-1]
-                # Check timing: can we connect?
-                ok, dh_time = can_connect(last_trip, orphan, turnaround_map,
-                                          service_constraint=False,
-                                          deadhead_matrix=deadhead_matrix)
-                if ok:
-                    # Check fuel feasibility
-                    can_insert, needs_refuel, refuel_info = _can_insert_trip_with_fuel(
-                        rot, orphan, "end", fuel_config, fuel_stations,
-                        deadhead_matrix, deadhead_km_matrix
-                    )
-                    if can_insert:
-                        gap = orphan.departure - last_trip.arrival
-                        if gap < best_gap:
-                            best_gap = gap
-                            best_rotation = rot
-                            best_pos = "end"
-                            best_refuel_info = refuel_info if needs_refuel else None
-
-            # Try inserting at start
-            if rot.trips:
-                first_trip = rot.trips[0]
-                # Check timing: can orphan connect to first trip?
-                ok, dh_time = can_connect(orphan, first_trip, turnaround_map,
-                                          service_constraint=False,
-                                          deadhead_matrix=deadhead_matrix)
-                if ok:
-                    # Check fuel (inserting at start is trickier for fuel tracking)
-                    # For simplicity, only allow if total km still fits
-                    can_insert, needs_refuel, refuel_info = _can_insert_trip_with_fuel(
-                        rot, orphan, "start", fuel_config, fuel_stations,
-                        deadhead_matrix, deadhead_km_matrix
-                    )
-                    if can_insert and not needs_refuel:  # No refuel for start insert
-                        gap = first_trip.departure - orphan.arrival
-                        if gap < best_gap:
-                            best_gap = gap
-                            best_rotation = rot
-                            best_pos = "start"
-                            best_refuel_info = None
-
-        if best_rotation is not None:
-            # Reassign the orphan to this rotation
-            if best_pos == "end":
-                best_rotation.trips.append(orphan)
-            else:
-                best_rotation.trips.insert(0, orphan)
-            reassigned.add(id(orphan))
-
-    # Phase 3: Create new rotations for unassigned orphans
-    unassigned = [t for t in orphan_trips if id(t) not in reassigned]
-    rotation_counter = len(rotations) + len(feasible_rotations)
-
-    # Group unassigned by date and bus type, then chain them
-    from collections import defaultdict
-    unassigned_groups = defaultdict(list)
-    for trip in unassigned:
-        key = (trip.date_str, trip.bus_type)
-        unassigned_groups[key].append(trip)
-
-    for (date_str, bus_type), trips in unassigned_groups.items():
-        # Sort by departure time
-        trips.sort(key=lambda t: (t.departure, t.arrival))
-
-        # Simple greedy chaining for unassigned trips
-        chains = []
-        for trip in trips:
-            placed = False
-            for chain in chains:
-                last_trip = chain[-1]
-                ok, _ = can_connect(last_trip, trip, turnaround_map,
-                                    service_constraint=False,
-                                    deadhead_matrix=deadhead_matrix)
-                if ok:
-                    # Check fuel for this chain
-                    temp_rot = BusRotation(
-                        bus_id="temp", bus_type=bus_type, date_str=date_str, trips=chain
-                    )
-                    can_add, _, _ = _can_insert_trip_with_fuel(
-                        temp_rot, trip, "end", fuel_config, fuel_stations,
-                        deadhead_matrix, deadhead_km_matrix
-                    )
-                    if can_add:
-                        chain.append(trip)
-                        placed = True
-                        break
-            if not placed:
-                chains.append([trip])
-
-        # Convert chains to rotations
-        for chain in chains:
-            rotation_counter += 1
-            new_rot = BusRotation(
-                bus_id=f"{date_str}_{bus_type[:2]}_fuel_{rotation_counter:03d}",
-                bus_type=bus_type,
-                date_str=date_str,
-                trips=chain,
+            # Use mincost to re-optimize these trips
+            chains = _optimize_mincost(
+                group_trips, turnaround_map,
+                service_constraint=False,
+                deadhead_matrix=deadhead_matrix,
+                trip_turnaround_overrides=None
             )
-            feasible_rotations.append(new_rot)
+
+            # Convert chains to rotations
+            sorted_trips = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
+            for chain_idx, chain in enumerate(chains):
+                chain_trips = [sorted_trips[i] for i in chain]
+                rot = BusRotation(
+                    bus_id=f"fuel_i{iteration}_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
+                    bus_type=bus_type,
+                    date_str=date_str,
+                    trips=chain_trips,
+                )
+                new_rotations.append(rot)
+
+        if iteration > 1:
+            print(f"    Fuel re-optimization iteration {iteration}: "
+                  f"{len(remaining_trips)} trips → {len(new_rotations)} buses")
+
+        # These new rotations become the input for next iteration
+        current_rotations = new_rotations
+
+    # Add any remaining rotations from final iteration
+    for rot in current_rotations:
+        result = validate_fuel_feasibility(
+            rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+        )
+        if result.is_feasible:
+            all_feasible_rotations.append(rot)
+        else:
+            # Still infeasible - split and keep what we can
+            trips = rot.trips
+            first_split = result.split_points[0] if result.split_points else len(trips)
+            if first_split > 0:
+                new_rot = BusRotation(
+                    bus_id=f"{rot.bus_id}_final",
+                    bus_type=rot.bus_type,
+                    date_str=rot.date_str,
+                    trips=list(trips[:first_split]),
+                )
+                all_feasible_rotations.append(new_rot)
+            # Remaining trips become single-trip rotations
+            for i, trip in enumerate(trips[first_split:]):
+                single_rot = BusRotation(
+                    bus_id=f"{rot.bus_id}_single_{i+1}",
+                    bus_type=rot.bus_type,
+                    date_str=rot.date_str,
+                    trips=[trip],
+                )
+                all_feasible_rotations.append(single_rot)
+            print(f"    Warning: rotation {rot.bus_id} still infeasible after {iteration} iterations, created single-trip buses")
 
     # Recalculate idle times for all rotations
-    for rot in feasible_rotations:
+    for rot in all_feasible_rotations:
         if len(rot.trips) > 1:
             total_idle = 0
             for i in range(len(rot.trips) - 1):
@@ -1805,14 +1772,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                 total_idle += max(0, gap)
             rot.total_idle_minutes = total_idle
 
-    # Report reassignment stats
-    n_reassigned = len(reassigned)
-    n_new_buses = len([r for r in feasible_rotations if "_fuel_" in r.bus_id])
-    if n_reassigned > 0 or n_new_buses > 0:
-        print(f"    Fuel reassignment: {n_reassigned} trips reassigned, "
-              f"{n_new_buses} new buses for remaining {len(unassigned)} trips")
-
-    return feasible_rotations, validation_results, split_count
+    return all_feasible_rotations, validation_results, total_split_count
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
