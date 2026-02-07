@@ -2216,15 +2216,110 @@ def _matching_to_chains(n, match_l):
 
 
 # ---------------------------------------------------------------------------
+# Euro-based edge cost calculation for Version 8
+# ---------------------------------------------------------------------------
+
+def calculate_euro_edge_cost(trip_i, trip_j, deadhead_min: int, deadhead_km: float,
+                              financial_config, fuel_config: dict) -> float:
+    """
+    Calculate euro-based cost for connecting trip_i to trip_j.
+
+    This is used in Version 8 cost-optimized chaining to prefer connections
+    that minimize actual operational costs rather than just time.
+
+    Cost components:
+    1. Driver idle cost: paid time with no revenue
+    2. Deadhead fuel cost: fuel burned driving empty
+    3. ORT penalty: extra cost if connection time falls in unsocial hours
+
+    Args:
+        trip_i: First trip (ending)
+        trip_j: Second trip (starting)
+        deadhead_min: Deadhead driving time in minutes
+        deadhead_km: Deadhead distance in km (from matrix)
+        financial_config: FinancialConfig object with rates
+        fuel_config: Dict with fuel consumption and prices
+
+    Returns:
+        Cost in euros (lower is better)
+    """
+    cost = 0.0
+
+    # 1. Idle time cost (driver paid but no revenue)
+    idle_minutes = trip_j.departure - trip_i.arrival
+    driver_hourly_rate = getattr(financial_config, 'base_hourly_wage', 22.0)  # Default €22/hour
+    idle_cost = (idle_minutes / 60.0) * driver_hourly_rate
+    cost += idle_cost
+
+    # 2. Deadhead fuel cost
+    if deadhead_km > 0:
+        # Get bus type consumption (L/100km for diesel)
+        bus_type = trip_i.bus_type
+        consumption_map = fuel_config.get('consumption', {})
+        consumption_per_100km = consumption_map.get(bus_type, 30)  # Default 30 L/100km
+        consumption_per_km = consumption_per_100km / 100.0
+
+        # Fuel price
+        fuel_price = fuel_config.get('diesel_price', 1.70)  # Default €1.70/L
+
+        deadhead_fuel_cost = deadhead_km * consumption_per_km * fuel_price
+        cost += deadhead_fuel_cost
+
+    # 3. ORT penalty estimate (for idle/deadhead in unsocial hours)
+    # ORT windows: weekdays 19:00-07:30, all Saturday, all Sunday
+    # We check if the connection time (arrival to departure) overlaps ORT windows
+
+    # Get connection time window
+    connection_start = trip_i.arrival  # Minutes from midnight
+    connection_end = trip_j.departure
+
+    # Check for evening ORT (19:00 = 1140 min, 07:30 = 450 min next day)
+    evening_start = 19 * 60  # 1140
+    morning_end = 7 * 60 + 30  # 450
+
+    ort_minutes = 0
+
+    # Simplified ORT check (weekday evening 19:00-24:00)
+    if connection_start < 24 * 60:  # Same day
+        if connection_end > evening_start:
+            # Some time in evening ORT window
+            ort_start = max(connection_start, evening_start)
+            ort_end = min(connection_end, 24 * 60)
+            ort_minutes += max(0, ort_end - ort_start)
+
+        # Early morning (00:00-07:30)
+        if connection_start < morning_end:
+            ort_start = max(connection_start, 0)
+            ort_end = min(connection_end, morning_end)
+            ort_minutes += max(0, ort_end - ort_start)
+
+    # ORT surcharge (average €5.50/hour for evening, higher for night)
+    if ort_minutes > 0:
+        ort_hourly_rate = 5.50  # Average ORT surcharge
+        ort_cost = (ort_minutes / 60.0) * ort_hourly_rate
+        cost += ort_cost
+
+    return cost
+
+
+# ---------------------------------------------------------------------------
 # Algorithm 2: Minimum-cost maximum matching (successive shortest path)
 #   Minimizes buses first, then minimizes total idle time.
 # ---------------------------------------------------------------------------
 
 def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
-                      deadhead_matrix=None, trip_turnaround_overrides=None):
+                      deadhead_matrix=None, trip_turnaround_overrides=None,
+                      euro_cost_mode=False, financial_config=None, fuel_config=None,
+                      distance_matrix=None):
     """
     Min-cost max matching via successive shortest path (SPFA).
     Minimizes number of buses (primary) and total deadhead+idle time (secondary).
+
+    Args:
+        euro_cost_mode: If True, use euro-based costs instead of time-based (Version 8)
+        financial_config: FinancialConfig for euro costs (required if euro_cost_mode=True)
+        fuel_config: Fuel config dict for euro costs (required if euro_cost_mode=True)
+        distance_matrix: Dict with distances in km for fuel cost calculation
     """
     from collections import deque
 
@@ -2232,7 +2327,8 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
     n = len(group_trips)
 
     # Build adjacency with costs
-    # Cost = deadhead time (penalizes empty driving) + idle time
+    # Default: Cost = deadhead time (penalizes empty driving) + idle time
+    # Euro mode: Cost = driver idle cost + deadhead fuel cost + ORT penalty
     adj = [[] for _ in range(n)]
     cost_map = {}
     for i in range(n):
@@ -2241,9 +2337,31 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
                                  service_constraint, deadhead_matrix,
                                  trip_turnaround_overrides)
             if ok:
-                idle = group_trips[j].departure - group_trips[i].arrival
-                # Weight deadhead more heavily: it costs fuel and driver time
-                cost = dh * 2 + idle if dh > 0 else idle
+                if euro_cost_mode and financial_config and fuel_config:
+                    # Version 8: Euro-based cost
+                    # Get deadhead km from distance matrix if available
+                    dh_km = 0.0
+                    if distance_matrix and dh > 0:
+                        from_st = group_trips[i].to_station.lower()
+                        to_st = group_trips[j].from_station.lower()
+                        if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
+                            dh_km = distance_matrix[from_st].get(to_st, 0)
+                        elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
+                            dh_km = distance_matrix[to_st].get(from_st, 0)
+
+                    cost = calculate_euro_edge_cost(
+                        group_trips[i], group_trips[j],
+                        deadhead_min=dh,
+                        deadhead_km=dh_km,
+                        financial_config=financial_config,
+                        fuel_config=fuel_config
+                    )
+                else:
+                    # Default: Time-based cost
+                    idle = group_trips[j].departure - group_trips[i].arrival
+                    # Weight deadhead more heavily: it costs fuel and driver time
+                    cost = dh * 2 + idle if dh > 0 else idle
+
                 adj[i].append(j)
                 cost_map[(i, j)] = cost
 
@@ -2326,6 +2444,271 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
         pass
 
     return _matching_to_chains(n, match_l)
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 3: Profit-maximizing optimization (Version 8)
+#   Explores different bus counts to find maximum profit
+# ---------------------------------------------------------------------------
+
+def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=False,
+                                 deadhead_matrix=None, trip_turnaround_overrides=None,
+                                 financial_config=None, fuel_config=None,
+                                 distance_matrix=None, max_extra_buses_pct=30):
+    """
+    Profit-maximizing optimization that explores different bus counts.
+
+    Instead of minimizing buses, this algorithm finds the number of buses
+    that maximizes profit by balancing:
+    - Garage costs (more buses = more garage travel)
+    - ORT costs (fewer buses = longer shifts = more ORT)
+    - Overtime costs (fewer buses = more overtime)
+    - Deadhead costs (depends on chaining)
+
+    Args:
+        group_trips: List of trips to chain
+        turnaround_map: Minimum turnaround times per bus type
+        service_constraint: Whether to enforce same-service connections
+        deadhead_matrix: Optional deadhead time matrix
+        trip_turnaround_overrides: Per-trip turnaround overrides
+        financial_config: FinancialConfig object for profit calculation
+        fuel_config: Fuel config dict
+        distance_matrix: Distances in km for fuel calculations
+        max_extra_buses_pct: Maximum % extra buses to try beyond minimum
+
+    Returns:
+        Tuple of (chains, profit_info) where profit_info contains the analysis
+    """
+    from collections import deque
+
+    if not financial_config:
+        # Fallback to min-cost if no financial config
+        return _optimize_mincost(group_trips, turnaround_map, service_constraint,
+                                 deadhead_matrix, trip_turnaround_overrides), None
+
+    group_trips_sorted = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
+    n = len(group_trips_sorted)
+
+    if n == 0:
+        return [], {'best_buses': 0, 'best_profit': 0, 'explored': []}
+
+    # Build connection graph with euro costs
+    adj = [[] for _ in range(n)]
+    cost_map = {}  # (i, j) -> euro cost of connection
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            ok, dh = can_connect(group_trips_sorted[i], group_trips_sorted[j],
+                                 turnaround_map, service_constraint, deadhead_matrix,
+                                 trip_turnaround_overrides)
+            if ok:
+                # Calculate euro cost for this connection
+                dh_km = 0.0
+                if distance_matrix and dh > 0:
+                    from_st = group_trips_sorted[i].to_station.lower()
+                    to_st = group_trips_sorted[j].from_station.lower()
+                    if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
+                        dh_km = distance_matrix[from_st].get(to_st, 0)
+                    elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
+                        dh_km = distance_matrix[to_st].get(from_st, 0)
+
+                cost = calculate_euro_edge_cost(
+                    group_trips_sorted[i], group_trips_sorted[j],
+                    deadhead_min=dh, deadhead_km=dh_km,
+                    financial_config=financial_config,
+                    fuel_config=fuel_config
+                )
+                adj[i].append(j)
+                cost_map[(i, j)] = cost
+
+    # First find minimum buses solution via max matching
+    match_l = [-1] * n
+    match_r = [-1] * n
+
+    def spfa_augment():
+        """Find minimum-cost augmenting path using SPFA."""
+        dist = [float('inf')] * n
+        prev_l = [-1] * n
+        in_queue = [False] * n
+        queue = deque()
+
+        dist_left = [float('inf')] * n
+        for u in range(n):
+            if match_l[u] == -1:
+                dist_left[u] = 0
+                for v in adj[u]:
+                    c = cost_map[(u, v)]
+                    if c < dist[v]:
+                        dist[v] = c
+                        prev_l[v] = u
+                        if not in_queue[v]:
+                            queue.append(v)
+                            in_queue[v] = True
+
+        while queue:
+            v = queue.popleft()
+            in_queue[v] = False
+
+            w = match_r[v]
+            if w == -1:
+                continue
+
+            new_dist_w = dist[v]
+            if new_dist_w < dist_left[w]:
+                dist_left[w] = new_dist_w
+                for v2 in adj[w]:
+                    c = new_dist_w + cost_map[(w, v2)]
+                    if c < dist[v2]:
+                        dist[v2] = c
+                        prev_l[v2] = w
+                        if not in_queue[v2]:
+                            queue.append(v2)
+                            in_queue[v2] = True
+
+        best_v = -1
+        best_d = float('inf')
+        for v in range(n):
+            if match_r[v] == -1 and dist[v] < best_d:
+                best_d = dist[v]
+                best_v = v
+
+        if best_v == -1:
+            return False
+
+        v = best_v
+        while v != -1:
+            u = prev_l[v]
+            old_v = match_l[u]
+            match_l[u] = v
+            match_r[v] = u
+            v = old_v
+
+        return True
+
+    # Find max matching
+    while spfa_augment():
+        pass
+
+    min_buses_chains = _matching_to_chains(n, match_l)
+    min_buses = len(min_buses_chains)
+
+    # Calculate max buses to try
+    max_extra = max(1, int(min_buses * max_extra_buses_pct / 100))
+    max_buses = min(n, min_buses + max_extra)
+
+    # Helper: Calculate profit for a given chaining
+    def calculate_chain_profit(chains):
+        """Calculate total profit for chains using full financial model."""
+        from financial_calculator import calculate_rotation_financials
+
+        total_revenue = 0.0
+        total_cost = 0.0
+
+        for chain in chains:
+            trips = [group_trips_sorted[i] for i in chain]
+
+            # Build a simple rotation object for financial calculation
+            class SimpleRotation:
+                def __init__(self, trips):
+                    self.trips = trips
+                    self.bus_type = trips[0].bus_type if trips else 'Touringcar'
+                    self.date_str = trips[0].date_str if trips else ''
+                    self.bus_id = 'temp'
+                    self.total_km = None
+                    self.deadhead_km = 0
+
+                    # Calculate deadhead km
+                    for i in range(1, len(trips)):
+                        prev_trip = trips[i-1]
+                        curr_trip = trips[i]
+                        from_st = prev_trip.dest_code.lower() if hasattr(prev_trip, 'dest_code') else ''
+                        to_st = curr_trip.origin_code.lower() if hasattr(curr_trip, 'origin_code') else ''
+                        if from_st and to_st and from_st != to_st:
+                            if distance_matrix:
+                                if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
+                                    self.deadhead_km += distance_matrix[from_st].get(to_st, 0)
+                                elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
+                                    self.deadhead_km += distance_matrix[to_st].get(from_st, 0)
+
+            rot = SimpleRotation(trips)
+            fin = calculate_rotation_financials(rot, financial_config, fuel_type="diesel")
+
+            total_revenue += fin.revenue
+            total_cost += fin.driver_cost.total_cost + fin.fuel_cost + fin.garage_fuel_cost
+
+        return total_revenue - total_cost
+
+    # Explore different bus counts
+    explored = []
+    best_chains = min_buses_chains
+    best_profit = calculate_chain_profit(min_buses_chains)
+    best_buses = min_buses
+
+    explored.append({
+        'buses': min_buses,
+        'profit': best_profit,
+        'chains': min_buses_chains
+    })
+
+    # For more buses, we need to split chains
+    # Strategy: Start from min-cost chains, then greedily split at best points
+
+    for target_buses in range(min_buses + 1, max_buses + 1):
+        # Start from previous solution and split one chain
+        # Find the split that results in highest profit
+
+        current_chains = [list(c) for c in best_chains]  # Copy
+
+        # Try splitting each chain at each possible point
+        best_split_profit = float('-inf')
+        best_split_chains = None
+
+        for chain_idx, chain in enumerate(current_chains):
+            if len(chain) <= 1:
+                continue  # Can't split a single-trip chain
+
+            for split_pos in range(1, len(chain)):
+                # Split chain into two
+                chain1 = chain[:split_pos]
+                chain2 = chain[split_pos:]
+
+                # Create new chain set
+                new_chains = [c for i, c in enumerate(current_chains) if i != chain_idx]
+                new_chains.append(chain1)
+                new_chains.append(chain2)
+
+                # Calculate profit
+                split_profit = calculate_chain_profit(new_chains)
+
+                if split_profit > best_split_profit:
+                    best_split_profit = split_profit
+                    best_split_chains = new_chains
+
+        if best_split_chains is None:
+            break  # No more splits possible
+
+        explored.append({
+            'buses': target_buses,
+            'profit': best_split_profit,
+            'chains': best_split_chains
+        })
+
+        if best_split_profit > best_profit:
+            best_profit = best_split_profit
+            best_chains = best_split_chains
+            best_buses = target_buses
+
+        # Use this as starting point for next iteration
+        current_chains = best_split_chains
+
+    profit_info = {
+        'best_buses': best_buses,
+        'best_profit': best_profit,
+        'min_buses': min_buses,
+        'explored': explored
+    }
+
+    return best_chains, profit_info
 
 
 # ---------------------------------------------------------------------------
@@ -4469,6 +4852,14 @@ def main():
         help="Genereer Output 7: Financieel overzicht met omzet, kosten en winst per omloop "
              "(bouwt voort op versie 6).",
     )
+    # Version 8: Profit maximization
+    parser.add_argument(
+        "--kosten-optimalisatie",
+        action="store_true",
+        help="Genereer Output 8: Winstmaximalisatie. Onderzoekt verschillende aantallen "
+             "bussen om de meest winstgevende configuratie te vinden. Weegt garagekosten, "
+             "ORT, brandstof en dienstlengte tegen elkaar af.",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -4630,6 +5021,17 @@ def main():
     # Version 7: financial analysis (only when --financieel enabled, requires version 6)
     if args.financieel and financial_config:
         n_outputs = 7
+    # Version 8: profit maximization (only when --kosten-optimalisatie enabled)
+    # Create a basic fuel_config from financial_config if not already loaded
+    if getattr(args, 'kosten_optimalisatie', False) and financial_config:
+        if not fuel_config:
+            # Create minimal fuel_config from financial_config for profit calculations
+            fuel_config = {
+                'consumption': financial_config.fuel_consumption,
+                'diesel_price': financial_config.diesel_price,
+                'hvo_price': financial_config.hvo_price,
+            }
+        n_outputs = 8
     if snel_mode:
         # outputs 1-(n_outputs-1) greedy only + last output all algos
         n_basis = n_outputs - 1 if deadhead_matrix else n_outputs
@@ -5055,60 +5457,183 @@ def main():
                                    "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
                                    "file": file6}
 
-            # ---------------------------------------------------------------
-            # OUTPUT 7: Financieel overzicht (financial analysis)
-            # Builds on version 6 rotations, adds financial calculations
-            # ---------------------------------------------------------------
-            if args.financieel and financial_config:
-                print(f"  Output 7 - Financieel overzicht...")
+        # ---------------------------------------------------------------
+        # OUTPUT 7: Financieel overzicht (financial analysis)
+        # Can run with or without deadhead data
+        # ---------------------------------------------------------------
+        if args.financieel and financial_config:
+            print(f"  Output 7 - Financieel overzicht...")
 
-                # Use version 6 rotations if available (fuel constraints), else version 5
-                rot7 = rot6 if (args.fuel_constraints and fuel_config and fuel_stations) else rot5
+            # Use best available rotations: rot6 > rot5 > rot3
+            if 6 in algo_results:
+                rot7 = algo_results[6]['rotations']
+            elif 5 in algo_results:
+                rot7 = algo_results[5]['rotations']
+            elif 4 in algo_results:
+                rot7 = algo_results[4]['rotations']
+            else:
+                rot7 = algo_results[3]['rotations']
 
-                # Calculate financials for all rotations
-                financials = calculate_total_financials(rot7, financial_config, fuel_type="diesel")
+            # Calculate financials for all rotations
+            financials = calculate_total_financials(rot7, financial_config, fuel_type="diesel")
 
-                totals = financials['totals']
-                print(f"    Totale omzet: {totals['total_revenue']:,.2f} EUR")
-                print(f"    Totale kosten: {totals['total_driver_cost'] + totals['total_fuel_cost']:,.2f} EUR")
-                print(f"    Netto winst: {totals['total_net_profit']:,.2f} EUR")
+            totals = financials['totals']
+            print(f"    Totale omzet: {totals['total_revenue']:,.2f} EUR")
+            print(f"    Totale kosten: {totals['total_driver_cost'] + totals['total_fuel_cost']:,.2f} EUR")
+            print(f"    Netto winst: {totals['total_net_profit']:,.2f} EUR")
 
-                # Copy version 6 file as base, add financial sheet
-                file7 = f"{output_base}_{algo_short}_7_financieel_overzicht.xlsx"
-                print(f"    Schrijven {file7}...", end=" ", flush=True)
+            file7 = f"{output_base}_{algo_short}_7_financieel_overzicht.xlsx"
+            print(f"    Schrijven {file7}...", end=" ", flush=True)
 
-                # Generate same output as version 6
-                generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=7)
+            # Generate output
+            generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report if 'risk_report' in dir() else None,
+                            deadhead_matrix=deadhead_matrix, version=7)
 
-                # Add fuel analysis sheet (same as v6) if fuel constraints were applied
-                wb7 = openpyxl.load_workbook(file7)
-                if args.fuel_constraints and fuel_config and fuel_stations:
-                    write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
+            # Add fuel analysis sheet if fuel constraints were applied
+            wb7 = openpyxl.load_workbook(file7)
+            if args.fuel_constraints and fuel_config and fuel_stations and 6 in algo_results:
+                write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
 
-                # Add financial overview sheet
-                write_financial_sheet(wb7, financials)
-                wb7.save(file7)
-                print("OK")
+            # Add financial overview sheet
+            write_financial_sheet(wb7, financials)
+            wb7.save(file7)
+            print("OK")
 
-                # Add ZE analysis if enabled (same as v6)
-                if args.ze and ze_config:
-                    generate_ze_output(
-                        rot7, file7, ze_config, charging_stations, args.min_ze,
-                        append_to_existing=True
+            # Add ZE analysis if enabled
+            if args.ze and ze_config:
+                generate_ze_output(
+                    rot7, file7, ze_config, charging_stations, args.min_ze,
+                    append_to_existing=True
+                )
+
+            n7_with_trips = len([r for r in rot7 if r.real_trips])
+            n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
+            n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
+            n7_extra = max(0, total_reserves - n7_res_planned)
+            n7_reserve_bussen = n7_reserve_only + n7_extra
+            n7_idle = sum(r.total_idle_minutes for r in rot7)
+
+            algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
+                               "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
+                               "file": file7, "financials": financials}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 8: Winstmaximalisatie (Profit Maximization)
+        # Can run with or without deadhead data
+        # ---------------------------------------------------------------
+        if getattr(args, 'kosten_optimalisatie', False) and financial_config and fuel_config:
+            print(f"  Output 8 - Winstmaximalisatie...")
+            print(f"    Onderzoekt verschillende aantallen bussen voor maximale winst...")
+
+            rot8 = []
+            all_profit_info = []
+
+            # Group trips by date and bus type (same as other outputs)
+            from collections import defaultdict
+            groups_by_date_type = defaultdict(list)
+            for t in all_trips:
+                groups_by_date_type[(t.date_str, t.bus_type)].append(t)
+
+            # Handle trip_turnaround_overrides if not available
+            trip_overrides_v8 = trip_turnaround_overrides if 'trip_turnaround_overrides' in dir() else None
+
+            for (date_str, bus_type), group_trips in groups_by_date_type.items():
+                if not group_trips:
+                    continue
+
+                # Run profit-maximizing optimization
+                chains, profit_info = _optimize_profit_maximizing(
+                    group_trips, baseline_turnaround,
+                    service_constraint=True,
+                    deadhead_matrix=deadhead_matrix,
+                    trip_turnaround_overrides=trip_overrides_v8,
+                    financial_config=financial_config,
+                    fuel_config=fuel_config,
+                    distance_matrix=deadhead_km_matrix,
+                    max_extra_buses_pct=30  # Try up to 30% more buses
+                )
+
+                if profit_info:
+                    all_profit_info.append({
+                        'date': date_str,
+                        'bus_type': bus_type,
+                        'info': profit_info
+                    })
+
+                    # Report findings for this group
+                    if profit_info['best_buses'] != profit_info['min_buses']:
+                        print(f"    [{date_str}/{bus_type}] Optimaal: {profit_info['best_buses']} bussen "
+                              f"(min={profit_info['min_buses']}, winst +{profit_info['best_profit']:,.0f} EUR)")
+
+                # Build rotations from chains
+                sorted_trips = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
+                for chain_idx, chain in enumerate(chains):
+                    chain_trips = [sorted_trips[i] for i in chain]
+                    rot = BusRotation(
+                        bus_id=f"v8_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
+                        bus_type=chain_trips[0].bus_type,
+                        date_str=chain_trips[0].date_str,
+                        trips=chain_trips
                     )
+                    rot8.append(rot)
 
-                n7_with_trips = len([r for r in rot7 if r.real_trips])
-                n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
-                n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
-                n7_extra = max(0, total_reserves - n7_res_planned)
-                n7_reserve_bussen = n7_reserve_only + n7_extra
-                n7_idle = sum(r.total_idle_minutes for r in rot7)
+            # Note: Version 8 doesn't include phantom reserve trips in optimization
+            # Reserves are handled separately in output generation
 
-                algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
-                                   "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
-                                   "file": file7, "financials": financials}
+            # Calculate financials
+            financials8 = calculate_total_financials(rot8, financial_config, fuel_type="diesel")
+            totals8 = financials8['totals']
+
+            # Show profit exploration summary
+            total_min_buses = sum(p['info']['min_buses'] for p in all_profit_info)
+            total_best_buses = sum(p['info']['best_buses'] for p in all_profit_info)
+            if total_best_buses != total_min_buses:
+                print(f"    Totaal: {total_best_buses} bussen gekozen (vs {total_min_buses} minimum)")
+
+            print(f"    Totale omzet: {totals8['total_revenue']:,.2f} EUR")
+            total_costs = totals8['total_driver_cost'] + totals8['total_fuel_cost'] + totals8['total_garage_fuel_cost']
+            print(f"    Totale kosten: {total_costs:,.2f} EUR")
+            print(f"      - Chauffeurkosten: {totals8['total_driver_cost']:,.2f} EUR")
+            print(f"      - Brandstofkosten (ritten): {totals8['total_fuel_cost']:,.2f} EUR")
+            print(f"      - Brandstofkosten (garage): {totals8['total_garage_fuel_cost']:,.2f} EUR")
+            print(f"      - Garage km totaal: {totals8['total_garage_km']:,.1f} km")
+            print(f"    Netto winst: {totals8['total_net_profit']:,.2f} EUR")
+
+            # Compare with version 7
+            if 7 in algo_results and 'financials' in algo_results[7]:
+                profit7 = algo_results[7]['financials']['totals']['total_net_profit']
+                profit8 = totals8['total_net_profit']
+                diff = profit8 - profit7
+                pct = (diff/profit7*100) if profit7 else 0
+                print(f"    Winstverschil t.o.v. v7: {diff:+,.2f} EUR ({pct:+.2f}%)")
+
+            file8 = f"{output_base}_{algo_short}_8_winstmaximalisatie.xlsx"
+            print(f"    Schrijven {file8}...", end=" ", flush=True)
+
+            generate_output(rot8, trips_with_reserves, reserves, file8, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report if 'risk_report' in dir() else None,
+                            deadhead_matrix=deadhead_matrix, version=8)
+
+            # Add financial sheet
+            wb8 = openpyxl.load_workbook(file8)
+            write_financial_sheet(wb8, financials8)
+            wb8.save(file8)
+            print("OK")
+
+            n8_with_trips = len([r for r in rot8 if r.real_trips])
+            n8_reserve_only = len([r for r in rot8 if not r.real_trips and r.reserve_trip_list])
+            n8_res_planned = sum(len(r.reserve_trip_list) for r in rot8)
+            n8_extra = max(0, total_reserves - n8_res_planned)
+            n8_reserve_bussen = n8_reserve_only + n8_extra
+            n8_idle = sum(r.total_idle_minutes for r in rot8)
+
+            algo_results[8] = {"rotations": rot8, "buses_met_ritten": n8_with_trips,
+                               "reserve_bussen": n8_reserve_bussen, "idle_min": n8_idle,
+                               "file": file8, "financials": financials8,
+                               "profit_info": all_profit_info}
 
         all_results[algo_key] = algo_results
         print()
@@ -5126,6 +5651,7 @@ def main():
         5: "5. Gecombineerd + reserve + deadhead + risico",
         6: "6. Brandstof/laad strategie",
         7: "7. Financieel overzicht",
+        8: "8. Winstmaximalisatie",
     }
     # Fallback label when output 4 is deadhead without traffic data
     if deadhead_matrix and not (traffic_data and traffic_data.get("time_slots")):
