@@ -2083,6 +2083,108 @@ def can_connect(prev_trip: Trip, next_trip: Trip, turnaround_map: dict,
     return True, deadhead_time
 
 
+def _parse_date_to_ordinal(date_str: str) -> int:
+    """Convert date string to ordinal for cross-day calculations.
+
+    Example: "do 11-06-2026" -> ordinal number
+    """
+    from datetime import datetime
+    if not date_str:
+        return 0
+    try:
+        # Format: "do 11-06-2026" or "donderdag 11 juni"
+        parts = date_str.split()
+        if len(parts) >= 2 and '-' in parts[1]:
+            # Format: "do 11-06-2026"
+            date_part = parts[1]
+            dt = datetime.strptime(date_part, "%d-%m-%Y")
+            return dt.toordinal()
+        else:
+            # Try other formats
+            return 0
+    except:
+        return 0
+
+
+def can_connect_multiday(prev_trip, next_trip, turnaround_map, service_constraint=False,
+                         deadhead_matrix=None, trip_turnaround_overrides=None):
+    """
+    Check if two trips can be connected by the same bus, allowing cross-day connections.
+
+    Same as can_connect, but allows trips on consecutive days to be chained.
+    Returns (bool, deadhead_time) tuple.
+    """
+    # Must be same bus type
+    if prev_trip.bus_type != next_trip.bus_type:
+        return False, 0
+
+    # Calculate absolute times (minutes from start of first day)
+    prev_day = _parse_date_to_ordinal(prev_trip.date_str)
+    next_day = _parse_date_to_ordinal(next_trip.date_str)
+
+    if prev_day == 0 or next_day == 0:
+        # Can't parse dates, fall back to same-day check
+        if prev_trip.date_str != next_trip.date_str:
+            return False, 0
+        day_offset = 0
+    else:
+        day_offset = next_day - prev_day
+        if day_offset < 0:
+            # next_trip is before prev_trip in calendar
+            return False, 0
+        if day_offset > 1:
+            # More than 1 day gap - don't chain (could be made configurable)
+            return False, 0
+
+    # Service constraint: real-to-real must be same service (within same day)
+    if service_constraint and day_offset == 0:
+        if not prev_trip.is_reserve and not next_trip.is_reserve:
+            if prev_trip.service != next_trip.service:
+                return False, 0
+
+    dest_loc = normalize_location(prev_trip.dest_code)
+    orig_loc = normalize_location(next_trip.origin_code)
+    deadhead_time = 0.0
+
+    if dest_loc != orig_loc:
+        # Different locations: check if deadhead is possible
+        if deadhead_matrix is None:
+            return False, 0
+        dh = deadhead_matrix.get(dest_loc, {}).get(orig_loc)
+        if dh is None:
+            return False, 0
+        deadhead_time = dh
+
+    # Timing: reserve trips need 0 turnaround
+    if prev_trip.is_reserve or next_trip.is_reserve:
+        min_turnaround = 0
+    else:
+        if trip_turnaround_overrides and prev_trip.trip_id in trip_turnaround_overrides:
+            min_turnaround = trip_turnaround_overrides[prev_trip.trip_id]
+        else:
+            min_turnaround = turnaround_map.get(prev_trip.bus_type, MIN_TURNAROUND_FALLBACK)
+        min_turnaround = max(min_turnaround, 2)
+
+    # Calculate gap including day offset
+    # day_offset of 1 means next_trip is on the next day
+    gap = (day_offset * 1440) + next_trip.departure - prev_trip.arrival
+
+    if gap < deadhead_time + min_turnaround:
+        return False, 0
+    return True, deadhead_time
+
+
+def _group_trips_multiday(trips, turnaround_map):
+    """Group trips by bus_type only (for cross-day optimization)."""
+    if turnaround_map is None:
+        turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
+    groups = {}
+    for t in trips:
+        key = t.bus_type
+        groups.setdefault(key, []).append(t)
+    return groups, turnaround_map
+
+
 def _group_trips(trips, turnaround_map):
     """Common setup: group trips by (date, bus_type), build compatibility edges."""
     if turnaround_map is None:
@@ -2114,10 +2216,21 @@ def _build_rotations(group_trips, date_str, bus_type, chains, rotation_counter):
 # ---------------------------------------------------------------------------
 
 def _optimize_greedy(group_trips, turnaround_map, service_constraint=False,
-                     deadhead_matrix=None, trip_turnaround_overrides=None):
-    """Greedy best-fit: assign each trip to the bus with shortest idle time."""
-    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+                     deadhead_matrix=None, trip_turnaround_overrides=None,
+                     multiday=False):
+    """Greedy best-fit: assign each trip to the bus with shortest idle time.
+
+    If multiday=True, allows chaining trips across consecutive days.
+    """
+    # Sort by absolute time for multiday, or just by time for single-day
+    if multiday:
+        # Sort by date ordinal then by time
+        group_trips.sort(key=lambda t: (_parse_date_to_ordinal(t.date_str), t.departure, t.arrival))
+    else:
+        group_trips.sort(key=lambda t: (t.departure, t.arrival))
+
     buses = []  # list of lists of trip indices
+    connect_func = can_connect_multiday if multiday else can_connect
 
     for idx, trip in enumerate(group_trips):
         best_bus = None
@@ -2125,10 +2238,15 @@ def _optimize_greedy(group_trips, turnaround_map, service_constraint=False,
 
         for bus in buses:
             last = group_trips[bus[-1]]
-            ok, _dh = can_connect(last, trip, turnaround_map, service_constraint,
-                                  deadhead_matrix, trip_turnaround_overrides)
+            ok, _dh = connect_func(last, trip, turnaround_map, service_constraint,
+                                   deadhead_matrix, trip_turnaround_overrides)
             if ok:
-                gap = trip.departure - last.arrival
+                # Calculate gap (including day offset for multiday)
+                if multiday:
+                    day_offset = _parse_date_to_ordinal(trip.date_str) - _parse_date_to_ordinal(last.date_str)
+                    gap = (day_offset * 1440) + trip.departure - last.arrival
+                else:
+                    gap = trip.departure - last.arrival
                 if gap < best_gap:
                     best_gap = gap
                     best_bus = bus
@@ -2310,7 +2428,7 @@ def calculate_euro_edge_cost(trip_i, trip_j, deadhead_min: int, deadhead_km: flo
 def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
                       deadhead_matrix=None, trip_turnaround_overrides=None,
                       euro_cost_mode=False, financial_config=None, fuel_config=None,
-                      distance_matrix=None):
+                      distance_matrix=None, multiday=False):
     """
     Min-cost max matching via successive shortest path (SPFA).
     Minimizes number of buses (primary) and total deadhead+idle time (secondary).
@@ -2320,22 +2438,28 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
         financial_config: FinancialConfig for euro costs (required if euro_cost_mode=True)
         fuel_config: Fuel config dict for euro costs (required if euro_cost_mode=True)
         distance_matrix: Dict with distances in km for fuel cost calculation
+        multiday: If True, allows chaining trips across consecutive days
     """
     from collections import deque
 
-    group_trips.sort(key=lambda t: (t.departure, t.arrival))
+    # Sort by absolute time for multiday, or just by time for single-day
+    if multiday:
+        group_trips.sort(key=lambda t: (_parse_date_to_ordinal(t.date_str), t.departure, t.arrival))
+    else:
+        group_trips.sort(key=lambda t: (t.departure, t.arrival))
     n = len(group_trips)
 
     # Build adjacency with costs
     # Default: Cost = deadhead time (penalizes empty driving) + idle time
     # Euro mode: Cost = driver idle cost + deadhead fuel cost + ORT penalty
+    connect_func = can_connect_multiday if multiday else can_connect
     adj = [[] for _ in range(n)]
     cost_map = {}
     for i in range(n):
         for j in range(i + 1, n):
-            ok, dh = can_connect(group_trips[i], group_trips[j], turnaround_map,
-                                 service_constraint, deadhead_matrix,
-                                 trip_turnaround_overrides)
+            ok, dh = connect_func(group_trips[i], group_trips[j], turnaround_map,
+                                  service_constraint, deadhead_matrix,
+                                  trip_turnaround_overrides)
             if ok:
                 if euro_cost_mode and financial_config and fuel_config:
                     # Version 8: Euro-based cost
@@ -2358,7 +2482,11 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
                     )
                 else:
                     # Default: Time-based cost
-                    idle = group_trips[j].departure - group_trips[i].arrival
+                    if multiday:
+                        day_offset = _parse_date_to_ordinal(group_trips[j].date_str) - _parse_date_to_ordinal(group_trips[i].date_str)
+                        idle = (day_offset * 1440) + group_trips[j].departure - group_trips[i].arrival
+                    else:
+                        idle = group_trips[j].departure - group_trips[i].arrival
                     # Weight deadhead more heavily: it costs fuel and driver time
                     cost = dh * 2 + idle if dh > 0 else idle
 
@@ -4857,18 +4985,26 @@ def main():
         help="Pas brandstofbeperkingen toe: controleer actieradius per bustype en "
              "splits omlopen als brandstofbereik overschreden wordt zonder tankmogelijkheid.",
     )
-    # Version 7: Financial analysis
+    # Version 6: Multi-day cross-day optimization
+    parser.add_argument(
+        "--multiday",
+        action="store_true",
+        help="Genereer Output 6: Meerdaagse optimalisatie. Combineert ritten over "
+             "opeenvolgende dagen zodat dezelfde bus meerdere dagen kan rijden "
+             "(met verschillende chauffeurs).",
+    )
+    # Version 8: Financial analysis (was version 7)
     parser.add_argument(
         "--financieel",
         action="store_true",
-        help="Genereer Output 7: Financieel overzicht met omzet, kosten en winst per omloop "
-             "(bouwt voort op versie 6).",
+        help="Genereer Output 8: Financieel overzicht met omzet, kosten en winst per omloop "
+             "(bouwt voort op versie 7).",
     )
-    # Version 8: Profit maximization
+    # Version 9: Profit maximization (was version 8)
     parser.add_argument(
         "--kosten-optimalisatie",
         action="store_true",
-        help="Genereer Output 8: Winstmaximalisatie. Onderzoekt verschillende aantallen "
+        help="Genereer Output 9: Winstmaximalisatie. Onderzoekt verschillende aantallen "
              "bussen om de meest winstgevende configuratie te vinden. Weegt garagekosten, "
              "ORT, brandstof en dienstlengte tegen elkaar af.",
     )
@@ -5027,13 +5163,16 @@ def main():
         n_outputs = 4
     if deadhead_matrix:
         n_outputs = 5 if has_traffic else 4
-    # Version 6: fuel/charging constraints (only when --fuel-constraints enabled)
-    if args.fuel_constraints and fuel_config and fuel_stations:
+    # Version 6: multi-day cross-day optimization (only when --multiday enabled)
+    if getattr(args, 'multiday', False) and deadhead_matrix:
         n_outputs = 6
-    # Version 7: financial analysis (only when --financieel enabled, requires version 6)
-    if args.financieel and financial_config:
+    # Version 7: fuel/charging constraints (only when --fuel-constraints enabled)
+    if args.fuel_constraints and fuel_config and fuel_stations:
         n_outputs = 7
-    # Version 8: profit maximization (only when --kosten-optimalisatie enabled)
+    # Version 8: financial analysis (only when --financieel enabled)
+    if args.financieel and financial_config:
+        n_outputs = 8
+    # Version 9: profit maximization (only when --kosten-optimalisatie enabled)
     # Create a basic fuel_config from financial_config if not already loaded
     if getattr(args, 'kosten_optimalisatie', False) and financial_config:
         if not fuel_config:
@@ -5043,7 +5182,7 @@ def main():
                 'diesel_price': financial_config.diesel_price,
                 'hvo_price': financial_config.hvo_price,
             }
-        n_outputs = 8
+        n_outputs = 9
     if snel_mode:
         # outputs 1-(n_outputs-1) greedy only + last output all algos
         n_basis = n_outputs - 1 if deadhead_matrix else n_outputs
@@ -5413,149 +5552,238 @@ def main():
                                      "file": file5}
 
             # ---------------------------------------------------------------
-            # OUTPUT 6: Brandstof/laad strategie (fuel constraints + ZE)
-            # Only generated when --fuel-constraints is enabled
+            # OUTPUT 6: Meerdaagse optimalisatie (multi-day cross-day)
+            # Only generated when --multiday is enabled
+            # Combines trips across consecutive days so same bus can work multiple days
             # ---------------------------------------------------------------
-            if args.fuel_constraints and fuel_config and fuel_stations:
-                print(f"  Output 6 - Brandstof/laad strategie...")
+            if getattr(args, 'multiday', False):
+                print(f"  Output 6 - Meerdaagse optimalisatie...")
+                print(f"    Combineert ritten over opeenvolgende dagen...")
 
-                # Apply fuel constraints - this may split rotations
-                rot6_orig_count = len(rot5)
-                rot6, fuel_results_6, fuel_splits_6 = apply_fuel_constraints(
-                    rot5, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
-                )
+                # Group trips by bus type only (not by date) for cross-day optimization
+                multiday_groups, _ = _group_trips_multiday(all_trips, baseline_turnaround)
 
-                if fuel_splits_6 > 0:
-                    print(f"    Brandstofcontrole: {fuel_splits_6} omlopen gesplitst "
-                          f"({rot6_orig_count} -> {len(rot6)} bussen)")
-                else:
-                    print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot6)} bussen)")
+                rot6 = []
+                rotation_counter = 0
+
+                for bus_type, group_trips in multiday_groups.items():
+                    if not group_trips:
+                        continue
+
+                    # Use multiday-aware algorithm
+                    if algo_key == "greedy":
+                        chains = _optimize_greedy(group_trips, baseline_turnaround,
+                                                  service_constraint=False,
+                                                  deadhead_matrix=deadhead_matrix,
+                                                  trip_turnaround_overrides=trip_overrides,
+                                                  multiday=True)
+                    else:
+                        chains = _optimize_mincost(group_trips, baseline_turnaround,
+                                                   service_constraint=False,
+                                                   deadhead_matrix=deadhead_matrix,
+                                                   trip_turnaround_overrides=trip_overrides,
+                                                   multiday=True)
+
+                    # Convert chains to rotations
+                    for chain in chains:
+                        rotation_counter += 1
+                        chain_trips = [group_trips[i] for i in chain]
+                        # Get date range for bus_id
+                        dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
+                        date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
+                        bus_id = f"MD-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
+
+                        rot6.append(BusRotation(
+                            bus_id=bus_id,
+                            bus_type=bus_type,
+                            date_str=chain_trips[0].date_str if chain_trips else "",
+                            trips=chain_trips,
+                        ))
+
+                # Calculate idle time for multiday rotations
+                for r in rot6:
+                    if len(r.trips) > 1:
+                        total_idle = 0
+                        for i in range(len(r.trips) - 1):
+                            t1, t2 = r.trips[i], r.trips[i+1]
+                            day_offset = _parse_date_to_ordinal(t2.date_str) - _parse_date_to_ordinal(t1.date_str)
+                            gap = (day_offset * 1440) + t2.departure - t1.arrival
+                            # Subtract deadhead time if applicable
+                            if deadhead_matrix:
+                                dh = deadhead_matrix.get(normalize_location(t1.dest_code), {}).get(
+                                    normalize_location(t2.origin_code), 0)
+                                gap = max(0, gap - dh)
+                            total_idle += max(0, gap)
+                        r.total_idle_minutes = total_idle
 
                 n6_with_trips = len([r for r in rot6 if r.real_trips])
-                n6_reserve_only = len([r for r in rot6 if not r.real_trips and r.reserve_trip_list])
-                n6_res_planned = sum(len(r.reserve_trip_list) for r in rot6)
-                n6_extra = max(0, total_reserves - n6_res_planned)
-                n6_reserve_bussen = n6_reserve_only + n6_extra
                 n6_idle = sum(r.total_idle_minutes for r in rot6)
-                print(f"    {n6_with_trips} bussen met ritten + {n6_reserve_bussen} reserve = {n6_with_trips + n6_reserve_bussen} totaal")
+                n6_trips_per_bus = sum(len(r.trips) for r in rot6) / max(1, len(rot6))
+                n6_multiday = len([r for r in rot6 if len(set(t.date_str for t in r.trips)) > 1])
+
+                print(f"    {len(rot6)} bussen totaal ({n6_multiday} meerdaags)")
+                print(f"    Gemiddeld {n6_trips_per_bus:.1f} ritten per bus")
                 print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
 
-                file6 = f"{output_base}_{algo_short}_6_brandstof_strategie.xlsx"
+                file6 = f"{output_base}_{algo_short}_6_meerdaags.xlsx"
                 print(f"    Schrijven {file6}...", end=" ", flush=True)
-
-                # Generate full output with all schedule tabs
                 generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
                                 include_sensitivity=True, output_mode=4,
                                 risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=6)
                 print("OK")
 
-                # Add fuel analysis sheet to version 6 output
+                algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
+                                   "reserve_bussen": 0, "idle_min": n6_idle,
+                                   "file": file6, "multiday_buses": n6_multiday}
+
+            # ---------------------------------------------------------------
+            # OUTPUT 7: Brandstof/laad strategie (fuel constraints + ZE)
+            # Only generated when --fuel-constraints is enabled
+            # ---------------------------------------------------------------
+            if args.fuel_constraints and fuel_config and fuel_stations:
+                print(f"  Output 7 - Brandstof/laad strategie...")
+
+                # Apply fuel constraints - this may split rotations
+                # Use multiday rotations (rot6) if available, else use rot5
+                base_rot = algo_results[6]['rotations'] if 6 in algo_results else rot5
+                rot7_orig_count = len(base_rot)
+                rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
+                    base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+                )
+
+                if fuel_splits_7 > 0:
+                    print(f"    Brandstofcontrole: {fuel_splits_7} omlopen gesplitst "
+                          f"({rot7_orig_count} -> {len(rot7)} bussen)")
+                else:
+                    print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot7)} bussen)")
+
+                n7_with_trips = len([r for r in rot7 if r.real_trips])
+                n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
+                n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
+                n7_extra = max(0, total_reserves - n7_res_planned)
+                n7_reserve_bussen = n7_reserve_only + n7_extra
+                n7_idle = sum(r.total_idle_minutes for r in rot7)
+                print(f"    {n7_with_trips} bussen met ritten + {n7_reserve_bussen} reserve = {n7_with_trips + n7_reserve_bussen} totaal")
+                print(f"    Totale wachttijd: {n7_idle} min ({n7_idle / 60:.1f} uur)")
+
+                file7 = f"{output_base}_{algo_short}_7_brandstof_strategie.xlsx"
+                print(f"    Schrijven {file7}...", end=" ", flush=True)
+
+                # Generate full output with all schedule tabs
+                generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
+                                include_sensitivity=True, output_mode=4,
+                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=7)
+                print("OK")
+
+                # Add fuel analysis sheet to version 7 output
                 print(f"    Toevoegen Brandstof Analyse sheet...", end=" ", flush=True)
-                wb6 = openpyxl.load_workbook(file6)
-                write_fuel_analysis_sheet(wb6, fuel_results_6, fuel_stations, fuel_config)
-                wb6.save(file6)
+                wb7 = openpyxl.load_workbook(file7)
+                write_fuel_analysis_sheet(wb7, fuel_results_7, fuel_stations, fuel_config)
+                wb7.save(file7)
                 print("OK")
 
                 # Add ZE analysis if enabled
                 if args.ze and ze_config:
                     ze_stats = generate_ze_output(
-                        rot6, file6, ze_config, charging_stations, args.min_ze,
+                        rot7, file7, ze_config, charging_stations, args.min_ze,
                         append_to_existing=True
                     )
                     print(f"    ZE analyse: {ze_stats['ze_feasible']}/{ze_stats['total_touringcar']} "
                           f"touringcars ZE-geschikt, {ze_stats['assigned_count']} toegewezen")
 
-                algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
-                                   "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
-                                   "file": file6}
+                algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
+                                   "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
+                                   "file": file7}
 
         # ---------------------------------------------------------------
-        # OUTPUT 7: Financieel overzicht (financial analysis)
+        # OUTPUT 8: Financieel overzicht (financial analysis)
         # Can run with or without deadhead data
         # ---------------------------------------------------------------
         if args.financieel and financial_config:
-            print(f"  Output 7 - Financieel overzicht...")
+            print(f"  Output 8 - Financieel overzicht...")
 
-            # Use best available rotations: rot6 > rot5 > rot4 > rot3
-            used_v6 = False
-            if 6 in algo_results:
-                rot7 = algo_results[6]['rotations']
-                used_v6 = True
+            # Use best available rotations: rot7 > rot6 > rot5 > rot4 > rot3
+            used_v7 = False
+            if 7 in algo_results:
+                rot8 = algo_results[7]['rotations']
+                used_v7 = True
+            elif 6 in algo_results:
+                rot8 = algo_results[6]['rotations']
             elif 5 in algo_results:
-                rot7 = algo_results[5]['rotations']
+                rot8 = algo_results[5]['rotations']
             elif 4 in algo_results:
-                rot7 = algo_results[4]['rotations']
+                rot8 = algo_results[4]['rotations']
             else:
-                rot7 = algo_results[3]['rotations']
+                rot8 = algo_results[3]['rotations']
 
-            # Apply fuel constraints if enabled but not already applied via v6
-            fuel_results_7 = None
-            if args.fuel_constraints and fuel_config and fuel_stations and not used_v6:
-                rot7_before = len(rot7)
-                rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
-                    rot7, fuel_config, fuel_stations, deadhead_km_matrix
+            # Apply fuel constraints if enabled but not already applied via v7
+            fuel_results_8 = None
+            if args.fuel_constraints and fuel_config and fuel_stations and not used_v7:
+                rot8_before = len(rot8)
+                rot8, fuel_results_8, fuel_splits_8 = apply_fuel_constraints(
+                    rot8, fuel_config, fuel_stations, deadhead_km_matrix
                 )
-                if len(rot7) > rot7_before:
-                    print(f"    Brandstofvalidatie: {len(rot7) - rot7_before} extra bussen door tankbeperkingen")
+                if len(rot8) > rot8_before:
+                    print(f"    Brandstofvalidatie: {len(rot8) - rot8_before} extra bussen door tankbeperkingen")
 
             # Calculate financials for all rotations
-            financials = calculate_total_financials(rot7, financial_config, fuel_type="diesel")
+            financials = calculate_total_financials(rot8, financial_config, fuel_type="diesel")
 
             totals = financials['totals']
             print(f"    Totale omzet: {totals['total_revenue']:,.2f} EUR")
             print(f"    Totale kosten: {totals['total_driver_cost'] + totals['total_fuel_cost']:,.2f} EUR")
             print(f"    Netto winst: {totals['total_net_profit']:,.2f} EUR")
 
-            file7 = f"{output_base}_{algo_short}_7_financieel_overzicht.xlsx"
-            print(f"    Schrijven {file7}...", end=" ", flush=True)
+            file8 = f"{output_base}_{algo_short}_8_financieel_overzicht.xlsx"
+            print(f"    Schrijven {file8}...", end=" ", flush=True)
 
             # Generate output
-            generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
+            generate_output(rot8, trips_with_reserves, reserves, file8, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
                             risk_report=risk_report if 'risk_report' in dir() else None,
-                            deadhead_matrix=deadhead_matrix, version=7)
+                            deadhead_matrix=deadhead_matrix, version=8)
 
             # Add fuel analysis sheet if fuel constraints were applied
-            wb7 = openpyxl.load_workbook(file7)
+            wb8 = openpyxl.load_workbook(file8)
             if args.fuel_constraints and fuel_config and fuel_stations:
-                # Use fuel_results_7 if v7 applied its own constraints, else use fuel_results_6 from v6
-                if fuel_results_7:
-                    write_fuel_analysis_sheet(wb7, fuel_results_7, fuel_stations, fuel_config)
-                elif 6 in algo_results:
-                    write_fuel_analysis_sheet(wb7, fuel_results_6, fuel_stations, fuel_config)
+                # Use fuel_results_8 if v8 applied its own constraints, else use fuel_results_7 from v7
+                if fuel_results_8:
+                    write_fuel_analysis_sheet(wb8, fuel_results_8, fuel_stations, fuel_config)
+                elif 7 in algo_results:
+                    write_fuel_analysis_sheet(wb8, fuel_results_7, fuel_stations, fuel_config)
 
             # Add financial overview sheet
-            write_financial_sheet(wb7, financials)
-            wb7.save(file7)
+            write_financial_sheet(wb8, financials)
+            wb8.save(file8)
             print("OK")
 
             # Add ZE analysis if enabled
             if args.ze and ze_config:
                 generate_ze_output(
-                    rot7, file7, ze_config, charging_stations, args.min_ze,
+                    rot8, file8, ze_config, charging_stations, args.min_ze,
                     append_to_existing=True
                 )
 
-            n7_with_trips = len([r for r in rot7 if r.real_trips])
-            n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
-            n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
-            n7_extra = max(0, total_reserves - n7_res_planned)
-            n7_reserve_bussen = n7_reserve_only + n7_extra
-            n7_idle = sum(r.total_idle_minutes for r in rot7)
+            n8_with_trips = len([r for r in rot8 if r.real_trips])
+            n8_reserve_only = len([r for r in rot8 if not r.real_trips and r.reserve_trip_list])
+            n8_res_planned = sum(len(r.reserve_trip_list) for r in rot8)
+            n8_extra = max(0, total_reserves - n8_res_planned)
+            n8_reserve_bussen = n8_reserve_only + n8_extra
+            n8_idle = sum(r.total_idle_minutes for r in rot8)
 
-            algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
-                               "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
-                               "file": file7, "financials": financials}
+            algo_results[8] = {"rotations": rot8, "buses_met_ritten": n8_with_trips,
+                               "reserve_bussen": n8_reserve_bussen, "idle_min": n8_idle,
+                               "file": file8, "financials": financials}
 
         # ---------------------------------------------------------------
-        # OUTPUT 8: Winstmaximalisatie (Profit Maximization)
+        # OUTPUT 9: Winstmaximalisatie (Profit Maximization)
         # Can run with or without deadhead data
         # ---------------------------------------------------------------
         if getattr(args, 'kosten_optimalisatie', False) and financial_config and fuel_config:
-            print(f"  Output 8 - Winstmaximalisatie...")
+            print(f"  Output 9 - Winstmaximalisatie...")
             print(f"    Onderzoekt verschillende aantallen bussen voor maximale winst...")
 
-            rot8 = []
+            rot9 = []
             all_profit_info = []
 
             # Group trips by date and bus type (same as other outputs)
@@ -5565,7 +5793,7 @@ def main():
                 groups_by_date_type[(t.date_str, t.bus_type)].append(t)
 
             # Handle trip_turnaround_overrides if not available
-            trip_overrides_v8 = trip_turnaround_overrides if 'trip_turnaround_overrides' in dir() else None
+            trip_overrides_v9 = trip_turnaround_overrides if 'trip_turnaround_overrides' in dir() else None
 
             for (date_str, bus_type), group_trips in groups_by_date_type.items():
                 if not group_trips:
@@ -5578,7 +5806,7 @@ def main():
                     group_trips, baseline_turnaround,
                     service_constraint=True,
                     deadhead_matrix=deadhead_matrix,
-                    trip_turnaround_overrides=trip_overrides_v8,
+                    trip_turnaround_overrides=trip_overrides_v9,
                     financial_config=financial_config,
                     fuel_config=fuel_config,
                     distance_matrix=deadhead_km_matrix,
@@ -5603,29 +5831,29 @@ def main():
                 for chain_idx, chain in enumerate(chains):
                     chain_trips = [sorted_trips[i] for i in chain]
                     rot = BusRotation(
-                        bus_id=f"v8_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
+                        bus_id=f"v9_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
                         bus_type=chain_trips[0].bus_type,
                         date_str=chain_trips[0].date_str,
                         trips=chain_trips
                     )
-                    rot8.append(rot)
+                    rot9.append(rot)
 
-            # Note: Version 8 doesn't include phantom reserve trips in optimization
+            # Note: Version 9 doesn't include phantom reserve trips in optimization
             # Reserves are handled separately in output generation
 
-            # Apply fuel constraints if enabled (same as Version 6)
-            fuel_results_8 = None
+            # Apply fuel constraints if enabled (same as Version 7)
+            fuel_results_9 = None
             if args.fuel_constraints and fuel_config and fuel_stations:
-                rot8_before = len(rot8)
-                rot8, fuel_results_8, fuel_splits_8 = apply_fuel_constraints(
-                    rot8, fuel_config, fuel_stations, deadhead_km_matrix
+                rot9_before = len(rot9)
+                rot9, fuel_results_9, fuel_splits_9 = apply_fuel_constraints(
+                    rot9, fuel_config, fuel_stations, deadhead_km_matrix
                 )
-                if len(rot8) > rot8_before:
-                    print(f"    Brandstofvalidatie: {len(rot8) - rot8_before} extra bussen door tankbeperkingen")
+                if len(rot9) > rot9_before:
+                    print(f"    Brandstofvalidatie: {len(rot9) - rot9_before} extra bussen door tankbeperkingen")
 
             # Calculate financials
-            financials8 = calculate_total_financials(rot8, financial_config, fuel_type="diesel")
-            totals8 = financials8['totals']
+            financials9 = calculate_total_financials(rot9, financial_config, fuel_type="diesel")
+            totals9 = financials9['totals']
 
             # Show profit exploration summary
             total_min_buses = sum(p['info']['min_buses'] for p in all_profit_info)
@@ -5633,49 +5861,49 @@ def main():
             if total_best_buses != total_min_buses:
                 print(f"    Totaal: {total_best_buses} bussen gekozen (vs {total_min_buses} minimum)")
 
-            print(f"    Totale omzet: {totals8['total_revenue']:,.2f} EUR")
-            total_costs = totals8['total_driver_cost'] + totals8['total_fuel_cost'] + totals8['total_garage_fuel_cost']
+            print(f"    Totale omzet: {totals9['total_revenue']:,.2f} EUR")
+            total_costs = totals9['total_driver_cost'] + totals9['total_fuel_cost'] + totals9['total_garage_fuel_cost']
             print(f"    Totale kosten: {total_costs:,.2f} EUR")
-            print(f"      - Chauffeurkosten: {totals8['total_driver_cost']:,.2f} EUR")
-            print(f"      - Brandstofkosten (ritten): {totals8['total_fuel_cost']:,.2f} EUR")
-            print(f"      - Brandstofkosten (garage): {totals8['total_garage_fuel_cost']:,.2f} EUR")
-            print(f"      - Garage km totaal: {totals8['total_garage_km']:,.1f} km")
-            print(f"    Netto winst: {totals8['total_net_profit']:,.2f} EUR")
+            print(f"      - Chauffeurkosten: {totals9['total_driver_cost']:,.2f} EUR")
+            print(f"      - Brandstofkosten (ritten): {totals9['total_fuel_cost']:,.2f} EUR")
+            print(f"      - Brandstofkosten (garage): {totals9['total_garage_fuel_cost']:,.2f} EUR")
+            print(f"      - Garage km totaal: {totals9['total_garage_km']:,.1f} km")
+            print(f"    Netto winst: {totals9['total_net_profit']:,.2f} EUR")
 
-            # Compare with version 7
-            if 7 in algo_results and 'financials' in algo_results[7]:
-                profit7 = algo_results[7]['financials']['totals']['total_net_profit']
-                profit8 = totals8['total_net_profit']
-                diff = profit8 - profit7
-                pct = (diff/profit7*100) if profit7 else 0
-                print(f"    Winstverschil t.o.v. v7: {diff:+,.2f} EUR ({pct:+.2f}%)")
+            # Compare with version 8
+            if 8 in algo_results and 'financials' in algo_results[8]:
+                profit8 = algo_results[8]['financials']['totals']['total_net_profit']
+                profit9 = totals9['total_net_profit']
+                diff = profit9 - profit8
+                pct = (diff/profit8*100) if profit8 else 0
+                print(f"    Winstverschil t.o.v. v8: {diff:+,.2f} EUR ({pct:+.2f}%)")
 
-            file8 = f"{output_base}_{algo_short}_8_winstmaximalisatie.xlsx"
-            print(f"    Schrijven {file8}...", end=" ", flush=True)
+            file9 = f"{output_base}_{algo_short}_9_winstmaximalisatie.xlsx"
+            print(f"    Schrijven {file9}...", end=" ", flush=True)
 
-            generate_output(rot8, trips_with_reserves, reserves, file8, baseline_turnaround, algo_key,
+            generate_output(rot9, trips_with_reserves, reserves, file9, baseline_turnaround, algo_key,
                             include_sensitivity=True, output_mode=4,
                             risk_report=risk_report if 'risk_report' in dir() else None,
-                            deadhead_matrix=deadhead_matrix, version=8)
+                            deadhead_matrix=deadhead_matrix, version=9)
 
             # Add financial sheet and fuel analysis if applicable
-            wb8 = openpyxl.load_workbook(file8)
-            if fuel_results_8 and args.fuel_constraints:
-                write_fuel_analysis_sheet(wb8, fuel_results_8, fuel_stations, fuel_config)
-            write_financial_sheet(wb8, financials8)
-            wb8.save(file8)
+            wb9 = openpyxl.load_workbook(file9)
+            if fuel_results_9 and args.fuel_constraints:
+                write_fuel_analysis_sheet(wb9, fuel_results_9, fuel_stations, fuel_config)
+            write_financial_sheet(wb9, financials9)
+            wb9.save(file9)
             print("OK")
 
-            n8_with_trips = len([r for r in rot8 if r.real_trips])
-            n8_reserve_only = len([r for r in rot8 if not r.real_trips and r.reserve_trip_list])
-            n8_res_planned = sum(len(r.reserve_trip_list) for r in rot8)
-            n8_extra = max(0, total_reserves - n8_res_planned)
-            n8_reserve_bussen = n8_reserve_only + n8_extra
-            n8_idle = sum(r.total_idle_minutes for r in rot8)
+            n9_with_trips = len([r for r in rot9 if r.real_trips])
+            n9_reserve_only = len([r for r in rot9 if not r.real_trips and r.reserve_trip_list])
+            n9_res_planned = sum(len(r.reserve_trip_list) for r in rot9)
+            n9_extra = max(0, total_reserves - n9_res_planned)
+            n9_reserve_bussen = n9_reserve_only + n9_extra
+            n9_idle = sum(r.total_idle_minutes for r in rot9)
 
-            algo_results[8] = {"rotations": rot8, "buses_met_ritten": n8_with_trips,
-                               "reserve_bussen": n8_reserve_bussen, "idle_min": n8_idle,
-                               "file": file8, "financials": financials8,
+            algo_results[9] = {"rotations": rot9, "buses_met_ritten": n9_with_trips,
+                               "reserve_bussen": n9_reserve_bussen, "idle_min": n9_idle,
+                               "file": file9, "financials": financials9,
                                "profit_info": all_profit_info}
 
         all_results[algo_key] = algo_results
@@ -5692,9 +5920,10 @@ def main():
         3: "3. Gecombineerd + reserve ingepland",
         4: "4. Gecombineerd + reserve + risico",
         5: "5. Gecombineerd + reserve + deadhead + risico",
-        6: "6. Brandstof/laad strategie",
-        7: "7. Financieel overzicht",
-        8: "8. Winstmaximalisatie",
+        6: "6. Meerdaagse optimalisatie",
+        7: "7. Brandstof/laad strategie",
+        8: "8. Financieel overzicht",
+        9: "9. Winstmaximalisatie",
     }
     # Fallback label when output 4 is deadhead without traffic data
     if deadhead_matrix and not (traffic_data and traffic_data.get("time_slots")):
