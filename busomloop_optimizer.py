@@ -6673,8 +6673,8 @@ def main():
             for t in all_trips:
                 groups_by_date_type[(t.date_str, t.bus_type)].append(t)
 
-            # Handle trip_turnaround_overrides if not available
-            trip_overrides_v9 = trip_turnaround_overrides if 'trip_turnaround_overrides' in dir() else None
+            # Handle trip_overrides if not available
+            trip_overrides_v10 = trip_overrides if 'trip_overrides' in dir() else None
 
             for (date_str, bus_type), group_trips in groups_by_date_type.items():
                 if not group_trips:
@@ -6687,7 +6687,7 @@ def main():
                     group_trips, baseline_turnaround,
                     service_constraint=True,
                     deadhead_matrix=deadhead_matrix,
-                    trip_turnaround_overrides=trip_overrides_v9,
+                    trip_turnaround_overrides=trip_overrides_v10,
                     financial_config=financial_config,
                     fuel_config=fuel_config,
                     distance_matrix=deadhead_km_matrix,
