@@ -1428,7 +1428,15 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
         if trip_km > remaining_range and i > 0:
             # Need to check for refueling opportunity BEFORE this trip
             prev_trip = trips[i - 1]
+
+            # Calculate idle gap, accounting for multi-day rotations
             idle_gap = trip.departure - prev_trip.arrival
+            # Check if trips are on different days (for multi-day rotations)
+            if hasattr(prev_trip, 'date_str') and hasattr(trip, 'date_str'):
+                day_offset = _parse_date_to_ordinal(trip.date_str) - _parse_date_to_ordinal(prev_trip.date_str)
+                if day_offset > 0:
+                    # Add 24 hours (1440 min) per day difference
+                    idle_gap += day_offset * 1440
 
             # Find nearest fuel station at the location
             station_loc = normalize_location(prev_trip.dest_code)
