@@ -72,6 +72,9 @@ class FinancialConfig:
     garage_afstand_enkel_km: float = 50.0    # One-way distance (km)
     garage_include_in_shift: bool = True     # Count garage travel as paid shift time
 
+    # Version 8 profit optimization settings
+    max_extra_buses_pct: int = 50   # Explore up to X% more buses than minimum
+
 
 @dataclass
 class DriverCostBreakdown:
@@ -182,10 +185,13 @@ def load_financial_config(xlsx_path: str) -> FinancialConfig:
     config.gebroken_dienst_toeslag = get_value(ws, 'gebroken_dienst_toeslag_eur', 15.00)
 
     # Garage/Remise travel (for v7/v8 cost calculations)
-    config.garage_reistijd_enkel_min = int(get_value(ws, 'garage_reistijd_enkel_min', 20))
-    config.garage_afstand_enkel_km = float(get_value(ws, 'garage_afstand_enkel_km', 15.0))
+    config.garage_reistijd_enkel_min = int(get_value(ws, 'garage_reistijd_enkel_min', 60))
+    config.garage_afstand_enkel_km = float(get_value(ws, 'garage_afstand_enkel_km', 50.0))
     garage_include = get_value(ws, 'garage_include_in_shift', 1)
     config.garage_include_in_shift = bool(garage_include) if garage_include is not None else True
+
+    # Version 8 profit optimization settings
+    config.max_extra_buses_pct = int(get_value(ws, 'max_extra_buses_pct', 50))
 
     # Load Buskosten (fuel consumption)
     ws = wb['Buskosten']
