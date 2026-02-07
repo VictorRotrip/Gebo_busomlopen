@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+
+# Generated output files
+busomloop_output_*.xlsx
