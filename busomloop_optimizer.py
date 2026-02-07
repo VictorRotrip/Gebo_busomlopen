@@ -2342,8 +2342,8 @@ def _optimize_mincost(group_trips, turnaround_map, service_constraint=False,
                     # Get deadhead km from distance matrix if available
                     dh_km = 0.0
                     if distance_matrix and dh > 0:
-                        from_st = group_trips[i].to_station.lower()
-                        to_st = group_trips[j].from_station.lower()
+                        from_st = group_trips[i].dest_code.lower()
+                        to_st = group_trips[j].origin_code.lower()
                         if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
                             dh_km = distance_matrix[from_st].get(to_st, 0)
                         elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
@@ -2505,8 +2505,8 @@ def _optimize_profit_maximizing(group_trips, turnaround_map, service_constraint=
                 # Calculate euro cost for this connection
                 dh_km = 0.0
                 if distance_matrix and dh > 0:
-                    from_st = group_trips_sorted[i].to_station.lower()
-                    to_st = group_trips_sorted[j].from_station.lower()
+                    from_st = group_trips_sorted[i].dest_code.lower()
+                    to_st = group_trips_sorted[j].origin_code.lower()
                     if from_st in distance_matrix and to_st in distance_matrix.get(from_st, {}):
                         dh_km = distance_matrix[from_st].get(to_st, 0)
                     elif to_st in distance_matrix and from_st in distance_matrix.get(to_st, {}):
