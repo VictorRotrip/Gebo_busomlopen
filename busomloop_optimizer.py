@@ -1632,7 +1632,8 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                            deadhead_matrix: dict = None,
                            deadhead_km_matrix: dict = None,
                            turnaround_map: dict = None,
-                           algorithm: str = "mincost") -> tuple:
+                           algorithm: str = "mincost",
+                           reserve_trips: list = None) -> tuple:
     """Apply fuel constraints to rotations with iterative re-optimization.
 
     When fuel constraints cause splits, the remaining trips are re-optimized
@@ -1643,6 +1644,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
     2. Keep feasible rotations and trips up to first split point
     3. Collect remaining trips after split points
     4. Re-run optimization on remaining trips using selected algorithm
+       (including unassigned reserve trips so they can be chained in)
     5. Repeat until no more splits needed
 
     Args:
@@ -1653,6 +1655,8 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         deadhead_km_matrix: Optional {origin: {dest: km}} from Google Maps
         turnaround_map: Optional {bus_type: min_turnaround_minutes}
         algorithm: Algorithm to use for re-optimization ("greedy" or "mincost")
+        reserve_trips: Optional list of phantom reserve Trip objects to include
+            in re-optimization, so reserves can be chained into rotations
 
     Returns: (new_rotations, validation_results, split_count)
     """
@@ -1664,6 +1668,18 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
     total_split_count = 0
     iteration = 0
     max_iterations = 10  # Safety limit
+
+    # Track which reserve trips are already assigned to feasible rotations
+    # so we don't double-add them during re-optimization
+    assigned_reserve_ids = set()
+
+    # Build reserve trip lookup by (date_str, bus_type) for efficient access
+    reserve_by_group = {}
+    if reserve_trips:
+        from collections import defaultdict as _dt
+        reserve_by_group = _dt(list)
+        for rt in reserve_trips:
+            reserve_by_group[(rt.date_str, rt.bus_type)].append(rt)
 
     # Current rotations to process
     current_rotations = list(rotations)
@@ -1681,6 +1697,10 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
             if result.is_feasible:
                 # No splits needed, keep rotation as-is
                 all_feasible_rotations.append(rotation)
+                # Track reserve trips already in feasible rotations
+                for t in rotation.trips:
+                    if t.is_reserve:
+                        assigned_reserve_ids.add(t.trip_id)
             else:
                 # Need to split
                 total_split_count += 1
@@ -1697,6 +1717,10 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                         trips=list(first_segment),
                     )
                     all_feasible_rotations.append(new_rot)
+                    # Track reserve trips in kept segment
+                    for t in first_segment:
+                        if t.is_reserve:
+                            assigned_reserve_ids.add(t.trip_id)
 
                 # Collect remaining trips for re-optimization
                 remaining_segment = trips[first_split:]
@@ -1712,6 +1736,19 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         for trip in remaining_trips:
             key = (trip.date_str, trip.bus_type)
             groups[key].append(trip)
+
+        # Include unassigned reserve trips in the re-optimization groups
+        # so the algorithm can chain them into rotations during idle time
+        if reserve_trips:
+            for rt in reserve_trips:
+                if rt.trip_id not in assigned_reserve_ids:
+                    key = (rt.date_str, rt.bus_type)
+                    # Only add if there are already real trips for this group
+                    if key in groups:
+                        # Avoid duplicates (reserve might already be in remaining_trips)
+                        existing_ids = {t.trip_id for t in groups[key]}
+                        if rt.trip_id not in existing_ids:
+                            groups[key].append(rt)
 
         # Select algorithm function
         algo_func = _optimize_greedy if algorithm == "greedy" else _optimize_mincost
@@ -1741,6 +1778,10 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                     trips=chain_trips,
                 )
                 new_rotations.append(rot)
+                # Track reserve trips that got assigned in this iteration
+                for t in chain_trips:
+                    if t.is_reserve:
+                        assigned_reserve_ids.add(t.trip_id)
 
         if iteration > 1:
             print(f"    Fuel re-optimization iteration {iteration}: "
@@ -1978,6 +2019,70 @@ def optimize_reserve_idle_matching(rotations: list, reserves: list, trip_dates: 
             "shortfall": max(0, rb.count - covered),
         })
     return results
+
+
+def calculate_fleet_size(rotations: list, reserves: list, trip_dates: list) -> dict:
+    """
+    Calculate physical fleet size = peak concurrent buses needed on any single day.
+
+    For single-day outputs: each rotation is on one day, so the fleet size is the
+    maximum number of buses active on any day (since buses return to the garage and
+    can be reused the next day).
+
+    For multi-day outputs: a rotation can span multiple days, counting toward each
+    day it has trips on. Non-overlapping multi-day rotations can share physical buses.
+
+    Returns dict with:
+        'vlootgrootte': int (peak buses on any day, excluding extra reserves)
+        'vlootgrootte_incl_reserve': int (peak buses including unmatched reserves)
+        'per_day': dict {date_str: {'buses': n, 'embedded_reserves': n, 'extra_reserves': n, 'total': n}}
+    """
+    from collections import Counter
+
+    # Count rotations active per day (a multi-day rotation counts for each day)
+    day_bus_count = Counter()
+    for r in rotations:
+        days = set(t.date_str for t in r.trips)
+        for d in days:
+            day_bus_count[d] += 1
+
+    # Count total reserve requirements per day
+    day_reserve_total = Counter()
+    for rb in reserves:
+        date_str = match_reserve_day(rb.day, trip_dates)
+        if date_str:
+            day_reserve_total[date_str] += rb.count
+
+    # Count reserve trips already embedded in rotations per day
+    day_embedded_reserves = Counter()
+    for r in rotations:
+        for t in r.trips:
+            if t.is_reserve:
+                day_embedded_reserves[t.date_str] += 1
+
+    # Build per-day breakdown
+    all_days = sorted(set(day_bus_count.keys()) | set(day_reserve_total.keys()))
+    per_day = {}
+    for d in all_days:
+        buses = day_bus_count.get(d, 0)
+        total_res = day_reserve_total.get(d, 0)
+        embedded_res = day_embedded_reserves.get(d, 0)
+        extra_res = max(0, total_res - embedded_res)
+        per_day[d] = {
+            'buses': buses,
+            'embedded_reserves': embedded_res,
+            'extra_reserves': extra_res,
+            'total': buses + extra_res,
+        }
+
+    vlootgrootte = max((v['buses'] for v in per_day.values()), default=0)
+    vlootgrootte_incl = max((v['total'] for v in per_day.values()), default=0)
+
+    return {
+        'vlootgrootte': vlootgrootte,
+        'vlootgrootte_incl_reserve': vlootgrootte_incl,
+        'per_day': per_day,
+    }
 
 
 def assign_reserves_to_bus_types(reserves: list, all_trips: list) -> list:
@@ -3568,6 +3673,59 @@ def write_berekeningen_sheet(wb_out, rotations: list, all_trips: list, reserves:
         cell.border = THIN_BORDER
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
+    row += 3
+
+    # --- Section 1b: Vlootgrootte (fleet size) ---
+    trip_dates = sorted(set(t.date_str for t in all_trips))
+    fleet_info = calculate_fleet_size(rotations, reserves, trip_dates)
+
+    ws.cell(row=row, column=1, value="Vlootgrootte (fysieke bussen nodig)")
+    ws.cell(row=row, column=1).font = Font(bold=True, size=12)
+    row += 1
+    ws.cell(row=row, column=1, value="Bussen kunnen hergebruikt worden op verschillende dagen. "
+            "De vlootgrootte is het maximum aantal bussen dat op één dag tegelijk nodig is.")
+    ws.cell(row=row, column=1).font = Font(italic=True, size=10)
+    row += 1
+
+    fleet_headers = ["Datum", "Bussen actief", "Reserves ingebed", "Extra reserves", "Totaal nodig"]
+    for j, h in enumerate(fleet_headers):
+        cell = ws.cell(row=row, column=1 + j, value=h)
+        cell.font = HEADER_FONT_WHITE
+        cell.fill = HEADER_FILL
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    row += 1
+
+    peak_day = ""
+    peak_total = 0
+    for day_str, day_info in sorted(fleet_info['per_day'].items()):
+        values = [
+            day_str, day_info['buses'], day_info['embedded_reserves'],
+            day_info['extra_reserves'], day_info['total']
+        ]
+        for j, v in enumerate(values):
+            cell = ws.cell(row=row, column=1 + j, value=v)
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="center")
+        if day_info['total'] > peak_total:
+            peak_total = day_info['total']
+            peak_day = day_str
+        row += 1
+
+    # Fleet size summary row
+    fleet_summary = [
+        f"VLOOTGROOTTE", "", "", "",
+        fleet_info['vlootgrootte_incl_reserve']
+    ]
+    for j, v in enumerate(fleet_summary):
+        cell = ws.cell(row=row, column=1 + j, value=v)
+        cell.border = THIN_BORDER
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    row += 1
+    if peak_day:
+        ws.cell(row=row, column=1, value=f"Piekdag: {peak_day}")
+        ws.cell(row=row, column=1).font = Font(italic=True, size=10)
     row += 3
 
     # --- Section 2: Per-bus detail ---
@@ -5971,7 +6129,9 @@ def main():
 
             n1 = len(rot1)
             n1_idle = sum(r.total_idle_minutes for r in rot1)
+            fleet1 = calculate_fleet_size(rot1, reserves, trip_dates)
             print(f"    {n1} bussen met ritten + {total_reserves} reserve = {n1 + total_reserves} totaal")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet1['vlootgrootte_incl_reserve']}")
             print(f"    Totale wachttijd: {n1_idle} min ({n1_idle / 60:.1f} uur)")
 
             file1 = f"{output_base}_{algo_short}_1_per_dienst.xlsx"
@@ -5982,7 +6142,7 @@ def main():
 
             algo_results[1] = {"rotations": rot1, "buses_met_ritten": n1,
                                "reserve_bussen": total_reserves, "idle_min": n1_idle,
-                               "file": file1}
+                               "file": file1, "fleet": fleet1}
 
             # ---------------------------------------------------------------
             # OUTPUT 2: Per dienst + optimale idle reserve matching
@@ -5997,13 +6157,15 @@ def main():
             idle_cov = optimize_reserve_idle_matching(rot1, reserves, trip_dates)
             idle_covered = sum(min(c["covered"], c["required"]) for c in idle_cov)
             n2_reserve_bussen = total_reserves - idle_covered
+            fleet2 = calculate_fleet_size(rot1, reserves, trip_dates)
             print(f"    {n1} bussen met ritten + {n2_reserve_bussen} reserve = {n1 + n2_reserve_bussen} totaal")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet2['vlootgrootte_incl_reserve']}")
             print(f"    ({idle_covered}/{total_reserves} reserves gedekt door bestaande bussen)")
             print(f"    Totale wachttijd: {n1_idle} min ({n1_idle / 60:.1f} uur)")
 
             algo_results[2] = {"rotations": rot1, "buses_met_ritten": n1,
                                "reserve_bussen": n2_reserve_bussen, "idle_min": n1_idle,
-                               "file": file2}
+                               "file": file2, "fleet": fleet2}
 
             # ---------------------------------------------------------------
             # OUTPUT 3: Gecombineerd + reserves ingepland + sensitiviteit
@@ -6018,7 +6180,9 @@ def main():
             n3_extra = max(0, total_reserves - n3_res_planned)
             n3_reserve_bussen = n3_reserve_only + n3_extra
             n3_idle = sum(r.total_idle_minutes for r in rot3)
+            fleet3 = calculate_fleet_size(rot3, reserves, trip_dates)
             print(f"    {n3_with_trips} bussen met ritten + {n3_reserve_bussen} reserve = {n3_with_trips + n3_reserve_bussen} totaal")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet3['vlootgrootte_incl_reserve']}")
             print(f"    Totale wachttijd: {n3_idle} min ({n3_idle / 60:.1f} uur)")
 
             file3 = f"{output_base}_{algo_short}_3_gecombineerd_met_reserve.xlsx"
@@ -6029,7 +6193,7 @@ def main():
 
             algo_results[3] = {"rotations": rot3, "buses_met_ritten": n3_with_trips,
                                "reserve_bussen": n3_reserve_bussen, "idle_min": n3_idle,
-                               "file": file3}
+                               "file": file3, "fleet": fleet3}
 
             # ---------------------------------------------------------------
             # Compute risk overrides once (shared by output 4 and 5)
@@ -6064,7 +6228,9 @@ def main():
                 n4_extra = max(0, total_reserves - n4_res_planned)
                 n4_reserve_bussen = n4_reserve_only + n4_extra
                 n4_idle = sum(r.total_idle_minutes for r in rot4)
+                fleet4 = calculate_fleet_size(rot4, reserves, trip_dates)
                 print(f"    {n4_with_trips} bussen met ritten + {n4_reserve_bussen} reserve = {n4_with_trips + n4_reserve_bussen} totaal")
+                print(f"    Vlootgrootte (fysieke bussen): {fleet4['vlootgrootte_incl_reserve']}")
                 print(f"    Totale wachttijd: {n4_idle} min ({n4_idle / 60:.1f} uur)")
 
                 file4 = f"{output_base}_{algo_short}_4_gecombineerd_risico.xlsx"
@@ -6076,7 +6242,7 @@ def main():
 
                 algo_results[4] = {"rotations": rot4, "buses_met_ritten": n4_with_trips,
                                    "reserve_bussen": n4_reserve_bussen, "idle_min": n4_idle,
-                                   "file": file4}
+                                   "file": file4, "fleet": fleet4}
 
         # ---------------------------------------------------------------
         # OUTPUT 5 (or 4): Gecombineerd + reserves + deadhead + risico
@@ -6106,7 +6272,9 @@ def main():
             n5_extra = max(0, total_reserves - n5_res_planned)
             n5_reserve_bussen = n5_reserve_only + n5_extra
             n5_idle = sum(r.total_idle_minutes for r in rot5)
+            fleet5 = calculate_fleet_size(rot5, reserves, trip_dates)
             print(f"    {n5_with_trips} bussen met ritten + {n5_reserve_bussen} reserve = {n5_with_trips + n5_reserve_bussen} totaal")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet5['vlootgrootte_incl_reserve']}")
             print(f"    Totale wachttijd: {n5_idle} min ({n5_idle / 60:.1f} uur)")
 
             file5 = f"{output_base}_{algo_short}_{out_num}_gecombineerd_deadhead.xlsx"
@@ -6118,7 +6286,7 @@ def main():
 
             algo_results[out_num] = {"rotations": rot5, "buses_met_ritten": n5_with_trips,
                                      "reserve_bussen": n5_reserve_bussen, "idle_min": n5_idle,
-                                     "file": file5}
+                                     "file": file5, "fleet": fleet5}
 
         # ---------------------------------------------------------------
         # OUTPUT 6: Meerdaagse optimalisatie (multi-day cross-day)
@@ -6195,8 +6363,10 @@ def main():
             n6_idle = sum(r.total_idle_minutes for r in rot6)
             n6_trips_per_bus = sum(len(r.trips) for r in rot6) / max(1, len(rot6))
             n6_multiday = len([r for r in rot6 if len(set(t.date_str for t in r.trips)) > 1])
+            fleet6 = calculate_fleet_size(rot6, reserves, trip_dates)
 
             print(f"    {len(rot6)} bussen totaal ({n6_multiday} meerdaags)")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet6['vlootgrootte_incl_reserve']}")
             print(f"    Gemiddeld {n6_trips_per_bus:.1f} ritten per bus")
             print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
 
@@ -6210,7 +6380,7 @@ def main():
 
             algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
                                "reserve_bussen": 0, "idle_min": n6_idle,
-                               "file": file6, "multiday_buses": n6_multiday}
+                               "file": file6, "multiday_buses": n6_multiday, "fleet": fleet6}
 
         # ---------------------------------------------------------------
         # OUTPUT 7: Brandstof/laad strategie (fuel constraints + ZE)
@@ -6231,7 +6401,8 @@ def main():
             rot7_orig_count = len(base_rot)
             rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
                 base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                turnaround_map=baseline_turnaround, algorithm=algo_key
+                turnaround_map=baseline_turnaround, algorithm=algo_key,
+                reserve_trips=reserve_trip_list
             )
 
             if fuel_splits_7 > 0:
@@ -6246,7 +6417,11 @@ def main():
             n7_extra = max(0, total_reserves - n7_res_planned)
             n7_reserve_bussen = n7_reserve_only + n7_extra
             n7_idle = sum(r.total_idle_minutes for r in rot7)
+            fleet7 = calculate_fleet_size(rot7, reserves, trip_dates)
             print(f"    {n7_with_trips} bussen met ritten + {n7_reserve_bussen} reserve = {n7_with_trips + n7_reserve_bussen} totaal")
+            if n7_res_planned > 0:
+                print(f"    ({n7_res_planned}/{total_reserves} reserves ingepland in bestaande omlopen)")
+            print(f"    Vlootgrootte (fysieke bussen): {fleet7['vlootgrootte_incl_reserve']}")
             print(f"    Totale wachttijd: {n7_idle} min ({n7_idle / 60:.1f} uur)")
 
             file7 = f"{output_base}_{algo_short}_7_brandstof_strategie.xlsx"
@@ -6277,7 +6452,7 @@ def main():
 
             algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
                                "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
-                               "file": file7}
+                               "file": file7, "fleet": fleet7}
 
         # ---------------------------------------------------------------
         # OUTPUT 8: Garage reistijden (depot → start, end → depot)
@@ -6381,10 +6556,11 @@ def main():
             wb8.save(file8)
             print("OK")
 
+            fleet8 = calculate_fleet_size(rot8_base, reserves, trip_dates)
             algo_results[8] = {"rotations": rot8_base, "buses_met_ritten": n8_with_trips,
                                "reserve_bussen": 0, "idle_min": 0,
                                "garage_km": n8_garage_km, "garage_min": n8_garage_min,
-                               "file": file8}
+                               "file": file8, "fleet": fleet8}
 
         # ---------------------------------------------------------------
         # OUTPUT 9: Financieel overzicht (financial analysis)
@@ -6413,7 +6589,8 @@ def main():
                     rot_before = len(rot)
                     rot, fuel_results, _ = apply_fuel_constraints(
                         rot, fuel_config, fuel_stations, dh_matrix, deadhead_km_matrix,
-                        turnaround_map=baseline_turnaround, algorithm=algo_key
+                        turnaround_map=baseline_turnaround, algorithm=algo_key,
+                        reserve_trips=reserve_trip_list
                     )
                     if len(rot) > rot_before:
                         print(f"      +{len(rot) - rot_before} bussen door tankbeperkingen")
@@ -6659,10 +6836,12 @@ def main():
             n8_reserve_bussen = n8_reserve_only + n8_extra
             n8_idle = sum(r.total_idle_minutes for r in rot8)
 
+            fleet9 = calculate_fleet_size(rot8, reserves, trip_dates)
             algo_results[9] = {"rotations": rot8, "buses_met_ritten": n8_with_trips,
                                "reserve_bussen": n8_reserve_bussen, "idle_min": n8_idle,
                                "file": file8_compare, "financials": financials,
-                               "all_financials": all_financials, "best_permutation": best_key}
+                               "all_financials": all_financials, "best_permutation": best_key,
+                               "fleet": fleet9}
 
         # ---------------------------------------------------------------
         # OUTPUT 10: Winstmaximalisatie (Profit Maximization)
@@ -6794,7 +6973,8 @@ def main():
                 rot10_before = len(rot10)
                 rot10, fuel_results_10, fuel_splits_10 = apply_fuel_constraints(
                     rot10, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                    turnaround_map=baseline_turnaround, algorithm=algo_key
+                    turnaround_map=baseline_turnaround, algorithm=algo_key,
+                    reserve_trips=reserve_trip_list
                 )
                 if len(rot10) > rot10_before:
                     print(f"    Brandstofvalidatie: {len(rot10) - rot10_before} extra bussen door tankbeperkingen")
@@ -6848,11 +7028,12 @@ def main():
             n10_extra = max(0, total_reserves - n10_res_planned)
             n10_reserve_bussen = n10_reserve_only + n10_extra
             n10_idle = sum(r.total_idle_minutes for r in rot10)
+            fleet10 = calculate_fleet_size(rot10, reserves, trip_dates)
 
             algo_results[10] = {"rotations": rot10, "buses_met_ritten": n10_with_trips,
                                "reserve_bussen": n10_reserve_bussen, "idle_min": n10_idle,
                                "file": file10, "financials": financials10,
-                               "profit_info": all_profit_info}
+                               "profit_info": all_profit_info, "fleet": fleet10}
 
         all_results[algo_key] = algo_results
         print()
@@ -6914,7 +7095,8 @@ def main():
 
         _print_row("  bussen met ritten", lambda r: f"{r['buses_met_ritten']:d}")
         _print_row("  reserve bussen", lambda r: f"{r['reserve_bussen']:d}")
-        _print_row("  TOTAAL VLOOT", lambda r: f"{r['buses_met_ritten'] + r['reserve_bussen']:d}")
+        _print_row("  TOTAAL (som)", lambda r: f"{r['buses_met_ritten'] + r['reserve_bussen']:d}")
+        _print_row("  VLOOTGROOTTE", lambda r: f"{r['fleet']['vlootgrootte_incl_reserve']:d}" if 'fleet' in r else "-")
         _print_row("  wachttijd (uur)", lambda r: f"{r['idle_min'] / 60:.1f}")
         print()
 
