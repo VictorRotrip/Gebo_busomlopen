@@ -105,11 +105,13 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Combines trips across **consecutive days** so the same bus can work multiple days
 - Different drivers can operate the same bus on different days
 - Reduces total fleet size by reusing buses across the scheduling period
-- Requires `--multiday` flag and `--deadhead` matrix
+- Requires `--multiday` flag
 - Groups trips by bus type only (not by date) for cross-day chaining
+- **With `--deadhead`:** Bus can end at one station, start next day at another (empty driving)
+- **Without `--deadhead`:** Bus must end at the same station where it starts the next day
 - **Benefit:** Significant bus reduction for multi-day operations
 
-**Example:** A bus that finishes at 23:00 on Thursday can start again at 06:00 on Friday.
+**Example:** A bus that finishes at 23:00 on Thursday at Utrecht Centraal can start again at 06:00 on Friday at Utrecht Centraal (or anywhere if deadhead is enabled).
 
 ### Version 7: Fuel/Charging Constraints
 **File:** `*_7_brandstof_strategie.xlsx`

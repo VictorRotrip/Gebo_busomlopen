@@ -5164,7 +5164,8 @@ def main():
     if deadhead_matrix:
         n_outputs = 5 if has_traffic else 4
     # Version 6: multi-day cross-day optimization (only when --multiday enabled)
-    if getattr(args, 'multiday', False) and deadhead_matrix:
+    # Works with or without deadhead - without deadhead, bus must end at same station where it starts next day
+    if getattr(args, 'multiday', False):
         n_outputs = 6
     # Version 7: fuel/charging constraints (only when --fuel-constraints enabled)
     if args.fuel_constraints and fuel_config and fuel_stations:
@@ -5551,149 +5552,163 @@ def main():
                                      "reserve_bussen": n5_reserve_bussen, "idle_min": n5_idle,
                                      "file": file5}
 
-            # ---------------------------------------------------------------
-            # OUTPUT 6: Meerdaagse optimalisatie (multi-day cross-day)
-            # Only generated when --multiday is enabled
-            # Combines trips across consecutive days so same bus can work multiple days
-            # ---------------------------------------------------------------
-            if getattr(args, 'multiday', False):
-                print(f"  Output 6 - Meerdaagse optimalisatie...")
-                print(f"    Combineert ritten over opeenvolgende dagen...")
+        # ---------------------------------------------------------------
+        # OUTPUT 6: Meerdaagse optimalisatie (multi-day cross-day)
+        # Only generated when --multiday is enabled
+        # Combines trips across consecutive days so same bus can work multiple days
+        # Works with or without deadhead - without deadhead, bus must end at same station
+        # ---------------------------------------------------------------
+        if getattr(args, 'multiday', False):
+            print(f"  Output 6 - Meerdaagse optimalisatie...")
+            print(f"    Combineert ritten over opeenvolgende dagen...")
+            if not deadhead_matrix:
+                print(f"    (Zonder deadhead: bus moet eindigen waar volgende dag begint)")
 
-                # Group trips by bus type only (not by date) for cross-day optimization
-                multiday_groups, _ = _group_trips_multiday(all_trips, baseline_turnaround)
+            # Group trips by bus type only (not by date) for cross-day optimization
+            multiday_groups, _ = _group_trips_multiday(all_trips, baseline_turnaround)
 
-                rot6 = []
-                rotation_counter = 0
+            rot6 = []
+            rotation_counter = 0
 
-                for bus_type, group_trips in multiday_groups.items():
-                    if not group_trips:
-                        continue
+            # Get trip_overrides if available
+            trip_overrides_v6 = trip_overrides if 'trip_overrides' in dir() else None
 
-                    # Use multiday-aware algorithm
-                    if algo_key == "greedy":
-                        chains = _optimize_greedy(group_trips, baseline_turnaround,
-                                                  service_constraint=False,
-                                                  deadhead_matrix=deadhead_matrix,
-                                                  trip_turnaround_overrides=trip_overrides,
-                                                  multiday=True)
-                    else:
-                        chains = _optimize_mincost(group_trips, baseline_turnaround,
-                                                   service_constraint=False,
-                                                   deadhead_matrix=deadhead_matrix,
-                                                   trip_turnaround_overrides=trip_overrides,
-                                                   multiday=True)
+            for bus_type, group_trips in multiday_groups.items():
+                if not group_trips:
+                    continue
 
-                    # Convert chains to rotations
-                    for chain in chains:
-                        rotation_counter += 1
-                        chain_trips = [group_trips[i] for i in chain]
-                        # Get date range for bus_id
-                        dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
-                        date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-                        bus_id = f"MD-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
-
-                        rot6.append(BusRotation(
-                            bus_id=bus_id,
-                            bus_type=bus_type,
-                            date_str=chain_trips[0].date_str if chain_trips else "",
-                            trips=chain_trips,
-                        ))
-
-                # Calculate idle time for multiday rotations
-                for r in rot6:
-                    if len(r.trips) > 1:
-                        total_idle = 0
-                        for i in range(len(r.trips) - 1):
-                            t1, t2 = r.trips[i], r.trips[i+1]
-                            day_offset = _parse_date_to_ordinal(t2.date_str) - _parse_date_to_ordinal(t1.date_str)
-                            gap = (day_offset * 1440) + t2.departure - t1.arrival
-                            # Subtract deadhead time if applicable
-                            if deadhead_matrix:
-                                dh = deadhead_matrix.get(normalize_location(t1.dest_code), {}).get(
-                                    normalize_location(t2.origin_code), 0)
-                                gap = max(0, gap - dh)
-                            total_idle += max(0, gap)
-                        r.total_idle_minutes = total_idle
-
-                n6_with_trips = len([r for r in rot6 if r.real_trips])
-                n6_idle = sum(r.total_idle_minutes for r in rot6)
-                n6_trips_per_bus = sum(len(r.trips) for r in rot6) / max(1, len(rot6))
-                n6_multiday = len([r for r in rot6 if len(set(t.date_str for t in r.trips)) > 1])
-
-                print(f"    {len(rot6)} bussen totaal ({n6_multiday} meerdaags)")
-                print(f"    Gemiddeld {n6_trips_per_bus:.1f} ritten per bus")
-                print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
-
-                file6 = f"{output_base}_{algo_short}_6_meerdaags.xlsx"
-                print(f"    Schrijven {file6}...", end=" ", flush=True)
-                generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=6)
-                print("OK")
-
-                algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
-                                   "reserve_bussen": 0, "idle_min": n6_idle,
-                                   "file": file6, "multiday_buses": n6_multiday}
-
-            # ---------------------------------------------------------------
-            # OUTPUT 7: Brandstof/laad strategie (fuel constraints + ZE)
-            # Only generated when --fuel-constraints is enabled
-            # ---------------------------------------------------------------
-            if args.fuel_constraints and fuel_config and fuel_stations:
-                print(f"  Output 7 - Brandstof/laad strategie...")
-
-                # Apply fuel constraints - this may split rotations
-                # Use multiday rotations (rot6) if available, else use rot5
-                base_rot = algo_results[6]['rotations'] if 6 in algo_results else rot5
-                rot7_orig_count = len(base_rot)
-                rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
-                    base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
-                )
-
-                if fuel_splits_7 > 0:
-                    print(f"    Brandstofcontrole: {fuel_splits_7} omlopen gesplitst "
-                          f"({rot7_orig_count} -> {len(rot7)} bussen)")
+                # Use multiday-aware algorithm
+                if algo_key == "greedy":
+                    chains = _optimize_greedy(group_trips, baseline_turnaround,
+                                              service_constraint=False,
+                                              deadhead_matrix=deadhead_matrix,
+                                              trip_turnaround_overrides=trip_overrides_v6,
+                                              multiday=True)
                 else:
-                    print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot7)} bussen)")
+                    chains = _optimize_mincost(group_trips, baseline_turnaround,
+                                               service_constraint=False,
+                                               deadhead_matrix=deadhead_matrix,
+                                               trip_turnaround_overrides=trip_overrides_v6,
+                                               multiday=True)
 
-                n7_with_trips = len([r for r in rot7 if r.real_trips])
-                n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
-                n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
-                n7_extra = max(0, total_reserves - n7_res_planned)
-                n7_reserve_bussen = n7_reserve_only + n7_extra
-                n7_idle = sum(r.total_idle_minutes for r in rot7)
-                print(f"    {n7_with_trips} bussen met ritten + {n7_reserve_bussen} reserve = {n7_with_trips + n7_reserve_bussen} totaal")
-                print(f"    Totale wachttijd: {n7_idle} min ({n7_idle / 60:.1f} uur)")
+                # Convert chains to rotations
+                for chain in chains:
+                    rotation_counter += 1
+                    chain_trips = [group_trips[i] for i in chain]
+                    # Get date range for bus_id
+                    dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
+                    date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
+                    bus_id = f"MD-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
 
-                file7 = f"{output_base}_{algo_short}_7_brandstof_strategie.xlsx"
-                print(f"    Schrijven {file7}...", end=" ", flush=True)
+                    rot6.append(BusRotation(
+                        bus_id=bus_id,
+                        bus_type=bus_type,
+                        date_str=chain_trips[0].date_str if chain_trips else "",
+                        trips=chain_trips,
+                    ))
 
-                # Generate full output with all schedule tabs
-                generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report, deadhead_matrix=deadhead_matrix, version=7)
-                print("OK")
+            # Calculate idle time for multiday rotations
+            for r in rot6:
+                if len(r.trips) > 1:
+                    total_idle = 0
+                    for i in range(len(r.trips) - 1):
+                        t1, t2 = r.trips[i], r.trips[i+1]
+                        day_offset = _parse_date_to_ordinal(t2.date_str) - _parse_date_to_ordinal(t1.date_str)
+                        gap = (day_offset * 1440) + t2.departure - t1.arrival
+                        # Subtract deadhead time if applicable
+                        if deadhead_matrix:
+                            dh = deadhead_matrix.get(normalize_location(t1.dest_code), {}).get(
+                                normalize_location(t2.origin_code), 0)
+                            gap = max(0, gap - dh)
+                        total_idle += max(0, gap)
+                    r.total_idle_minutes = total_idle
 
-                # Add fuel analysis sheet to version 7 output
-                print(f"    Toevoegen Brandstof Analyse sheet...", end=" ", flush=True)
-                wb7 = openpyxl.load_workbook(file7)
-                write_fuel_analysis_sheet(wb7, fuel_results_7, fuel_stations, fuel_config)
-                wb7.save(file7)
-                print("OK")
+            n6_with_trips = len([r for r in rot6 if r.real_trips])
+            n6_idle = sum(r.total_idle_minutes for r in rot6)
+            n6_trips_per_bus = sum(len(r.trips) for r in rot6) / max(1, len(rot6))
+            n6_multiday = len([r for r in rot6 if len(set(t.date_str for t in r.trips)) > 1])
 
-                # Add ZE analysis if enabled
-                if args.ze and ze_config:
-                    ze_stats = generate_ze_output(
-                        rot7, file7, ze_config, charging_stations, args.min_ze,
-                        append_to_existing=True
-                    )
-                    print(f"    ZE analyse: {ze_stats['ze_feasible']}/{ze_stats['total_touringcar']} "
-                          f"touringcars ZE-geschikt, {ze_stats['assigned_count']} toegewezen")
+            print(f"    {len(rot6)} bussen totaal ({n6_multiday} meerdaags)")
+            print(f"    Gemiddeld {n6_trips_per_bus:.1f} ritten per bus")
+            print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
 
-                algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
-                                   "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
-                                   "file": file7}
+            file6 = f"{output_base}_{algo_short}_6_meerdaags.xlsx"
+            print(f"    Schrijven {file6}...", end=" ", flush=True)
+            risk_report_v6 = risk_report if 'risk_report' in dir() else None
+            generate_output(rot6, trips_with_reserves, reserves, file6, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report_v6, deadhead_matrix=deadhead_matrix, version=6)
+            print("OK")
+
+            algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
+                               "reserve_bussen": 0, "idle_min": n6_idle,
+                               "file": file6, "multiday_buses": n6_multiday}
+
+        # ---------------------------------------------------------------
+        # OUTPUT 7: Brandstof/laad strategie (fuel constraints + ZE)
+        # Only generated when --fuel-constraints is enabled
+        # ---------------------------------------------------------------
+        if args.fuel_constraints and fuel_config and fuel_stations:
+            print(f"  Output 7 - Brandstof/laad strategie...")
+
+            # Apply fuel constraints - this may split rotations
+            # Use best available: multiday (rot6) > deadhead (rot5) > combined (rot3)
+            if 6 in algo_results:
+                base_rot = algo_results[6]['rotations']
+            elif 5 in algo_results:
+                base_rot = algo_results[5]['rotations']
+            else:
+                base_rot = algo_results[3]['rotations']
+
+            rot7_orig_count = len(base_rot)
+            rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
+                base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+            )
+
+            if fuel_splits_7 > 0:
+                print(f"    Brandstofcontrole: {fuel_splits_7} omlopen gesplitst "
+                      f"({rot7_orig_count} -> {len(rot7)} bussen)")
+            else:
+                print(f"    Brandstofcontrole: geen splitsingen nodig ({len(rot7)} bussen)")
+
+            n7_with_trips = len([r for r in rot7 if r.real_trips])
+            n7_reserve_only = len([r for r in rot7 if not r.real_trips and r.reserve_trip_list])
+            n7_res_planned = sum(len(r.reserve_trip_list) for r in rot7)
+            n7_extra = max(0, total_reserves - n7_res_planned)
+            n7_reserve_bussen = n7_reserve_only + n7_extra
+            n7_idle = sum(r.total_idle_minutes for r in rot7)
+            print(f"    {n7_with_trips} bussen met ritten + {n7_reserve_bussen} reserve = {n7_with_trips + n7_reserve_bussen} totaal")
+            print(f"    Totale wachttijd: {n7_idle} min ({n7_idle / 60:.1f} uur)")
+
+            file7 = f"{output_base}_{algo_short}_7_brandstof_strategie.xlsx"
+            print(f"    Schrijven {file7}...", end=" ", flush=True)
+
+            # Generate full output with all schedule tabs
+            risk_report_v7 = risk_report if 'risk_report' in dir() else None
+            generate_output(rot7, trips_with_reserves, reserves, file7, baseline_turnaround, algo_key,
+                            include_sensitivity=True, output_mode=4,
+                            risk_report=risk_report_v7, deadhead_matrix=deadhead_matrix, version=7)
+            print("OK")
+
+            # Add fuel analysis sheet to version 7 output
+            print(f"    Toevoegen Brandstof Analyse sheet...", end=" ", flush=True)
+            wb7 = openpyxl.load_workbook(file7)
+            write_fuel_analysis_sheet(wb7, fuel_results_7, fuel_stations, fuel_config)
+            wb7.save(file7)
+            print("OK")
+
+            # Add ZE analysis if enabled
+            if args.ze and ze_config:
+                ze_stats = generate_ze_output(
+                    rot7, file7, ze_config, charging_stations, args.min_ze,
+                    append_to_existing=True
+                )
+                print(f"    ZE analyse: {ze_stats['ze_feasible']}/{ze_stats['total_touringcar']} "
+                      f"touringcars ZE-geschikt, {ze_stats['assigned_count']} toegewezen")
+
+            algo_results[7] = {"rotations": rot7, "buses_met_ritten": n7_with_trips,
+                               "reserve_bussen": n7_reserve_bussen, "idle_min": n7_idle,
+                               "file": file7}
 
         # ---------------------------------------------------------------
         # OUTPUT 8: Financieel overzicht (financial analysis)
