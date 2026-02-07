@@ -124,15 +124,31 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Calculates actual driving times to fuel/charging stations via Google Maps
 - **Benefit:** Realistic fuel logistics planning, ZE feasibility assessment
 
-### Version 8: Financial Analysis
-**File:** `*_8_financieel_overzicht.xlsx`
+### Version 8: Financial Analysis (All Permutations)
+**Files:** Multiple output files per permutation, plus comparison file
 
-- Adds **complete financial calculations** to the roster
-- Per rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel cost
-- Includes ORT surcharges (unsocial hours), pauzestaffel (break deductions), overtime calculations
-- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v7)
+- Generates **complete financial analysis for ALL optimization permutations**:
+  - **8a - Basis**: No deadhead, no multiday, no risk (same as v3)
+  - **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (same as v4)
+  - **8b - Deadhead**: With deadhead repositioning (same as v5)
+  - **8b_risico**: Deadhead with risk-adjusted turnaround times
+  - **8c - Multidag**: Multi-day optimization without deadhead
+  - **8c_risico**: Multidag with risk-adjusted turnaround times
+  - **8d - Deadhead+Multidag**: Both features combined (same as v6)
+  - **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+- **Risk variants** (if traffic matrix available): Use extended turnaround times at high-traffic locations
+- Each permutation file includes:
+  - Full roster with per-rotation financials
+  - Revenue (active hours × rate), driver cost (CAO), fuel cost
+  - ORT surcharges, pauzestaffel, overtime calculations
+  - **Kostenberekening Uitleg** sheet: step-by-step explanation of cost calculations
+- **Comparison file** (`*_8_financieel_vergelijking.xlsx`):
+  - Side-by-side comparison of all permutations
+  - Highlights best option based on net profit
+  - Shows profit difference vs basis
+- **Includes fuel constraints** if `--fuel-constraints` is enabled
 - Requires `--financieel` flag and `additional_inputs.xlsx` with financial config
-- **Benefit:** Full profit/loss visibility per bus rotation
+- **Benefit:** Compare financial impact of deadhead, multiday, and risk-adjusted optimization
 
 ### Version 9: Profit Maximization
 **File:** `*_9_winstmaximalisatie.xlsx`

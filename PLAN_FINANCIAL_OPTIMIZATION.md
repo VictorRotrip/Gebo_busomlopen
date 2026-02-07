@@ -252,15 +252,35 @@ Version 7 now integrates energy constraints directly into the optimization algor
 
 ---
 
-### Version 8: Financial Analysis Overlay (`8_financieel_overzicht`) ✅ DONE
-**Goal**: Calculate full financial picture on the roster (INTERNAL)
+### Version 8: Financial Analysis Overlay (`8_financieel_*`) ✅ DONE (UPDATED Feb 2026)
+**Goal**: Calculate full financial picture for ALL optimization permutations (INTERNAL)
 
-- Input: version 5/6/7 roster + `additional_inputs.xlsx`
+**Now generates financials for all permutations (up to 8 variants):**
+- **8a - Basis**: No deadhead, no multiday, no risk (v3 equivalent)
+- **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (v4 equivalent)
+- **8b - Deadhead**: With deadhead repositioning (v5 equivalent)
+- **8b_risico**: Deadhead with risk-adjusted turnaround times
+- **8c - Multidag**: Multi-day optimization without deadhead
+- **8c_risico**: Multidag with risk-adjusted turnaround times
+- **8d - Deadhead+Multidag**: Both features combined (v6 equivalent)
+- **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+
+**Risk variants** (generated if traffic matrix available):
+- Use extended turnaround times at high-traffic locations
+- Accounts for potential delays from traffic congestion
+
+**Each permutation file includes:**
 - Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel
-- Output: new Excel sheet "Financieel Overzicht" with per-rotation breakdown
-- No re-optimization; purely analytical overlay
-- **Same roster as version 5/6/7** — just adds financial calculations
-- Helps understand: "How much profit do we actually make on this roster?"
+- "Financieel Overzicht" sheet with per-rotation breakdown
+- **"Kostenberekening Uitleg" sheet**: step-by-step explanation of all cost calculations
+  - Shows formulas, rates, and example calculations
+  - Helps human roster planners understand and verify costs
+
+**Comparison file (`*_8_financieel_vergelijking.xlsx`):**
+- Side-by-side comparison of all permutations
+- Shows bus count, revenue, costs, profit for each option
+- Highlights best option based on net profit
+- Shows profit difference vs basis
 
 **Implementation (Feb 2026):**
 - Created `financial_calculator.py` module with:
@@ -268,6 +288,8 @@ Version 7 now integrates energy constraints directly into the optimization algor
   - `calculate_rotation_financials()` for per-rotation calculations
   - `calculate_total_financials()` for aggregated totals
   - `load_financial_config()` to load from additional_inputs.xlsx
+- Added `write_financial_comparison_sheet()` for version comparison
+- Added `write_cost_calculation_sheet()` for step-by-step cost explanation
 - CAO logic implemented: pauzestaffel, ORT, overtime, meal allowances
 - Garage travel costs included (configurable distance/time)
 - CLI flag: `--financieel`
