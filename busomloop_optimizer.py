@@ -733,7 +733,8 @@ ZE_DEFAULTS = {
 def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
     """Load ZE configuration from additional_inputs.xlsx Buskosten sheet.
 
-    Also supports the older financieel_input.xlsx format for backward compatibility.
+    All values should be present in additional_inputs.xlsx. ZE_DEFAULTS are
+    only used as last resort with a clear warning.
 
     Returns dict with:
         - ze_range_km: {bus_type: range_km}
@@ -742,22 +743,31 @@ def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
     """
     import json
     config = {
-        "ze_range_km": dict(ZE_DEFAULTS["ze_range_km"]),
-        "ze_consumption_kwh_per_100km": dict(ZE_DEFAULTS["ze_consumption_kwh_per_100km"]),
-        "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        "ze_range_km": {},
+        "ze_consumption_kwh_per_100km": {},
+        "avg_speed_kmh": {},
     }
+    loaded_from_excel = set()
 
     path = Path(inputs_xlsx)
     if not path.exists():
-        print(f"  ZE config: {inputs_xlsx} niet gevonden, standaardwaarden gebruikt")
-        return config
+        print(f"  WAARSCHUWING: {inputs_xlsx} niet gevonden voor ZE config!")
+        return {
+            "ze_range_km": dict(ZE_DEFAULTS["ze_range_km"]),
+            "ze_consumption_kwh_per_100km": dict(ZE_DEFAULTS["ze_consumption_kwh_per_100km"]),
+            "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        }
 
     try:
         wb = openpyxl.load_workbook(path, data_only=True)
         if "Buskosten" not in wb.sheetnames:
-            print(f"  ZE config: 'Buskosten' blad niet gevonden, standaardwaarden gebruikt")
+            print(f"  WAARSCHUWING: 'Buskosten' blad niet gevonden voor ZE config")
             wb.close()
-            return config
+            return {
+                "ze_range_km": dict(ZE_DEFAULTS["ze_range_km"]),
+                "ze_consumption_kwh_per_100km": dict(ZE_DEFAULTS["ze_consumption_kwh_per_100km"]),
+                "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+            }
 
         ws = wb["Buskosten"]
 
@@ -772,38 +782,76 @@ def load_ze_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
             if "actieradius" in var_name and "_ze" in var_name and value:
                 if "dubbeldekker" in var_name:
                     config["ze_range_km"]["Dubbeldekker"] = float(value)
+                    loaded_from_excel.add("actieradius_ze_dubbeldekker")
                 elif "touringcar" in var_name:
                     config["ze_range_km"]["Touringcar"] = float(value)
+                    loaded_from_excel.add("actieradius_ze_touringcar")
                 elif "lagevloer" in var_name:
                     config["ze_range_km"]["Lagevloerbus"] = float(value)
+                    loaded_from_excel.add("actieradius_ze_lagevloerbus")
                 elif "midi" in var_name:
                     config["ze_range_km"]["Midi bus"] = float(value)
+                    loaded_from_excel.add("actieradius_ze_midibus")
                 elif "taxi" in var_name:
                     config["ze_range_km"]["Taxibus"] = float(value)
+                    loaded_from_excel.add("actieradius_ze_taxibus")
 
             # ZE consumption (kWh per 100km)
             if "verbruik" in var_name and "_ze" in var_name and "kwh" in var_name and value:
                 if "dubbeldekker" in var_name:
                     config["ze_consumption_kwh_per_100km"]["Dubbeldekker"] = float(value)
+                    loaded_from_excel.add("verbruik_ze_dubbeldekker")
                 elif "touringcar" in var_name:
                     config["ze_consumption_kwh_per_100km"]["Touringcar"] = float(value)
+                    loaded_from_excel.add("verbruik_ze_touringcar")
                 elif "lagevloer" in var_name:
                     config["ze_consumption_kwh_per_100km"]["Lagevloerbus"] = float(value)
+                    loaded_from_excel.add("verbruik_ze_lagevloerbus")
                 elif "midi" in var_name:
                     config["ze_consumption_kwh_per_100km"]["Midi bus"] = float(value)
+                    loaded_from_excel.add("verbruik_ze_midibus")
                 elif "taxi" in var_name:
                     config["ze_consumption_kwh_per_100km"]["Taxibus"] = float(value)
+                    loaded_from_excel.add("verbruik_ze_taxibus")
 
         wb.close()
-        print(f"  ZE config geladen: bereik Touringcar = {config['ze_range_km']['Touringcar']} km")
+
+        # Fill missing values from ZE_DEFAULTS with warnings
+        missing = []
+        all_bus_types = ["Touringcar", "Dubbeldekker", "Lagevloerbus", "Midi bus", "Taxibus"]
+        for bt in all_bus_types:
+            if bt not in config["ze_range_km"]:
+                config["ze_range_km"][bt] = ZE_DEFAULTS["ze_range_km"][bt]
+                missing.append(f"actieradius_ze_{bt.lower().replace(' ', '')}")
+            if bt not in config["ze_consumption_kwh_per_100km"]:
+                config["ze_consumption_kwh_per_100km"][bt] = ZE_DEFAULTS["ze_consumption_kwh_per_100km"][bt]
+                missing.append(f"verbruik_{bt.lower().replace(' ', '')}_ze_kwh_per_100km")
+            if bt not in config["avg_speed_kmh"]:
+                config["avg_speed_kmh"][bt] = ZE_DEFAULTS["avg_speed_kmh"][bt]
+
+        print(f"  ZE config geladen uit {inputs_xlsx}: {len(loaded_from_excel)} waarden")
+        print(f"    bereik Touringcar = {config['ze_range_km']['Touringcar']} km")
+        if missing:
+            print(f"    WAARSCHUWING: {len(missing)} waarden niet gevonden in Excel, standaard gebruikt:")
+            for m in missing:
+                print(f"      - {m}")
     except Exception as e:
         print(f"  ZE config laden mislukt ({e}), standaardwaarden gebruikt")
+        config = {
+            "ze_range_km": dict(ZE_DEFAULTS["ze_range_km"]),
+            "ze_consumption_kwh_per_100km": dict(ZE_DEFAULTS["ze_consumption_kwh_per_100km"]),
+            "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        }
 
     return config
 
 
 def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
     """Load fuel configuration from additional_inputs.xlsx Buskosten sheet.
+
+    All values should be present in additional_inputs.xlsx (populated by fetch
+    scripts or manual entry). FUEL_DEFAULTS are only used as last resort with
+    a clear warning.
 
     Returns dict with:
         - diesel_range_km: {bus_type: range_km}
@@ -812,29 +860,49 @@ def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
         - speed_to_station_kmh: average speed driving to fuel station
         - avg_speed_kmh: {bus_type: km/h for estimating trip distances}
     """
+    # Start with empty config (no defaults) - track what's loaded from Excel
     config = {
-        "diesel_range_km": dict(FUEL_DEFAULTS["diesel_range_km"]),
-        "diesel_consumption_l_per_100km": dict(FUEL_DEFAULTS["diesel_consumption_l_per_100km"]),
-        "refuel_time_min": FUEL_DEFAULTS["refuel_time_min"],
-        "speed_to_station_kmh": FUEL_DEFAULTS["speed_to_station_kmh"],
-        "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        "diesel_range_km": {},
+        "diesel_consumption_l_per_100km": {},
+        "refuel_time_min": None,
+        "speed_to_station_kmh": None,
+        "avg_speed_kmh": {},
     }
+    loaded_from_excel = set()  # Track which values were loaded from Excel
 
     path = Path(inputs_xlsx)
     if not path.exists():
-        print(f"  Fuel config: {inputs_xlsx} niet gevonden, standaardwaarden gebruikt")
+        print(f"  WAARSCHUWING: {inputs_xlsx} niet gevonden!")
+        print(f"    Zorg dat fetch-scripts draaien om additional_inputs.xlsx te vullen.")
+        # Fall back to FUEL_DEFAULTS
+        config = {
+            "diesel_range_km": dict(FUEL_DEFAULTS["diesel_range_km"]),
+            "diesel_consumption_l_per_100km": dict(FUEL_DEFAULTS["diesel_consumption_l_per_100km"]),
+            "refuel_time_min": FUEL_DEFAULTS["refuel_time_min"],
+            "speed_to_station_kmh": FUEL_DEFAULTS["speed_to_station_kmh"],
+            "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        }
         return config
 
     try:
         wb = openpyxl.load_workbook(path, data_only=True)
         if "Buskosten" not in wb.sheetnames:
-            print(f"  Fuel config: 'Buskosten' blad niet gevonden, standaardwaarden gebruikt")
+            print(f"  WAARSCHUWING: 'Buskosten' blad niet gevonden in {inputs_xlsx}")
             wb.close()
+            config = {
+                "diesel_range_km": dict(FUEL_DEFAULTS["diesel_range_km"]),
+                "diesel_consumption_l_per_100km": dict(FUEL_DEFAULTS["diesel_consumption_l_per_100km"]),
+                "refuel_time_min": FUEL_DEFAULTS["refuel_time_min"],
+                "speed_to_station_kmh": FUEL_DEFAULTS["speed_to_station_kmh"],
+                "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+            }
             return config
 
         ws = wb["Buskosten"]
 
         # Parse the sheet to find diesel range and other values
+        refuel_base = None
+        refuel_buffer = None
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
             if not row or not row[0]:
                 continue
@@ -845,56 +913,111 @@ def load_fuel_config(inputs_xlsx: str = "additional_inputs.xlsx") -> dict:
             if "actieradius" in var_name and "_diesel" in var_name and value:
                 if "dubbeldekker" in var_name:
                     config["diesel_range_km"]["Dubbeldekker"] = float(value)
+                    loaded_from_excel.add("actieradius_diesel_dubbeldekker")
                 elif "touringcar" in var_name:
                     config["diesel_range_km"]["Touringcar"] = float(value)
+                    loaded_from_excel.add("actieradius_diesel_touringcar")
                 elif "lagevloer" in var_name:
                     config["diesel_range_km"]["Lagevloerbus"] = float(value)
+                    loaded_from_excel.add("actieradius_diesel_lagevloerbus")
                 elif "midi" in var_name:
                     config["diesel_range_km"]["Midi bus"] = float(value)
+                    loaded_from_excel.add("actieradius_diesel_midibus")
                 elif "taxi" in var_name:
                     config["diesel_range_km"]["Taxibus"] = float(value)
+                    loaded_from_excel.add("actieradius_diesel_taxibus")
 
             # Diesel consumption (L per 100km)
             if "verbruik" in var_name and "_diesel" in var_name and "l_per" in var_name and value:
                 if "dubbeldekker" in var_name:
                     config["diesel_consumption_l_per_100km"]["Dubbeldekker"] = float(value)
+                    loaded_from_excel.add("verbruik_diesel_dubbeldekker")
                 elif "touringcar" in var_name:
                     config["diesel_consumption_l_per_100km"]["Touringcar"] = float(value)
+                    loaded_from_excel.add("verbruik_diesel_touringcar")
                 elif "lagevloer" in var_name:
                     config["diesel_consumption_l_per_100km"]["Lagevloerbus"] = float(value)
+                    loaded_from_excel.add("verbruik_diesel_lagevloerbus")
                 elif "midi" in var_name:
                     config["diesel_consumption_l_per_100km"]["Midi bus"] = float(value)
+                    loaded_from_excel.add("verbruik_diesel_midibus")
                 elif "taxi" in var_name:
                     config["diesel_consumption_l_per_100km"]["Taxibus"] = float(value)
+                    loaded_from_excel.add("verbruik_diesel_taxibus")
 
             # Refuel time
             if "tanktijd_diesel" in var_name and value:
-                config["refuel_time_min"] = float(value)
+                refuel_base = float(value)
+                loaded_from_excel.add("tanktijd_diesel")
             if "tanktijd_buffer" in var_name and value:
-                config["refuel_time_min"] += float(value)
+                refuel_buffer = float(value)
+                loaded_from_excel.add("tanktijd_buffer")
 
             # Speed to station
             if "snelheid_naar_tankstation" in var_name and value:
                 config["speed_to_station_kmh"] = float(value)
+                loaded_from_excel.add("snelheid_naar_tankstation")
 
             # Average speed per bus type (for km estimation)
             if "avg_snelheid" in var_name and "_kmh" in var_name and value:
                 if "dubbeldekker" in var_name:
                     config["avg_speed_kmh"]["Dubbeldekker"] = float(value)
+                    loaded_from_excel.add("avg_snelheid_dubbeldekker")
                 elif "touringcar" in var_name:
                     config["avg_speed_kmh"]["Touringcar"] = float(value)
+                    loaded_from_excel.add("avg_snelheid_touringcar")
                 elif "lagevloer" in var_name:
                     config["avg_speed_kmh"]["Lagevloerbus"] = float(value)
+                    loaded_from_excel.add("avg_snelheid_lagevloerbus")
                 elif "midi" in var_name:
                     config["avg_speed_kmh"]["Midi bus"] = float(value)
+                    loaded_from_excel.add("avg_snelheid_midibus")
                 elif "taxi" in var_name:
                     config["avg_speed_kmh"]["Taxibus"] = float(value)
+                    loaded_from_excel.add("avg_snelheid_taxibus")
 
         wb.close()
-        print(f"  Fuel config geladen: bereik Touringcar = {config['diesel_range_km']['Touringcar']} km, "
+
+        # Calculate refuel time
+        if refuel_base is not None:
+            config["refuel_time_min"] = refuel_base + (refuel_buffer or 0)
+
+        # Fill missing values from FUEL_DEFAULTS with warnings
+        missing = []
+        all_bus_types = ["Touringcar", "Dubbeldekker", "Lagevloerbus", "Midi bus", "Taxibus"]
+        for bt in all_bus_types:
+            if bt not in config["diesel_range_km"]:
+                config["diesel_range_km"][bt] = FUEL_DEFAULTS["diesel_range_km"][bt]
+                missing.append(f"actieradius_diesel_{bt.lower().replace(' ', '')}")
+            if bt not in config["diesel_consumption_l_per_100km"]:
+                config["diesel_consumption_l_per_100km"][bt] = FUEL_DEFAULTS["diesel_consumption_l_per_100km"][bt]
+                missing.append(f"verbruik_{bt.lower().replace(' ', '')}_diesel_l_per_100km")
+            if bt not in config["avg_speed_kmh"]:
+                config["avg_speed_kmh"][bt] = ZE_DEFAULTS["avg_speed_kmh"][bt]
+                missing.append(f"avg_snelheid_{bt.lower().replace(' ', '')}_kmh")
+        if config["refuel_time_min"] is None:
+            config["refuel_time_min"] = FUEL_DEFAULTS["refuel_time_min"]
+            missing.append("tanktijd_diesel")
+        if config["speed_to_station_kmh"] is None:
+            config["speed_to_station_kmh"] = FUEL_DEFAULTS["speed_to_station_kmh"]
+            missing.append("snelheid_naar_tankstation")
+
+        print(f"  Fuel config geladen uit {inputs_xlsx}: {len(loaded_from_excel)} waarden")
+        print(f"    bereik Touringcar = {config['diesel_range_km']['Touringcar']} km, "
               f"snelheid = {config['avg_speed_kmh']['Touringcar']} km/h")
+        if missing:
+            print(f"    WAARSCHUWING: {len(missing)} waarden niet gevonden in Excel, standaard gebruikt:")
+            for m in missing:
+                print(f"      - {m}")
     except Exception as e:
         print(f"  Fuel config laden mislukt ({e}), standaardwaarden gebruikt")
+        config = {
+            "diesel_range_km": dict(FUEL_DEFAULTS["diesel_range_km"]),
+            "diesel_consumption_l_per_100km": dict(FUEL_DEFAULTS["diesel_consumption_l_per_100km"]),
+            "refuel_time_min": FUEL_DEFAULTS["refuel_time_min"],
+            "speed_to_station_kmh": FUEL_DEFAULTS["speed_to_station_kmh"],
+            "avg_speed_kmh": dict(ZE_DEFAULTS["avg_speed_kmh"]),
+        }
 
     return config
 
@@ -1729,12 +1852,22 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         if not remaining_trips:
             break  # All rotations are feasible
 
+        # Detect if input contains multi-day rotations (trips spanning multiple dates)
+        is_multiday = any(
+            len(set(t.date_str for t in rot.trips)) > 1
+            for rot in rotations if len(rot.trips) > 1
+        )
+
         # Re-optimize remaining trips using selected algorithm
-        # Group by date and bus type
+        # For multi-day: group by bus_type only (preserve cross-day chaining)
+        # For single-day: group by (date_str, bus_type)
         from collections import defaultdict
         groups = defaultdict(list)
         for trip in remaining_trips:
-            key = (trip.date_str, trip.bus_type)
+            if is_multiday:
+                key = trip.bus_type
+            else:
+                key = (trip.date_str, trip.bus_type)
             groups[key].append(trip)
 
         # Include unassigned reserve trips in the re-optimization groups
@@ -1742,7 +1875,10 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         if reserve_trips:
             for rt in reserve_trips:
                 if rt.trip_id not in assigned_reserve_ids:
-                    key = (rt.date_str, rt.bus_type)
+                    if is_multiday:
+                        key = rt.bus_type
+                    else:
+                        key = (rt.date_str, rt.bus_type)
                     # Only add if there are already real trips for this group
                     if key in groups:
                         # Avoid duplicates (reserve might already be in remaining_trips)
@@ -1755,7 +1891,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
 
         # Run selected algorithm on each group and convert to rotations
         new_rotations = []
-        for (date_str, bus_type), group_trips in groups.items():
+        for group_key, group_trips in groups.items():
             if not group_trips:
                 continue
 
@@ -1764,19 +1900,40 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                 group_trips, turnaround_map,
                 service_constraint=False,
                 deadhead_matrix=deadhead_matrix,
-                trip_turnaround_overrides=None
+                trip_turnaround_overrides=None,
+                multiday=is_multiday
             )
 
             # Convert chains to rotations
-            sorted_trips = sorted(group_trips, key=lambda t: (t.departure, t.arrival))
+            sorted_trips = sorted(group_trips, key=lambda t: (
+                _parse_date_to_ordinal(t.date_str) if is_multiday else 0,
+                t.departure, t.arrival
+            ))
             for chain_idx, chain in enumerate(chains):
                 chain_trips = [sorted_trips[i] for i in chain]
+                dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
+                date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
+                bus_type = chain_trips[0].bus_type if chain_trips else str(group_key)
                 rot = BusRotation(
-                    bus_id=f"fuel_i{iteration}_{date_str}_{bus_type[:2]}_{chain_idx+1:03d}",
+                    bus_id=f"fuel_i{iteration}_{date_label}_{bus_type[:2]}_{chain_idx+1:03d}",
                     bus_type=bus_type,
-                    date_str=date_str,
+                    date_str=chain_trips[0].date_str if chain_trips else "",
                     trips=chain_trips,
                 )
+                # Calculate cross-day idle times for multi-day rotations
+                if is_multiday and len(chain_trips) > 1:
+                    total_idle = 0
+                    for ci in range(len(chain_trips) - 1):
+                        ct1, ct2 = chain_trips[ci], chain_trips[ci+1]
+                        day_off = _parse_date_to_ordinal(ct2.date_str) - _parse_date_to_ordinal(ct1.date_str)
+                        g = (day_off * 1440) + ct2.departure - ct1.arrival
+                        if deadhead_matrix:
+                            dh_t = deadhead_matrix.get(
+                                normalize_location(ct1.dest_code), {}
+                            ).get(normalize_location(ct2.origin_code), 0)
+                            g = max(0, g - dh_t)
+                        total_idle += max(0, g)
+                    rot.total_idle_minutes = int(total_idle)
                 new_rotations.append(rot)
                 # Track reserve trips that got assigned in this iteration
                 for t in chain_trips:
@@ -5877,7 +6034,13 @@ def main():
             print("Financiele configuratie laden...")
             financial_config = load_financial_config(args.inputs)
             print(f"  Tarieven geladen: {len(financial_config.rates)} bustypes")
-            print(f"  Diesel prijs: {financial_config.diesel_price:.2f} EUR/liter")
+            print(f"  Diesel prijs: {financial_config.diesel_price:.2f} EUR/liter (bron: {financial_config.diesel_price_source})")
+            print(f"  HVO100 prijs: {financial_config.hvo_price:.2f} EUR/liter (bron: {financial_config.hvo_price_source})")
+            print(f"  Elektriciteit prijs: {financial_config.electricity_price:.2f} EUR/kWh (bron: {financial_config.electricity_price_source})")
+            if financial_config.missing_values:
+                print(f"  WAARSCHUWING: {len(financial_config.missing_values)} waarden niet in Excel, standaard gebruikt:")
+                for mv in financial_config.missing_values:
+                    print(f"    - {mv}")
 
     # --snel mode: only useful when deadhead is provided + multiple algos
     snel_mode = args.snel and len(algos) > 1 and deadhead_matrix is not None
@@ -6363,9 +6526,18 @@ def main():
             n6_idle = sum(r.total_idle_minutes for r in rot6)
             n6_trips_per_bus = sum(len(r.trips) for r in rot6) / max(1, len(rot6))
             n6_multiday = len([r for r in rot6 if len(set(t.date_str for t in r.trips)) > 1])
+
+            # Count reserves: Output 6 doesn't embed reserves, so check idle matching
+            n6_reserve_only = len([r for r in rot6 if not r.real_trips and r.reserve_trip_list])
+            n6_res_planned = sum(len(r.reserve_trip_list) for r in rot6)
+            idle_cov_6 = optimize_reserve_idle_matching(rot6, reserves, trip_dates)
+            idle_covered_6 = sum(min(c["covered"], c["required"]) for c in idle_cov_6)
+            n6_total_covered = n6_res_planned + idle_covered_6
+            n6_extra = max(0, total_reserves - n6_total_covered)
+            n6_reserve_bussen = n6_reserve_only + n6_extra
             fleet6 = calculate_fleet_size(rot6, reserves, trip_dates)
 
-            print(f"    {len(rot6)} bussen totaal ({n6_multiday} meerdaags)")
+            print(f"    {n6_with_trips} bussen met ritten + {n6_reserve_bussen} reserve = {n6_with_trips + n6_reserve_bussen} totaal ({n6_multiday} meerdaags)")
             print(f"    Vlootgrootte (fysieke bussen): {fleet6['vlootgrootte_incl_reserve']}")
             print(f"    Gemiddeld {n6_trips_per_bus:.1f} ritten per bus")
             print(f"    Totale wachttijd: {n6_idle} min ({n6_idle / 60:.1f} uur)")
@@ -6379,7 +6551,7 @@ def main():
             print("OK")
 
             algo_results[6] = {"rotations": rot6, "buses_met_ritten": n6_with_trips,
-                               "reserve_bussen": 0, "idle_min": n6_idle,
+                               "reserve_bussen": n6_reserve_bussen, "idle_min": n6_idle,
                                "file": file6, "multiday_buses": n6_multiday, "fleet": fleet6}
 
         # ---------------------------------------------------------------
@@ -6556,9 +6728,10 @@ def main():
             wb8.save(file8)
             print("OK")
 
+            n8_idle = sum(r.total_idle_minutes for r in rot8_base)
             fleet8 = calculate_fleet_size(rot8_base, reserves, trip_dates)
             algo_results[8] = {"rotations": rot8_base, "buses_met_ritten": n8_with_trips,
-                               "reserve_bussen": 0, "idle_min": 0,
+                               "reserve_bussen": 0, "idle_min": n8_idle,
                                "garage_km": n8_garage_km, "garage_min": n8_garage_min,
                                "file": file8, "fleet": fleet8}
 
@@ -6738,6 +6911,20 @@ def main():
                             date_str=chain_trips[0].date_str if chain_trips else "",
                             trips=chain_trips,
                         ))
+                # Calculate cross-day idle times for multiday rotations
+                for r in rotations:
+                    if len(r.trips) > 1:
+                        total_idle = 0
+                        for i in range(len(r.trips) - 1):
+                            t1, t2 = r.trips[i], r.trips[i+1]
+                            day_offset = _parse_date_to_ordinal(t2.date_str) - _parse_date_to_ordinal(t1.date_str)
+                            gap = (day_offset * 1440) + t2.departure - t1.arrival
+                            if dh:
+                                dh_time = dh.get(normalize_location(t1.dest_code), {}).get(
+                                    normalize_location(t2.origin_code), 0)
+                                gap = max(0, gap - dh_time)
+                            total_idle += max(0, gap)
+                        r.total_idle_minutes = int(total_idle)
                 return rotations
 
             # 9c: Multidag (no deadhead, no risk, no fuel)

@@ -58,8 +58,11 @@ class FinancialConfig:
 
     # Fuel prices
     diesel_price: float = 1.65
+    diesel_price_source: str = "standaard"  # Tracks source: "Fieten", "CBS", "handmatig", "standaard"
     hvo_price: float = 1.95
+    hvo_price_source: str = "standaard"
     electricity_price: float = 0.35
+    electricity_price_source: str = "standaard"
 
     # Sustainability bonuses
     ze_bonus_per_km: float = 0.12
@@ -74,6 +77,9 @@ class FinancialConfig:
 
     # Version 8 profit optimization settings
     max_extra_buses_pct: int = 50   # Explore up to X% more buses than minimum
+
+    # Warnings for missing values (populated during loading)
+    missing_values: list = field(default_factory=list)
 
 
 @dataclass
@@ -193,15 +199,24 @@ def load_financial_config(xlsx_path: str) -> FinancialConfig:
     # Version 8 profit optimization settings
     config.max_extra_buses_pct = int(get_value(ws, 'max_extra_buses_pct', 50))
 
-    # Load Buskosten (fuel consumption)
+    # Load Buskosten (fuel consumption) - all values should be in additional_inputs.xlsx
     ws = wb['Buskosten']
-    config.fuel_consumption = {
-        'Dubbeldekker': get_value(ws, 'verbruik_dubbeldekker_diesel_l_per_100km', 45),
-        'Touringcar': get_value(ws, 'verbruik_touringcar_diesel_l_per_100km', 32),
-        'Lagevloerbus': get_value(ws, 'verbruik_lagevloer_diesel_l_per_100km', 38),
-        'Midi bus': get_value(ws, 'verbruik_midibus_diesel_l_per_100km', 25),
-        'Taxibus': get_value(ws, 'verbruik_taxibus_diesel_l_per_100km', 12),
+    _consumption_keys = {
+        'Dubbeldekker': ('verbruik_dubbeldekker_diesel_l_per_100km', 45),
+        'Touringcar': ('verbruik_touringcar_diesel_l_per_100km', 32),
+        'Lagevloerbus': ('verbruik_lagevloer_diesel_l_per_100km', 38),
+        'Midi bus': ('verbruik_midibus_diesel_l_per_100km', 25),
+        'Taxibus': ('verbruik_taxibus_diesel_l_per_100km', 12),
     }
+    config.fuel_consumption = {}
+    _consumption_defaults_used = []
+    for bt, (var, fallback) in _consumption_keys.items():
+        val = get_value(ws, var)
+        if val is not None:
+            config.fuel_consumption[bt] = val
+        else:
+            config.fuel_consumption[bt] = fallback
+            _consumption_defaults_used.append(var)
 
     # Load Brandstofprijzen
     ws = wb['Brandstofprijzen']
@@ -209,23 +224,51 @@ def load_financial_config(xlsx_path: str) -> FinancialConfig:
     # fall back to CBS pump price, then manual entry
     diesel_fieten = get_value(ws, 'diesel_b7_adviesprijs_fieten_eur_per_liter')
     diesel_cbs = get_value(ws, 'diesel_b7_pompprijs_eur_per_liter')
-    diesel_manual = get_value(ws, 'diesel_b7_handmatig_eur_per_liter', 1.65)
-    config.diesel_price = diesel_fieten or diesel_cbs or diesel_manual
+    diesel_manual = get_value(ws, 'diesel_b7_handmatig_eur_per_liter')
+    if diesel_fieten:
+        config.diesel_price = diesel_fieten
+        config.diesel_price_source = "Fieten adviesprijs"
+    elif diesel_cbs:
+        config.diesel_price = diesel_cbs
+        config.diesel_price_source = "CBS pompprijs"
+    elif diesel_manual:
+        config.diesel_price = diesel_manual
+        config.diesel_price_source = "handmatig"
+    # else: keeps dataclass default (1.65, "standaard")
 
     # HVO100: Fieten first, then manual
     hvo_fieten = get_value(ws, 'hvo100_adviesprijs_fieten_eur_per_liter')
-    hvo_manual = get_value(ws, 'hvo100_handmatig_eur_per_liter', 1.95)
-    config.hvo_price = hvo_fieten or hvo_manual
+    hvo_manual = get_value(ws, 'hvo100_handmatig_eur_per_liter')
+    if hvo_fieten:
+        config.hvo_price = hvo_fieten
+        config.hvo_price_source = "Fieten adviesprijs"
+    elif hvo_manual:
+        config.hvo_price = hvo_manual
+        config.hvo_price_source = "handmatig"
 
     elec_api = get_value(ws, 'elektriciteit_snelladen_eur_per_kwh')
-    elec_manual = get_value(ws, 'elektriciteit_handmatig_eur_per_kwh', 0.35)
-    config.electricity_price = elec_api if elec_api else elec_manual
+    elec_manual = get_value(ws, 'elektriciteit_handmatig_eur_per_kwh')
+    if elec_api:
+        config.electricity_price = elec_api
+        config.electricity_price_source = "API snelladen"
+    elif elec_manual:
+        config.electricity_price = elec_manual
+        config.electricity_price_source = "handmatig"
 
     # Load Duurzaamheid
     ws = wb['Duurzaamheid']
     config.ze_bonus_per_km = get_value(ws, 'zero_emissie_stimulans_eur_per_km', 0.12)
     config.hvo_bonus_per_liter = get_value(ws, 'hvo_stimulans_eur_per_liter', 0.05)
     config.hvo_max_total_per_liter = get_value(ws, 'hvo_max_total_eur_per_liter', 0.40)
+
+    # Collect warnings for missing values
+    config.missing_values = list(_consumption_defaults_used)
+    if config.diesel_price_source == "standaard":
+        config.missing_values.append("diesel_b7_*_eur_per_liter (geen Fieten/CBS/handmatig)")
+    if config.hvo_price_source == "standaard":
+        config.missing_values.append("hvo100_*_eur_per_liter (geen Fieten/handmatig)")
+    if config.electricity_price_source == "standaard":
+        config.missing_values.append("elektriciteit_*_eur_per_kwh (geen API/handmatig)")
 
     wb.close()
     return config
