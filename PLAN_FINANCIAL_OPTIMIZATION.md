@@ -5,8 +5,9 @@
 The current optimizer (`busomloop_optimizer.py`) creates rosters in versions 1-5 for two
 algorithms (greedy, mincost), optimizing primarily for **efficiency**: minimizing the number
 of buses and idle time. This plan extends the optimizer with versions 6-9 that incorporate
-**financial optimization**: maximizing profit by considering revenue, driver costs (CAO BB),
-bus operating costs, sustainability bonuses, and penalty (malus) avoidance.
+**multi-day optimization** and **financial optimization**: maximizing profit by considering
+revenue, driver costs (CAO BB), bus operating costs, sustainability bonuses, and penalty
+(malus) avoidance.
 
 **Important constraint**: Bus types are dictated by NS in the input Excel (Bijlage J). If NS
 specifies a Dubbeldekker for a trip, we must use a Dubbeldekker. The optimizer cannot swap bus
@@ -162,25 +163,46 @@ BONUS = ZE_km × €0.12 + HVO_liters × min(price_diff, €0.35) + HVO_liters �
 
 ## Proposed New Versions
 
-### Tender Versions (1-6) vs Internal Versions (7-9)
+### Tender Versions (1-7) vs Internal Versions (8-9)
 
-**Tender versions (1-6)** are designed to demonstrate efficiency and capability to NS:
+**Tender versions (1-7)** are designed to demonstrate efficiency and capability to NS:
 - Show optimal bus utilization
 - Satisfy K3 requirements (efficient, robust, realistic)
 - Include ZE touringcar planning (NS requires minimum 5 ZE)
+- Multi-day optimization for fleet efficiency (version 6)
+- Fuel/charging constraint validation (version 7)
 
-**Internal versions (7-9)** are for operational profit optimization:
+**Internal versions (8-9)** are for operational profit optimization:
 - May differ from tender versions in chaining choices
 - Optimize for actual profit, not just efficiency metrics
 - Used after winning the contract to maximize margins
 
 ---
 
-### Version 6: Fuel/Charging Constraint Integration (`6_fuel_charging_constraints`)
+### Version 6: Multi-Day Cross-Day Optimization (`6_meerdaags`)
+
+**Goal**: Combine trips across consecutive days so the same bus can work multiple days.
+
+**Key features**:
+- Groups trips by bus type only (not by date)
+- Allows chaining trips ending late one day with trips starting early the next day
+- Different drivers can operate the same bus on different days
+- Uses `can_connect_multiday()` function for cross-day feasibility checks
+
+**Benefits**:
+- Significant fleet reduction for multi-day operations
+- Better asset utilization
+- Example: A bus finishing at 23:00 Thursday can start again at 06:00 Friday
+
+**Flag**: `--multiday`
+
+---
+
+### Version 7: Fuel/Charging Constraint Integration (`7_brandstof_strategie`)
 **Goal**: Integrate fuel and charging constraints INTO the optimization, affecting chaining decisions and potentially increasing bus count when fuel range is exceeded.
 
 **UPDATED APPROACH (Feb 2026):**
-Version 6 now integrates energy constraints directly into the optimization algorithm rather than doing post-analysis. This means:
+Version 7 now integrates energy constraints directly into the optimization algorithm rather than doing post-analysis. This means:
 - Fuel/charging feasibility affects which trips can be chained together
 - If cumulative km exceeds fuel range without a refueling opportunity, the chain must be split
 - This may result in MORE buses than purely time-based optimization
@@ -189,7 +211,7 @@ Version 6 now integrates energy constraints directly into the optimization algor
 > "Bij het uitwerken van de casus dient er rekening gehouden te worden met het inzetten van
 > tenminste 5 Zero Emissie (ZE) touringcars middels volledige chauffeursdiensten."
 
-**What Version 6 does:**
+**What Version 7 does:**
 1. **Loads fuel configuration** from `additional_inputs.xlsx`:
    - Diesel range per bus type (actieradius_*_diesel_km)
    - ZE range per bus type (actieradius_*_ze_km)
@@ -230,15 +252,51 @@ Version 6 now integrates energy constraints directly into the optimization algor
 
 ---
 
-### Version 7: Financial Analysis Overlay (`7_financieel_analyse`) ✅ DONE
-**Goal**: Calculate full financial picture on the roster (INTERNAL)
+### Version 8: Financial Analysis Overlay (`8_financieel_*`) ✅ DONE (UPDATED Feb 2026)
+**Goal**: Calculate full financial picture for ALL optimization permutations (INTERNAL)
 
-- Input: version 5/6 roster + `additional_inputs.xlsx`
+**Now generates financials for all permutations across 4 dimensions (up to 16 variants):**
+
+**Dimensions:**
+1. **Deadhead**: With/without deadhead repositioning
+2. **Multidag**: With/without multi-day cross-day optimization
+3. **Risico**: With/without traffic-based risk-adjusted turnaround times
+4. **Brandstof**: With/without fuel constraint validation
+
+**Base permutations (without fuel constraints):**
+- **8a - Basis**: No deadhead, no multiday, no risk (v3 equivalent)
+- **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (v4 equivalent)
+- **8b - Deadhead**: With deadhead repositioning (v5 equivalent)
+- **8b_risico**: Deadhead with risk-adjusted turnaround times
+- **8c - Multidag**: Multi-day optimization without deadhead
+- **8c_risico**: Multidag with risk-adjusted turnaround times
+- **8d - Deadhead+Multidag**: Both features combined (v6 equivalent)
+- **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+
+**Fuel permutations (with `--fuel-constraints`):** Each base variant + fuel constraint validation
+- **8a_brandstof**, **8a_risico_brandstof**, **8b_brandstof**, **8b_risico_brandstof**
+- **8c_brandstof**, **8c_risico_brandstof**, **8d_brandstof**, **8d_risico_brandstof**
+- Fuel variants may have MORE buses due to range-based chain splits
+- Uses the same fuel constraint logic as Version 7
+
+**Up to 16 permutations** when all options enabled (4 base × with/without risk × with/without fuel)
+
+**Risk variants** (generated if traffic matrix available):
+- Use extended turnaround times at high-traffic locations
+- Accounts for potential delays from traffic congestion
+
+**Each permutation file includes:**
 - Per bus rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel
-- Output: new Excel sheet "Financieel Overzicht" with per-rotation breakdown
-- No re-optimization; purely analytical overlay
-- **Same roster as version 5/6** — just adds financial calculations
-- Helps understand: "How much profit do we actually make on this roster?"
+- "Financieel Overzicht" sheet with per-rotation breakdown
+- **"Kostenberekening Uitleg" sheet**: step-by-step explanation of all cost calculations
+  - Shows formulas, rates, and example calculations
+  - Helps human roster planners understand and verify costs
+
+**Comparison file (`*_8_financieel_vergelijking.xlsx`):**
+- Side-by-side comparison of all permutations (up to 16)
+- Shows bus count, revenue, costs, profit for each option
+- Highlights best option based on net profit
+- Shows profit difference vs basis
 
 **Implementation (Feb 2026):**
 - Created `financial_calculator.py` module with:
@@ -246,13 +304,16 @@ Version 6 now integrates energy constraints directly into the optimization algor
   - `calculate_rotation_financials()` for per-rotation calculations
   - `calculate_total_financials()` for aggregated totals
   - `load_financial_config()` to load from additional_inputs.xlsx
+- Added `write_financial_comparison_sheet()` for version comparison
+- Added `write_cost_calculation_sheet()` for step-by-step cost explanation
+- Refactored v8 section with helper functions: `process_permutation()`, `generate_multiday_rotations()`
 - CAO logic implemented: pauzestaffel, ORT, overtime, meal allowances
 - Garage travel costs included (configurable distance/time)
-- CLI flag: `--financieel`
+- CLI flags: `--financieel`, optionally `--fuel-constraints` for brandstof dimension
 
 ---
 
-### Version 8: Profit Maximization (`8_winstmaximalisatie`) ✅ DONE
+### Version 9: Profit Maximization (`9_winstmaximalisatie`) ✅ DONE
 **Goal**: True profit maximization, potentially using different number of buses (INTERNAL)
 
 **Original plan was cost-optimized chaining (same buses, different chaining). Updated to TRUE profit maximization:**
@@ -266,7 +327,7 @@ Version 6 now integrates energy constraints directly into the optimization algor
 **Implementation (Feb 2026):**
 - Added `_optimize_profit_maximizing()` algorithm in busomloop_optimizer.py
 - Algorithm:
-  1. Runs its OWN min-cost max-matching (does NOT inherit from v7)
+  1. Runs its OWN min-cost max-matching (does NOT inherit from v8)
   2. Find minimum buses via service-constrained matching (same algorithm as v5)
   3. Try up to +50% more buses by splitting chains (configurable via `max_extra_buses_pct`)
   4. For each configuration, calculate full profit using financial_calculator
@@ -275,24 +336,24 @@ Version 6 now integrates energy constraints directly into the optimization algor
 - CLI flag: `--kosten-optimalisatie`
 
 **Relationship to other versions:**
-- Version 8 does NOT use rotations from v7 - it re-optimizes from scratch
-- v7 is purely analytical (same rotations as v6, just adds financial calculations)
-- v8 explores different bus counts to find profit-maximizing configuration
+- Version 9 does NOT use rotations from v8 - it re-optimizes from scratch
+- v8 is purely analytical (same rotations as v7, just adds financial calculations)
+- v9 explores different bus counts to find profit-maximizing configuration
 
 **Results on test data:**
 ```
-Version 7: 180 buses → €17,631 profit (minimum buses)
-Version 8: 230 buses → €24,940 profit (+41% improvement!)
+Version 8: 180 buses → €17,631 profit (minimum buses)
+Version 9: 230 buses → €24,940 profit (+41% improvement!)
 ```
 
 The 50 extra buses cost more in garage travel but save MORE in driver costs (less ORT, overtime, shorter shifts).
 
 ---
 
-### Version 9: Full Profit Optimization with Fuel Type Assignment (PLANNED)
+### Future: Full Profit Optimization with Fuel Type Assignment (PLANNED)
 **Goal**: Add fuel type assignment (ZE/HVO/diesel) as optimization variable
 
-- All of Version 8 capabilities
+- All of Version 9 capabilities
 - Plus: automatically assign ZE/HVO/diesel to maximize profit
 - Consider ZE bonus (€0.12/km) and HVO incentive (up to €0.40/L)
 - Balance sustainability bonuses vs charging/fueling constraints

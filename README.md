@@ -13,7 +13,7 @@ This tool reads a trip schedule (Bijlage J Excel format) and generates optimized
 - Deadhead repositioning (empty driving between stations)
 - Traffic-based risk analysis (adjusting turnaround times for congestion)
 
-The optimizer produces **5 output versions** with progressively more sophisticated optimization.
+The optimizer produces **up to 9 output versions** with progressively more sophisticated optimization.
 
 ## Installation
 
@@ -99,8 +99,22 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Shows deadhead rows in the bus rotation schedule
 - **Benefit:** Maximum flexibility, potentially fewer buses at cost of fuel/driver time
 
-### Version 6: Fuel/Charging Constraints (NEW)
-**File:** `*_6_brandstof_constraints.xlsx`
+### Version 6: Multi-Day Optimization (NEW)
+**File:** `*_6_meerdaags.xlsx`
+
+- Combines trips across **consecutive days** so the same bus can work multiple days
+- Different drivers can operate the same bus on different days
+- Reduces total fleet size by reusing buses across the scheduling period
+- Requires `--multiday` flag
+- Groups trips by bus type only (not by date) for cross-day chaining
+- **With `--deadhead`:** Bus can end at one station, start next day at another (empty driving)
+- **Without `--deadhead`:** Bus must end at the same station where it starts the next day
+- **Benefit:** Significant bus reduction for multi-day operations
+
+**Example:** A bus that finishes at 23:00 on Thursday at Utrecht Centraal can start again at 06:00 on Friday at Utrecht Centraal (or anywhere if deadhead is enabled).
+
+### Version 7: Fuel/Charging Constraints
+**File:** `*_7_brandstof_strategie.xlsx`
 
 - Integrates **fuel and charging constraints** into optimization
 - Tracks cumulative km per bus, validates against fuel range
@@ -110,35 +124,64 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 - Calculates actual driving times to fuel/charging stations via Google Maps
 - **Benefit:** Realistic fuel logistics planning, ZE feasibility assessment
 
-### Version 7: Financial Analysis (NEW)
-**File:** `*_7_financieel_overzicht.xlsx`
+### Version 8: Financial Analysis (All Permutations)
+**Files:** Multiple output files per permutation, plus comparison file
 
-- Adds **complete financial calculations** to the roster
-- Per rotation: revenue (active hours × rate), driver cost (CAO), fuel cost, garage travel cost
-- Includes ORT surcharges (unsocial hours), pauzestaffel (break deductions), overtime calculations
-- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v6)
+- Generates **complete financial analysis for ALL optimization permutations** across 4 dimensions:
+  - **Deadhead**: With/without deadhead repositioning
+  - **Multidag**: With/without multi-day cross-day optimization
+  - **Risico**: With/without traffic-based risk-adjusted turnaround times
+  - **Brandstof**: With/without fuel constraint validation
+
+- **Base permutations** (without fuel constraints):
+  - **8a - Basis**: No deadhead, no multiday, no risk (same as v3)
+  - **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (same as v4)
+  - **8b - Deadhead**: With deadhead repositioning (same as v5)
+  - **8b_risico**: Deadhead with risk-adjusted turnaround times
+  - **8c - Multidag**: Multi-day optimization without deadhead
+  - **8c_risico**: Multidag with risk-adjusted turnaround times
+  - **8d - Deadhead+Multidag**: Both features combined (same as v6)
+  - **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+
+- **Fuel permutations** (with `--fuel-constraints`): Each base variant + fuel constraint validation
+  - **8a_brandstof**, **8a_risico_brandstof**, **8b_brandstof**, **8b_risico_brandstof**
+  - **8c_brandstof**, **8c_risico_brandstof**, **8d_brandstof**, **8d_risico_brandstof**
+  - Fuel variants may have MORE buses due to range-based chain splits
+
+- **Up to 16 permutations** when all options enabled (4 base × with/without risk × with/without fuel)
+
+- Each permutation file includes:
+  - Full roster with per-rotation financials
+  - Revenue (active hours × rate), driver cost (CAO), fuel cost
+  - ORT surcharges, pauzestaffel, overtime calculations
+  - **Kostenberekening Uitleg** sheet: step-by-step explanation of cost calculations
+- **Comparison file** (`*_8_financieel_vergelijking.xlsx`):
+  - Side-by-side comparison of all permutations
+  - Highlights best option based on net profit
+  - Shows profit difference vs basis
 - Requires `--financieel` flag and `additional_inputs.xlsx` with financial config
-- **Benefit:** Full profit/loss visibility per bus rotation
+- Optional: `--fuel-constraints` adds fuel dimension, `--deadhead` required for deadhead dimension
+- **Benefit:** Compare financial impact of deadhead, multiday, risk-adjusted optimization, and fuel constraints
 
-### Version 8: Profit Maximization (NEW)
-**File:** `*_8_winstmaximalisatie.xlsx`
+### Version 9: Profit Maximization
+**File:** `*_9_winstmaximalisatie.xlsx`
 
 - **True profit maximization** — explores different bus counts to find maximum profit
 - Instead of minimizing buses, balances trade-offs between:
   - More buses = shorter shifts = less ORT, overtime, break deductions
   - More buses = more garage travel costs
-- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v6)
+- **Includes fuel constraints** if `--fuel-constraints` is enabled (same as v7)
 - Uses all financial variables from `additional_inputs.xlsx`
 - Requires `--kosten-optimalisatie` flag (implies `--financieel`)
 - **Benefit:** May find that using more buses increases profit significantly
 
 **Example result:**
 ```
-Version 7: 180 buses → €17,631 profit
-Version 8: 230 buses → €24,940 profit (+41% improvement)
+Version 8: 180 buses → €17,631 profit
+Version 9: 230 buses → €24,940 profit (+41% improvement)
 ```
 
-See [Input Variables Impact on Version 8](#input-variables-impact-on-version-8) for how each variable affects the optimization.
+See [Input Variables Impact on Version 9](#input-variables-impact-on-version-9) for how each variable affects the optimization.
 
 ## Algorithms
 
@@ -345,8 +388,9 @@ Options:
   --inputs XLSX            additional_inputs.xlsx with financial/operational config
   --ze                     Enable ZE (Zero Emission) feasibility analysis
   --fuel-constraints       Enable diesel fuel range validation
-  --financieel             Generate Version 7: Financial analysis overlay
-  --kosten-optimalisatie   Generate Version 8: Profit maximization
+  --multiday               Generate Version 6: Multi-day cross-day optimization
+  --financieel             Generate Version 8: Financial analysis overlay
+  --kosten-optimalisatie   Generate Version 9: Profit maximization
   --snel                   Fast mode: skip non-greedy for versions 1-4
   --keer-dd MIN            Turnaround time Dubbeldekker (default: 8)
   --keer-tc MIN            Turnaround time Touringcar (default: 6)
@@ -408,9 +452,9 @@ python busomloop_optimizer.py Bijlage_J.xlsx \
               └───────────────────────────────────────────────────┘
 ```
 
-## Input Variables Impact on Version 8
+## Input Variables Impact on Version 9
 
-Version 8 uses all financial variables from `additional_inputs.xlsx` to calculate profit. Here's how each variable impacts the optimization:
+Version 9 uses all financial variables from `additional_inputs.xlsx` to calculate profit. Here's how each variable impacts the optimization:
 
 ### Revenue Variables (Sheet: Tarieven)
 
@@ -497,11 +541,11 @@ Version 8 uses all financial variables from `additional_inputs.xlsx` to calculat
 | `hvo_bonus_per_liter` | €0.05 | HVO100 stimulans bonus. |
 | `hvo_max_total_per_liter` | €0.40 | Max HVO incentive (price diff capped at €0.35 + €0.05). |
 
-### How Version 8 Uses These Variables
+### How Version 9 Uses These Variables
 
 The profit-maximizing algorithm:
 
-1. **Runs its own optimization** — does NOT inherit from Version 7. Re-runs min-cost max-matching from scratch
+1. **Runs its own optimization** — does NOT inherit from Version 8. Re-runs min-cost max-matching from scratch
 2. **Finds minimum buses** — using the same algorithm as Version 5 (service-constrained min-cost matching)
 3. **Explores different bus counts** — from minimum feasible up to +50% (configurable via `max_extra_buses_pct`)
 4. **For each bus count**, calculates total cost:
@@ -514,11 +558,12 @@ The profit-maximizing algorithm:
 | Version | What it does | Fuel constraints | Bus count |
 |---------|--------------|------------------|-----------|
 | 5 | Min buses with deadhead repositioning | No | Minimum feasible |
-| 6 | Same as v5, but splits chains if fuel range exceeded | Yes | ≥ v5 (more if fuel-constrained) |
-| 7 | Financial analysis on best available rotations | Yes (inherits or applies) | Same as base |
-| 8 | **Re-runs optimization** to maximize profit | Yes (applies after) | Explores min to min+50% |
+| 6 | Multi-day: chains buses across consecutive days | No | Fewer buses (multi-day reuse) |
+| 7 | Same as v5/v6, but splits chains if fuel range exceeded | Yes | ≥ base (more if fuel-constrained) |
+| 8 | Financial analysis on best available rotations | Yes (inherits or applies) | Same as base |
+| 9 | **Re-runs optimization** to maximize profit | Yes (applies after) | Explores min to min+50% |
 
-**Key insight:** Version 8 may find that using MORE buses than the minimum is MORE profitable, because shorter shifts have lower driver costs (less ORT, overtime, break deductions).
+**Key insight:** Version 9 may find that using MORE buses than the minimum is MORE profitable, because shorter shifts have lower driver costs (less ORT, overtime, break deductions).
 
 **Why more buses can mean more profit:**
 
@@ -535,7 +580,7 @@ The optimizer finds the sweet spot where driver cost savings exceed extra garage
 
 ### Excel Output: Financieel Overzicht Sheet
 
-Version 8 output includes a "Financieel Overzicht" sheet showing:
+Version 8 and 9 output includes a "Financieel Overzicht" sheet showing:
 
 | Column | Description |
 |--------|-------------|
