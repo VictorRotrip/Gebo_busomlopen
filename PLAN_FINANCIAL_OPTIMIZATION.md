@@ -255,7 +255,15 @@ Version 7 now integrates energy constraints directly into the optimization algor
 ### Version 8: Financial Analysis Overlay (`8_financieel_*`) ✅ DONE (UPDATED Feb 2026)
 **Goal**: Calculate full financial picture for ALL optimization permutations (INTERNAL)
 
-**Now generates financials for all permutations (up to 8 variants):**
+**Now generates financials for all permutations across 4 dimensions (up to 16 variants):**
+
+**Dimensions:**
+1. **Deadhead**: With/without deadhead repositioning
+2. **Multidag**: With/without multi-day cross-day optimization
+3. **Risico**: With/without traffic-based risk-adjusted turnaround times
+4. **Brandstof**: With/without fuel constraint validation
+
+**Base permutations (without fuel constraints):**
 - **8a - Basis**: No deadhead, no multiday, no risk (v3 equivalent)
 - **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (v4 equivalent)
 - **8b - Deadhead**: With deadhead repositioning (v5 equivalent)
@@ -264,6 +272,14 @@ Version 7 now integrates energy constraints directly into the optimization algor
 - **8c_risico**: Multidag with risk-adjusted turnaround times
 - **8d - Deadhead+Multidag**: Both features combined (v6 equivalent)
 - **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
+
+**Fuel permutations (with `--fuel-constraints`):** Each base variant + fuel constraint validation
+- **8a_brandstof**, **8a_risico_brandstof**, **8b_brandstof**, **8b_risico_brandstof**
+- **8c_brandstof**, **8c_risico_brandstof**, **8d_brandstof**, **8d_risico_brandstof**
+- Fuel variants may have MORE buses due to range-based chain splits
+- Uses the same fuel constraint logic as Version 7
+
+**Up to 16 permutations** when all options enabled (4 base × with/without risk × with/without fuel)
 
 **Risk variants** (generated if traffic matrix available):
 - Use extended turnaround times at high-traffic locations
@@ -277,7 +293,7 @@ Version 7 now integrates energy constraints directly into the optimization algor
   - Helps human roster planners understand and verify costs
 
 **Comparison file (`*_8_financieel_vergelijking.xlsx`):**
-- Side-by-side comparison of all permutations
+- Side-by-side comparison of all permutations (up to 16)
 - Shows bus count, revenue, costs, profit for each option
 - Highlights best option based on net profit
 - Shows profit difference vs basis
@@ -290,9 +306,10 @@ Version 7 now integrates energy constraints directly into the optimization algor
   - `load_financial_config()` to load from additional_inputs.xlsx
 - Added `write_financial_comparison_sheet()` for version comparison
 - Added `write_cost_calculation_sheet()` for step-by-step cost explanation
+- Refactored v8 section with helper functions: `process_permutation()`, `generate_multiday_rotations()`
 - CAO logic implemented: pauzestaffel, ORT, overtime, meal allowances
 - Garage travel costs included (configurable distance/time)
-- CLI flag: `--financieel`
+- CLI flags: `--financieel`, optionally `--fuel-constraints` for brandstof dimension
 
 ---
 

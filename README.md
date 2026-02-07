@@ -127,7 +127,13 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
 ### Version 8: Financial Analysis (All Permutations)
 **Files:** Multiple output files per permutation, plus comparison file
 
-- Generates **complete financial analysis for ALL optimization permutations**:
+- Generates **complete financial analysis for ALL optimization permutations** across 4 dimensions:
+  - **Deadhead**: With/without deadhead repositioning
+  - **Multidag**: With/without multi-day cross-day optimization
+  - **Risico**: With/without traffic-based risk-adjusted turnaround times
+  - **Brandstof**: With/without fuel constraint validation
+
+- **Base permutations** (without fuel constraints):
   - **8a - Basis**: No deadhead, no multiday, no risk (same as v3)
   - **8a_risico**: Basis with traffic-based risk-adjusted turnaround times (same as v4)
   - **8b - Deadhead**: With deadhead repositioning (same as v5)
@@ -136,7 +142,14 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
   - **8c_risico**: Multidag with risk-adjusted turnaround times
   - **8d - Deadhead+Multidag**: Both features combined (same as v6)
   - **8d_risico**: Deadhead+Multidag with risk-adjusted turnaround times
-- **Risk variants** (if traffic matrix available): Use extended turnaround times at high-traffic locations
+
+- **Fuel permutations** (with `--fuel-constraints`): Each base variant + fuel constraint validation
+  - **8a_brandstof**, **8a_risico_brandstof**, **8b_brandstof**, **8b_risico_brandstof**
+  - **8c_brandstof**, **8c_risico_brandstof**, **8d_brandstof**, **8d_risico_brandstof**
+  - Fuel variants may have MORE buses due to range-based chain splits
+
+- **Up to 16 permutations** when all options enabled (4 base × with/without risk × with/without fuel)
+
 - Each permutation file includes:
   - Full roster with per-rotation financials
   - Revenue (active hours × rate), driver cost (CAO), fuel cost
@@ -146,9 +159,9 @@ The optimizer generates 5 Excel files per algorithm, each building on the previo
   - Side-by-side comparison of all permutations
   - Highlights best option based on net profit
   - Shows profit difference vs basis
-- **Includes fuel constraints** if `--fuel-constraints` is enabled
 - Requires `--financieel` flag and `additional_inputs.xlsx` with financial config
-- **Benefit:** Compare financial impact of deadhead, multiday, and risk-adjusted optimization
+- Optional: `--fuel-constraints` adds fuel dimension, `--deadhead` required for deadhead dimension
+- **Benefit:** Compare financial impact of deadhead, multiday, risk-adjusted optimization, and fuel constraints
 
 ### Version 9: Profit Maximization
 **File:** `*_9_winstmaximalisatie.xlsx`

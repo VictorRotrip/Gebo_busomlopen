@@ -4827,13 +4827,21 @@ def write_financial_comparison_sheet(wb, all_financials: dict):
     # Permutation name mapping for display
     display_names = {
         "basis": "Basis",
+        "basis_brandstof": "Basis + Brandstof",
         "basis_risico": "Basis + Risico",
+        "basis_risico_brandstof": "Basis + Risico + Brandstof",
         "deadhead": "Deadhead",
+        "deadhead_brandstof": "Deadhead + Brandstof",
         "deadhead_risico": "Deadhead + Risico",
+        "deadhead_risico_brandstof": "Deadhead + Risico + Brandstof",
         "multidag": "Multidag",
+        "multidag_brandstof": "Multidag + Brandstof",
         "multidag_risico": "Multidag + Risico",
+        "multidag_risico_brandstof": "Multidag + Risico + Brandstof",
         "deadhead_multidag": "Deadhead + Multidag",
+        "deadhead_multidag_brandstof": "Deadhead + Multidag + Brandstof",
         "deadhead_multidag_risico": "Deadhead + Multidag + Risico",
+        "deadhead_multidag_risico_brandstof": "Alle opties",
     }
 
     # Header row with permutation names
@@ -6255,12 +6263,11 @@ def main():
 
         # ---------------------------------------------------------------
         # OUTPUT 8: Financieel overzicht (financial analysis)
-        # Generates financials for ALL version permutations:
-        #   8a: Basis (no deadhead, no multiday)
-        #   8b: Met Deadhead (if deadhead_matrix available)
-        #   8c: Multidag (no deadhead)
-        #   8d: Deadhead + Multidag (if deadhead_matrix available)
-        # Each permutation can optionally have fuel constraints applied
+        # Generates financials for ALL version permutations with dimensions:
+        #   - Deadhead: no/yes
+        #   - Multidag: no/yes
+        #   - Risico: no/yes (if traffic data available)
+        #   - Brandstof: no/yes (if fuel constraints available)
         # ---------------------------------------------------------------
         if args.financieel and financial_config:
             print(f"  Output 8 - Financieel overzicht (alle permutaties)...")
@@ -6269,398 +6276,234 @@ def main():
             all_financials = {}
             all_rotations = {}
             trip_overrides_v8 = trip_overrides if 'trip_overrides' in dir() else None
+            has_fuel = args.fuel_constraints and fuel_config and fuel_stations
+            has_risk = trip_overrides_v8 is not None
 
-            # ---- 8a: Basis (no deadhead, no multiday) ----
-            # Use v3 rotations (combined with reserves, no deadhead)
-            print(f"    8a - Basis (geen deadhead, geen multidag)...")
-            rot8a = algo_results[3]['rotations']
-
-            # Apply fuel constraints if enabled
-            fuel_results_8a = None
-            if args.fuel_constraints and fuel_config and fuel_stations:
-                rot8a_before = len(rot8a)
-                rot8a, fuel_results_8a, _ = apply_fuel_constraints(
-                    rot8a, fuel_config, fuel_stations, None, deadhead_km_matrix,
-                    turnaround_map=baseline_turnaround, algorithm=algo_key
-                )
-                if len(rot8a) > rot8a_before:
-                    print(f"      +{len(rot8a) - rot8a_before} bussen door tankbeperkingen")
-
-            financials_8a = calculate_total_financials(rot8a, financial_config, fuel_type="diesel")
-            financials_8a['totals']['bus_count'] = len(rot8a)
-            all_financials["basis"] = financials_8a
-            all_rotations["basis"] = rot8a
-            print(f"      {len(rot8a)} bussen, winst: {financials_8a['totals']['total_net_profit']:,.0f} EUR")
-
-            # Write 8a output
-            file8a = f"{output_base}_{algo_short}_8a_financieel_basis.xlsx"
-            generate_output(rot8a, trips_with_reserves, reserves, file8a, baseline_turnaround, algo_key,
-                            include_sensitivity=True, output_mode=4,
-                            risk_report=risk_report if 'risk_report' in dir() else None,
-                            deadhead_matrix=None, version=8)
-            wb8a = openpyxl.load_workbook(file8a)
-            if fuel_results_8a:
-                write_fuel_analysis_sheet(wb8a, fuel_results_8a, fuel_stations, fuel_config)
-            write_financial_sheet(wb8a, financials_8a)
-            write_cost_calculation_sheet(wb8a, financial_config)
-            wb8a.save(file8a)
-
-            # ---- 8a_risico: Basis with risk-adjusted turnaround (if traffic data available) ----
-            if trip_overrides_v8:
-                print(f"    8a_risico - Basis met risico-keertijden...")
-                rot8a_risico = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                                                   algorithm=algo_key,
-                                                   trip_turnaround_overrides=trip_overrides_v8)
-
-                fuel_results_8a_risico = None
-                if args.fuel_constraints and fuel_config and fuel_stations:
-                    rot8a_risico_before = len(rot8a_risico)
-                    rot8a_risico, fuel_results_8a_risico, _ = apply_fuel_constraints(
-                        rot8a_risico, fuel_config, fuel_stations, None, deadhead_km_matrix,
+            # Helper to process a permutation (generate financials, write file)
+            def process_permutation(rot, perm_key, perm_label, file_suffix,
+                                   dh_matrix=None, apply_fuel=False, fuel_results_in=None):
+                """Process a single permutation: apply fuel if needed, calculate financials, write file."""
+                fuel_results = fuel_results_in
+                if apply_fuel and has_fuel:
+                    rot_before = len(rot)
+                    rot, fuel_results, _ = apply_fuel_constraints(
+                        rot, fuel_config, fuel_stations, dh_matrix, deadhead_km_matrix,
                         turnaround_map=baseline_turnaround, algorithm=algo_key
                     )
-                    if len(rot8a_risico) > rot8a_risico_before:
-                        print(f"      +{len(rot8a_risico) - rot8a_risico_before} bussen door tankbeperkingen")
+                    if len(rot) > rot_before:
+                        print(f"      +{len(rot) - rot_before} bussen door tankbeperkingen")
 
-                financials_8a_risico = calculate_total_financials(rot8a_risico, financial_config, fuel_type="diesel")
-                financials_8a_risico['totals']['bus_count'] = len(rot8a_risico)
-                all_financials["basis_risico"] = financials_8a_risico
-                all_rotations["basis_risico"] = rot8a_risico
-                print(f"      {len(rot8a_risico)} bussen, winst: {financials_8a_risico['totals']['total_net_profit']:,.0f} EUR")
+                financials = calculate_total_financials(rot, financial_config, fuel_type="diesel")
+                financials['totals']['bus_count'] = len(rot)
+                all_financials[perm_key] = financials
+                all_rotations[perm_key] = rot
+                print(f"      {len(rot)} bussen, winst: {financials['totals']['total_net_profit']:,.0f} EUR")
 
-                file8a_risico = f"{output_base}_{algo_short}_8a_financieel_basis_risico.xlsx"
-                generate_output(rot8a_risico, trips_with_reserves, reserves, file8a_risico, baseline_turnaround, algo_key,
+                # Write output file
+                file_path = f"{output_base}_{algo_short}_{file_suffix}.xlsx"
+                generate_output(rot, trips_with_reserves, reserves, file_path, baseline_turnaround, algo_key,
                                 include_sensitivity=True, output_mode=4,
                                 risk_report=risk_report if 'risk_report' in dir() else None,
-                                deadhead_matrix=None, version=8)
-                wb8a_risico = openpyxl.load_workbook(file8a_risico)
-                if fuel_results_8a_risico:
-                    write_fuel_analysis_sheet(wb8a_risico, fuel_results_8a_risico, fuel_stations, fuel_config)
-                write_financial_sheet(wb8a_risico, financials_8a_risico)
-                write_cost_calculation_sheet(wb8a_risico, financial_config)
-                wb8a_risico.save(file8a_risico)
+                                deadhead_matrix=dh_matrix, version=8)
+                wb = openpyxl.load_workbook(file_path)
+                if fuel_results:
+                    write_fuel_analysis_sheet(wb, fuel_results, fuel_stations, fuel_config)
+                write_financial_sheet(wb, financials)
+                write_cost_calculation_sheet(wb, financial_config)
+                wb.save(file_path)
+                return rot, financials
 
-            # ---- 8b: Met Deadhead (if available) ----
-            if deadhead_matrix:
-                print(f"    8b - Met Deadhead...")
-                # Generate deadhead rotations (same as v5 but fresh)
-                rot8b = optimize_rotations(trips_with_reserves, baseline_turnaround,
-                                           algorithm=algo_key,
-                                           deadhead_matrix=deadhead_matrix,
-                                           trip_turnaround_overrides=trip_overrides_v8)
+            # =====================================================================
+            # BASIS PERMUTATIONS (no deadhead, no multiday)
+            # =====================================================================
+            print(f"    Basis permutaties...")
 
-                # Apply fuel constraints if enabled
-                fuel_results_8b = None
-                if args.fuel_constraints and fuel_config and fuel_stations:
-                    rot8b_before = len(rot8b)
-                    rot8b, fuel_results_8b, _ = apply_fuel_constraints(
-                        rot8b, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                        turnaround_map=baseline_turnaround, algorithm=algo_key
-                    )
-                    if len(rot8b) > rot8b_before:
-                        print(f"      +{len(rot8b) - rot8b_before} bussen door tankbeperkingen")
+            # 8a: Basis (no fuel)
+            print(f"      basis...")
+            rot_basis = algo_results[3]['rotations']
+            process_permutation(rot_basis, "basis", "Basis", "8a_financieel_basis",
+                               dh_matrix=None, apply_fuel=False)
 
-                financials_8b = calculate_total_financials(rot8b, financial_config, fuel_type="diesel")
-                financials_8b['totals']['bus_count'] = len(rot8b)
-                all_financials["deadhead"] = financials_8b
-                all_rotations["deadhead"] = rot8b
-                print(f"      {len(rot8b)} bussen, winst: {financials_8b['totals']['total_net_profit']:,.0f} EUR")
+            # 8a_brandstof: Basis with fuel constraints
+            if has_fuel:
+                print(f"      basis_brandstof...")
+                rot_basis_copy = algo_results[3]['rotations'][:]  # Fresh copy
+                process_permutation(rot_basis_copy, "basis_brandstof", "Basis + Brandstof",
+                                   "8a_financieel_basis_brandstof", dh_matrix=None, apply_fuel=True)
 
-                # Write 8b output
-                file8b = f"{output_base}_{algo_short}_8b_financieel_deadhead.xlsx"
-                generate_output(rot8b, trips_with_reserves, reserves, file8b, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report if 'risk_report' in dir() else None,
-                                deadhead_matrix=deadhead_matrix, version=8)
-                wb8b = openpyxl.load_workbook(file8b)
-                if fuel_results_8b:
-                    write_fuel_analysis_sheet(wb8b, fuel_results_8b, fuel_stations, fuel_config)
-                write_financial_sheet(wb8b, financials_8b)
-                write_cost_calculation_sheet(wb8b, financial_config)
-                wb8b.save(file8b)
-
-                # ---- 8b_risico: Deadhead with risk-adjusted turnaround ----
-                if trip_overrides_v8:
-                    print(f"    8b_risico - Deadhead met risico-keertijden...")
-                    rot8b_risico = optimize_rotations(trips_with_reserves, baseline_turnaround,
+            # 8a_risico: Basis with risk (no fuel)
+            if has_risk:
+                print(f"      basis_risico...")
+                rot_basis_risico = optimize_rotations(trips_with_reserves, baseline_turnaround,
                                                        algorithm=algo_key,
-                                                       deadhead_matrix=deadhead_matrix,
                                                        trip_turnaround_overrides=trip_overrides_v8)
+                process_permutation(rot_basis_risico, "basis_risico", "Basis + Risico",
+                                   "8a_financieel_basis_risico", dh_matrix=None, apply_fuel=False)
 
-                    fuel_results_8b_risico = None
-                    if args.fuel_constraints and fuel_config and fuel_stations:
-                        rot8b_risico_before = len(rot8b_risico)
-                        rot8b_risico, fuel_results_8b_risico, _ = apply_fuel_constraints(
-                            rot8b_risico, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                            turnaround_map=baseline_turnaround, algorithm=algo_key
-                        )
-                        if len(rot8b_risico) > rot8b_risico_before:
-                            print(f"      +{len(rot8b_risico) - rot8b_risico_before} bussen door tankbeperkingen")
+                # 8a_risico_brandstof: Basis with risk AND fuel
+                if has_fuel:
+                    print(f"      basis_risico_brandstof...")
+                    rot_basis_risico_copy = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                                                algorithm=algo_key,
+                                                                trip_turnaround_overrides=trip_overrides_v8)
+                    process_permutation(rot_basis_risico_copy, "basis_risico_brandstof",
+                                       "Basis + Risico + Brandstof",
+                                       "8a_financieel_basis_risico_brandstof", dh_matrix=None, apply_fuel=True)
 
-                    financials_8b_risico = calculate_total_financials(rot8b_risico, financial_config, fuel_type="diesel")
-                    financials_8b_risico['totals']['bus_count'] = len(rot8b_risico)
-                    all_financials["deadhead_risico"] = financials_8b_risico
-                    all_rotations["deadhead_risico"] = rot8b_risico
-                    print(f"      {len(rot8b_risico)} bussen, winst: {financials_8b_risico['totals']['total_net_profit']:,.0f} EUR")
-
-                    file8b_risico = f"{output_base}_{algo_short}_8b_financieel_deadhead_risico.xlsx"
-                    generate_output(rot8b_risico, trips_with_reserves, reserves, file8b_risico, baseline_turnaround, algo_key,
-                                    include_sensitivity=True, output_mode=4,
-                                    risk_report=risk_report if 'risk_report' in dir() else None,
-                                    deadhead_matrix=deadhead_matrix, version=8)
-                    wb8b_risico = openpyxl.load_workbook(file8b_risico)
-                    if fuel_results_8b_risico:
-                        write_fuel_analysis_sheet(wb8b_risico, fuel_results_8b_risico, fuel_stations, fuel_config)
-                    write_financial_sheet(wb8b_risico, financials_8b_risico)
-                    write_cost_calculation_sheet(wb8b_risico, financial_config)
-                    wb8b_risico.save(file8b_risico)
-
-            # ---- 8c: Multidag (no deadhead, no risk adjustment) ----
-            print(f"    8c - Multidag (geen deadhead)...")
-            multiday_groups_8c, _ = _group_trips_multiday(all_trips, baseline_turnaround)
-            rot8c = []
-            rotation_counter = 0
-            for bus_type, group_trips in multiday_groups_8c.items():
-                if not group_trips:
-                    continue
-                if algo_key == "greedy":
-                    chains = _optimize_greedy(group_trips, baseline_turnaround,
-                                              service_constraint=False,
-                                              deadhead_matrix=None,
-                                              trip_turnaround_overrides=None,
-                                              multiday=True)
-                else:
-                    chains = _optimize_mincost(group_trips, baseline_turnaround,
-                                               service_constraint=False,
-                                               deadhead_matrix=None,
-                                               trip_turnaround_overrides=None,
-                                               multiday=True)
-                for chain in chains:
-                    rotation_counter += 1
-                    chain_trips = [group_trips[i] for i in chain]
-                    dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
-                    date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-                    bus_id = f"8c-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
-                    rot8c.append(BusRotation(
-                        bus_id=bus_id, bus_type=bus_type,
-                        date_str=chain_trips[0].date_str if chain_trips else "",
-                        trips=chain_trips,
-                    ))
-
-            # Apply fuel constraints if enabled
-            fuel_results_8c = None
-            if args.fuel_constraints and fuel_config and fuel_stations:
-                rot8c_before = len(rot8c)
-                rot8c, fuel_results_8c, _ = apply_fuel_constraints(
-                    rot8c, fuel_config, fuel_stations, None, deadhead_km_matrix,
-                    turnaround_map=baseline_turnaround, algorithm=algo_key
-                )
-                if len(rot8c) > rot8c_before:
-                    print(f"      +{len(rot8c) - rot8c_before} bussen door tankbeperkingen")
-
-            financials_8c = calculate_total_financials(rot8c, financial_config, fuel_type="diesel")
-            financials_8c['totals']['bus_count'] = len(rot8c)
-            all_financials["multidag"] = financials_8c
-            all_rotations["multidag"] = rot8c
-            print(f"      {len(rot8c)} bussen, winst: {financials_8c['totals']['total_net_profit']:,.0f} EUR")
-
-            # Write 8c output
-            file8c = f"{output_base}_{algo_short}_8c_financieel_multidag.xlsx"
-            generate_output(rot8c, trips_with_reserves, reserves, file8c, baseline_turnaround, algo_key,
-                            include_sensitivity=True, output_mode=4,
-                            risk_report=risk_report if 'risk_report' in dir() else None,
-                            deadhead_matrix=None, version=8)
-            wb8c = openpyxl.load_workbook(file8c)
-            if fuel_results_8c:
-                write_fuel_analysis_sheet(wb8c, fuel_results_8c, fuel_stations, fuel_config)
-            write_financial_sheet(wb8c, financials_8c)
-            write_cost_calculation_sheet(wb8c, financial_config)
-            wb8c.save(file8c)
-
-            # ---- 8c_risico: Multidag with risk-adjusted turnaround ----
-            if trip_overrides_v8:
-                print(f"    8c_risico - Multidag met risico-keertijden...")
-                multiday_groups_8c_r, _ = _group_trips_multiday(all_trips, baseline_turnaround)
-                rot8c_risico = []
-                rotation_counter = 0
-                for bus_type, group_trips in multiday_groups_8c_r.items():
-                    if not group_trips:
-                        continue
-                    if algo_key == "greedy":
-                        chains = _optimize_greedy(group_trips, baseline_turnaround,
-                                                  service_constraint=False,
-                                                  deadhead_matrix=None,
-                                                  trip_turnaround_overrides=trip_overrides_v8,
-                                                  multiday=True)
-                    else:
-                        chains = _optimize_mincost(group_trips, baseline_turnaround,
-                                                   service_constraint=False,
-                                                   deadhead_matrix=None,
-                                                   trip_turnaround_overrides=trip_overrides_v8,
-                                                   multiday=True)
-                    for chain in chains:
-                        rotation_counter += 1
-                        chain_trips = [group_trips[i] for i in chain]
-                        dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
-                        date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-                        bus_id = f"8cr-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
-                        rot8c_risico.append(BusRotation(
-                            bus_id=bus_id, bus_type=bus_type,
-                            date_str=chain_trips[0].date_str if chain_trips else "",
-                            trips=chain_trips,
-                        ))
-
-                fuel_results_8c_risico = None
-                if args.fuel_constraints and fuel_config and fuel_stations:
-                    rot8c_risico_before = len(rot8c_risico)
-                    rot8c_risico, fuel_results_8c_risico, _ = apply_fuel_constraints(
-                        rot8c_risico, fuel_config, fuel_stations, None, deadhead_km_matrix,
-                        turnaround_map=baseline_turnaround, algorithm=algo_key
-                    )
-                    if len(rot8c_risico) > rot8c_risico_before:
-                        print(f"      +{len(rot8c_risico) - rot8c_risico_before} bussen door tankbeperkingen")
-
-                financials_8c_risico = calculate_total_financials(rot8c_risico, financial_config, fuel_type="diesel")
-                financials_8c_risico['totals']['bus_count'] = len(rot8c_risico)
-                all_financials["multidag_risico"] = financials_8c_risico
-                all_rotations["multidag_risico"] = rot8c_risico
-                print(f"      {len(rot8c_risico)} bussen, winst: {financials_8c_risico['totals']['total_net_profit']:,.0f} EUR")
-
-                file8c_risico = f"{output_base}_{algo_short}_8c_financieel_multidag_risico.xlsx"
-                generate_output(rot8c_risico, trips_with_reserves, reserves, file8c_risico, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report if 'risk_report' in dir() else None,
-                                deadhead_matrix=None, version=8)
-                wb8c_risico = openpyxl.load_workbook(file8c_risico)
-                if fuel_results_8c_risico:
-                    write_fuel_analysis_sheet(wb8c_risico, fuel_results_8c_risico, fuel_stations, fuel_config)
-                write_financial_sheet(wb8c_risico, financials_8c_risico)
-                write_cost_calculation_sheet(wb8c_risico, financial_config)
-                wb8c_risico.save(file8c_risico)
-
-            # ---- 8d: Deadhead + Multidag (if deadhead available, no risk) ----
+            # =====================================================================
+            # DEADHEAD PERMUTATIONS (with deadhead, no multiday)
+            # =====================================================================
             if deadhead_matrix:
-                print(f"    8d - Deadhead + Multidag...")
-                multiday_groups_8d, _ = _group_trips_multiday(all_trips, baseline_turnaround)
-                rot8d = []
-                rotation_counter = 0
-                for bus_type, group_trips in multiday_groups_8d.items():
+                print(f"    Deadhead permutaties...")
+
+                # 8b: Deadhead (no risk, no fuel)
+                print(f"      deadhead...")
+                rot_deadhead = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                                   algorithm=algo_key,
+                                                   deadhead_matrix=deadhead_matrix,
+                                                   trip_turnaround_overrides=None)
+                process_permutation(rot_deadhead, "deadhead", "Deadhead",
+                                   "8b_financieel_deadhead", dh_matrix=deadhead_matrix, apply_fuel=False)
+
+                # 8b_brandstof: Deadhead with fuel
+                if has_fuel:
+                    print(f"      deadhead_brandstof...")
+                    rot_deadhead_copy = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                                            algorithm=algo_key,
+                                                            deadhead_matrix=deadhead_matrix,
+                                                            trip_turnaround_overrides=None)
+                    process_permutation(rot_deadhead_copy, "deadhead_brandstof", "Deadhead + Brandstof",
+                                       "8b_financieel_deadhead_brandstof", dh_matrix=deadhead_matrix, apply_fuel=True)
+
+                # 8b_risico: Deadhead with risk (no fuel)
+                if has_risk:
+                    print(f"      deadhead_risico...")
+                    rot_dh_risico = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                                        algorithm=algo_key,
+                                                        deadhead_matrix=deadhead_matrix,
+                                                        trip_turnaround_overrides=trip_overrides_v8)
+                    process_permutation(rot_dh_risico, "deadhead_risico", "Deadhead + Risico",
+                                       "8b_financieel_deadhead_risico", dh_matrix=deadhead_matrix, apply_fuel=False)
+
+                    # 8b_risico_brandstof: Deadhead with risk AND fuel
+                    if has_fuel:
+                        print(f"      deadhead_risico_brandstof...")
+                        rot_dh_risico_copy = optimize_rotations(trips_with_reserves, baseline_turnaround,
+                                                                 algorithm=algo_key,
+                                                                 deadhead_matrix=deadhead_matrix,
+                                                                 trip_turnaround_overrides=trip_overrides_v8)
+                        process_permutation(rot_dh_risico_copy, "deadhead_risico_brandstof",
+                                           "Deadhead + Risico + Brandstof",
+                                           "8b_financieel_deadhead_risico_brandstof",
+                                           dh_matrix=deadhead_matrix, apply_fuel=True)
+
+            # =====================================================================
+            # MULTIDAG PERMUTATIONS (no deadhead, with multiday)
+            # =====================================================================
+            print(f"    Multidag permutaties...")
+
+            # Helper to generate multiday rotations
+            def generate_multiday_rotations(use_deadhead, use_risk, prefix):
+                """Generate multiday rotations with given options."""
+                multiday_groups, _ = _group_trips_multiday(all_trips, baseline_turnaround)
+                rotations = []
+                counter = 0
+                dh = deadhead_matrix if use_deadhead else None
+                overrides = trip_overrides_v8 if use_risk else None
+                for bus_type, group_trips in multiday_groups.items():
                     if not group_trips:
                         continue
                     if algo_key == "greedy":
                         chains = _optimize_greedy(group_trips, baseline_turnaround,
                                                   service_constraint=False,
-                                                  deadhead_matrix=deadhead_matrix,
-                                                  trip_turnaround_overrides=None,
+                                                  deadhead_matrix=dh,
+                                                  trip_turnaround_overrides=overrides,
                                                   multiday=True)
                     else:
                         chains = _optimize_mincost(group_trips, baseline_turnaround,
                                                    service_constraint=False,
-                                                   deadhead_matrix=deadhead_matrix,
-                                                   trip_turnaround_overrides=None,
+                                                   deadhead_matrix=dh,
+                                                   trip_turnaround_overrides=overrides,
                                                    multiday=True)
                     for chain in chains:
-                        rotation_counter += 1
+                        counter += 1
                         chain_trips = [group_trips[i] for i in chain]
                         dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
                         date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-                        bus_id = f"8d-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
-                        rot8d.append(BusRotation(
+                        bus_id = f"{prefix}-{bus_type[:2].upper()}-{date_label}-{counter:03d}"
+                        rotations.append(BusRotation(
                             bus_id=bus_id, bus_type=bus_type,
                             date_str=chain_trips[0].date_str if chain_trips else "",
                             trips=chain_trips,
                         ))
+                return rotations
 
-                # Apply fuel constraints if enabled
-                fuel_results_8d = None
-                if args.fuel_constraints and fuel_config and fuel_stations:
-                    rot8d_before = len(rot8d)
-                    rot8d, fuel_results_8d, _ = apply_fuel_constraints(
-                        rot8d, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                        turnaround_map=baseline_turnaround, algorithm=algo_key
-                    )
-                    if len(rot8d) > rot8d_before:
-                        print(f"      +{len(rot8d) - rot8d_before} bussen door tankbeperkingen")
+            # 8c: Multidag (no deadhead, no risk, no fuel)
+            print(f"      multidag...")
+            rot_multidag = generate_multiday_rotations(use_deadhead=False, use_risk=False, prefix="8c")
+            process_permutation(rot_multidag, "multidag", "Multidag",
+                               "8c_financieel_multidag", dh_matrix=None, apply_fuel=False)
 
-                financials_8d = calculate_total_financials(rot8d, financial_config, fuel_type="diesel")
-                financials_8d['totals']['bus_count'] = len(rot8d)
-                all_financials["deadhead_multidag"] = financials_8d
-                all_rotations["deadhead_multidag"] = rot8d
-                print(f"      {len(rot8d)} bussen, winst: {financials_8d['totals']['total_net_profit']:,.0f} EUR")
+            # 8c_brandstof: Multidag with fuel
+            if has_fuel:
+                print(f"      multidag_brandstof...")
+                rot_multidag_f = generate_multiday_rotations(use_deadhead=False, use_risk=False, prefix="8cf")
+                process_permutation(rot_multidag_f, "multidag_brandstof", "Multidag + Brandstof",
+                                   "8c_financieel_multidag_brandstof", dh_matrix=None, apply_fuel=True)
 
-                # Write 8d output
-                file8d = f"{output_base}_{algo_short}_8d_financieel_deadhead_multidag.xlsx"
-                generate_output(rot8d, trips_with_reserves, reserves, file8d, baseline_turnaround, algo_key,
-                                include_sensitivity=True, output_mode=4,
-                                risk_report=risk_report if 'risk_report' in dir() else None,
-                                deadhead_matrix=deadhead_matrix, version=8)
-                wb8d = openpyxl.load_workbook(file8d)
-                if fuel_results_8d:
-                    write_fuel_analysis_sheet(wb8d, fuel_results_8d, fuel_stations, fuel_config)
-                write_financial_sheet(wb8d, financials_8d)
-                write_cost_calculation_sheet(wb8d, financial_config)
-                wb8d.save(file8d)
+            # 8c_risico: Multidag with risk (no fuel)
+            if has_risk:
+                print(f"      multidag_risico...")
+                rot_multidag_r = generate_multiday_rotations(use_deadhead=False, use_risk=True, prefix="8cr")
+                process_permutation(rot_multidag_r, "multidag_risico", "Multidag + Risico",
+                                   "8c_financieel_multidag_risico", dh_matrix=None, apply_fuel=False)
 
-                # ---- 8d_risico: Deadhead + Multidag with risk-adjusted turnaround ----
-                if trip_overrides_v8:
-                    print(f"    8d_risico - Deadhead + Multidag met risico-keertijden...")
-                    multiday_groups_8d_r, _ = _group_trips_multiday(all_trips, baseline_turnaround)
-                    rot8d_risico = []
-                    rotation_counter = 0
-                    for bus_type, group_trips in multiday_groups_8d_r.items():
-                        if not group_trips:
-                            continue
-                        if algo_key == "greedy":
-                            chains = _optimize_greedy(group_trips, baseline_turnaround,
-                                                      service_constraint=False,
-                                                      deadhead_matrix=deadhead_matrix,
-                                                      trip_turnaround_overrides=trip_overrides_v8,
-                                                      multiday=True)
-                        else:
-                            chains = _optimize_mincost(group_trips, baseline_turnaround,
-                                                       service_constraint=False,
-                                                       deadhead_matrix=deadhead_matrix,
-                                                       trip_turnaround_overrides=trip_overrides_v8,
-                                                       multiday=True)
-                        for chain in chains:
-                            rotation_counter += 1
-                            chain_trips = [group_trips[i] for i in chain]
-                            dates = sorted(set(t.date_str.split()[0] for t in chain_trips if t.date_str))
-                            date_label = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-                            bus_id = f"8dr-{bus_type[:2].upper()}-{date_label}-{rotation_counter:03d}"
-                            rot8d_risico.append(BusRotation(
-                                bus_id=bus_id, bus_type=bus_type,
-                                date_str=chain_trips[0].date_str if chain_trips else "",
-                                trips=chain_trips,
-                            ))
+                # 8c_risico_brandstof: Multidag with risk AND fuel
+                if has_fuel:
+                    print(f"      multidag_risico_brandstof...")
+                    rot_multidag_rf = generate_multiday_rotations(use_deadhead=False, use_risk=True, prefix="8crf")
+                    process_permutation(rot_multidag_rf, "multidag_risico_brandstof",
+                                       "Multidag + Risico + Brandstof",
+                                       "8c_financieel_multidag_risico_brandstof", dh_matrix=None, apply_fuel=True)
 
-                    fuel_results_8d_risico = None
-                    if args.fuel_constraints and fuel_config and fuel_stations:
-                        rot8d_risico_before = len(rot8d_risico)
-                        rot8d_risico, fuel_results_8d_risico, _ = apply_fuel_constraints(
-                            rot8d_risico, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                            turnaround_map=baseline_turnaround, algorithm=algo_key
-                        )
-                        if len(rot8d_risico) > rot8d_risico_before:
-                            print(f"      +{len(rot8d_risico) - rot8d_risico_before} bussen door tankbeperkingen")
+            # =====================================================================
+            # DEADHEAD + MULTIDAG PERMUTATIONS
+            # =====================================================================
+            if deadhead_matrix:
+                print(f"    Deadhead + Multidag permutaties...")
 
-                    financials_8d_risico = calculate_total_financials(rot8d_risico, financial_config, fuel_type="diesel")
-                    financials_8d_risico['totals']['bus_count'] = len(rot8d_risico)
-                    all_financials["deadhead_multidag_risico"] = financials_8d_risico
-                    all_rotations["deadhead_multidag_risico"] = rot8d_risico
-                    print(f"      {len(rot8d_risico)} bussen, winst: {financials_8d_risico['totals']['total_net_profit']:,.0f} EUR")
+                # 8d: Deadhead + Multidag (no risk, no fuel)
+                print(f"      deadhead_multidag...")
+                rot_dh_md = generate_multiday_rotations(use_deadhead=True, use_risk=False, prefix="8d")
+                process_permutation(rot_dh_md, "deadhead_multidag", "Deadhead + Multidag",
+                                   "8d_financieel_deadhead_multidag", dh_matrix=deadhead_matrix, apply_fuel=False)
 
-                    file8d_risico = f"{output_base}_{algo_short}_8d_financieel_deadhead_multidag_risico.xlsx"
-                    generate_output(rot8d_risico, trips_with_reserves, reserves, file8d_risico, baseline_turnaround, algo_key,
-                                    include_sensitivity=True, output_mode=4,
-                                    risk_report=risk_report if 'risk_report' in dir() else None,
-                                    deadhead_matrix=deadhead_matrix, version=8)
-                    wb8d_risico = openpyxl.load_workbook(file8d_risico)
-                    if fuel_results_8d_risico:
-                        write_fuel_analysis_sheet(wb8d_risico, fuel_results_8d_risico, fuel_stations, fuel_config)
-                    write_financial_sheet(wb8d_risico, financials_8d_risico)
-                    write_cost_calculation_sheet(wb8d_risico, financial_config)
-                    wb8d_risico.save(file8d_risico)
+                # 8d_brandstof: Deadhead + Multidag with fuel
+                if has_fuel:
+                    print(f"      deadhead_multidag_brandstof...")
+                    rot_dh_md_f = generate_multiday_rotations(use_deadhead=True, use_risk=False, prefix="8df")
+                    process_permutation(rot_dh_md_f, "deadhead_multidag_brandstof",
+                                       "Deadhead + Multidag + Brandstof",
+                                       "8d_financieel_deadhead_multidag_brandstof",
+                                       dh_matrix=deadhead_matrix, apply_fuel=True)
+
+                # 8d_risico: Deadhead + Multidag with risk (no fuel)
+                if has_risk:
+                    print(f"      deadhead_multidag_risico...")
+                    rot_dh_md_r = generate_multiday_rotations(use_deadhead=True, use_risk=True, prefix="8dr")
+                    process_permutation(rot_dh_md_r, "deadhead_multidag_risico",
+                                       "Deadhead + Multidag + Risico",
+                                       "8d_financieel_deadhead_multidag_risico",
+                                       dh_matrix=deadhead_matrix, apply_fuel=False)
+
+                    # 8d_risico_brandstof: All features combined
+                    if has_fuel:
+                        print(f"      deadhead_multidag_risico_brandstof...")
+                        rot_dh_md_rf = generate_multiday_rotations(use_deadhead=True, use_risk=True, prefix="8drf")
+                        process_permutation(rot_dh_md_rf, "deadhead_multidag_risico_brandstof",
+                                           "Deadhead + Multidag + Risico + Brandstof",
+                                           "8d_financieel_deadhead_multidag_risico_brandstof",
+                                           dh_matrix=deadhead_matrix, apply_fuel=True)
 
             # ---- Create comparison file ----
             print(f"    Vergelijkingsoverzicht...")
@@ -6677,17 +6520,7 @@ def main():
             best_key = max(all_financials.keys(),
                            key=lambda k: all_financials[k]['totals']['total_net_profit'])
             best_profit = all_financials[best_key]['totals']['total_net_profit']
-            best_display = {
-                "basis": "Basis",
-                "basis_risico": "Basis+Risico",
-                "deadhead": "Deadhead",
-                "deadhead_risico": "Deadhead+Risico",
-                "multidag": "Multidag",
-                "multidag_risico": "Multidag+Risico",
-                "deadhead_multidag": "Deadhead+Multidag",
-                "deadhead_multidag_risico": "Deadhead+Multidag+Risico",
-            }
-            print(f"    Beste optie: {best_display.get(best_key, best_key)} "
+            print(f"    Beste optie: {best_key} "
                   f"met {all_financials[best_key]['totals']['bus_count']} bussen, "
                   f"winst: {best_profit:,.0f} EUR")
 
