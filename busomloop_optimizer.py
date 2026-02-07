@@ -1495,11 +1495,132 @@ def validate_fuel_feasibility(rotation: BusRotation, fuel_config: dict,
     )
 
 
+def _calculate_rotation_km(rotation: BusRotation, fuel_config: dict,
+                           deadhead_matrix: dict = None,
+                           deadhead_km_matrix: dict = None) -> float:
+    """Calculate total km for a rotation including deadhead."""
+    total_km = 0.0
+    speed_to_station = fuel_config.get("speed_to_station_kmh", 30)
+
+    for i, trip in enumerate(rotation.trips):
+        trip_km = estimate_trip_km(trip, fuel_config)
+
+        # Add deadhead km from previous trip
+        if i > 0:
+            prev_dest = normalize_location(rotation.trips[i - 1].dest_code)
+            curr_orig = normalize_location(trip.origin_code)
+            if prev_dest != curr_orig:
+                deadhead_km = 0.0
+                if deadhead_km_matrix:
+                    deadhead_km = deadhead_km_matrix.get(prev_dest, {}).get(curr_orig, 0) or 0
+                if deadhead_km == 0 and deadhead_matrix:
+                    dh_time = deadhead_matrix.get(prev_dest, {}).get(curr_orig, 0)
+                    if dh_time > 0:
+                        deadhead_km = (dh_time / 60) * speed_to_station
+                trip_km += deadhead_km
+
+        total_km += trip_km
+
+    return total_km
+
+
+def _can_insert_trip_with_fuel(rotation: BusRotation, trip: Trip, insert_pos: str,
+                                fuel_config: dict, fuel_stations: dict,
+                                deadhead_matrix: dict = None,
+                                deadhead_km_matrix: dict = None) -> tuple:
+    """Check if a trip can be inserted into a rotation respecting fuel constraints.
+
+    Args:
+        rotation: Existing rotation
+        trip: Trip to insert
+        insert_pos: "start" or "end"
+        fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix: Fuel config
+
+    Returns: (can_insert, needs_refuel, refuel_info)
+    """
+    bus_type = rotation.bus_type
+    fuel_range = fuel_config["diesel_range_km"].get(bus_type, 1000)
+    refuel_time = fuel_config["refuel_time_min"]
+    speed_to_station = fuel_config.get("speed_to_station_kmh", 30)
+
+    # Calculate current rotation km
+    current_km = _calculate_rotation_km(rotation, fuel_config, deadhead_matrix, deadhead_km_matrix)
+
+    # Calculate additional km from the new trip
+    trip_km = estimate_trip_km(trip, fuel_config)
+
+    # Calculate deadhead km for connection
+    deadhead_km = 0.0
+    if insert_pos == "end" and rotation.trips:
+        last_dest = normalize_location(rotation.trips[-1].dest_code)
+        trip_orig = normalize_location(trip.origin_code)
+        if last_dest != trip_orig:
+            if deadhead_km_matrix:
+                deadhead_km = deadhead_km_matrix.get(last_dest, {}).get(trip_orig, 0) or 0
+            if deadhead_km == 0 and deadhead_matrix:
+                dh_time = deadhead_matrix.get(last_dest, {}).get(trip_orig, 0)
+                if dh_time > 0:
+                    deadhead_km = (dh_time / 60) * speed_to_station
+    elif insert_pos == "start" and rotation.trips:
+        trip_dest = normalize_location(trip.dest_code)
+        first_orig = normalize_location(rotation.trips[0].origin_code)
+        if trip_dest != first_orig:
+            if deadhead_km_matrix:
+                deadhead_km = deadhead_km_matrix.get(trip_dest, {}).get(first_orig, 0) or 0
+            if deadhead_km == 0 and deadhead_matrix:
+                dh_time = deadhead_matrix.get(trip_dest, {}).get(first_orig, 0)
+                if dh_time > 0:
+                    deadhead_km = (dh_time / 60) * speed_to_station
+
+    total_new_km = current_km + trip_km + deadhead_km
+
+    if total_new_km <= fuel_range:
+        return True, False, None
+
+    # Need refueling - check if there's an opportunity
+    if insert_pos == "end" and rotation.trips:
+        last_trip = rotation.trips[-1]
+        idle_gap = trip.departure - last_trip.arrival
+
+        station_loc = normalize_location(last_trip.dest_code)
+        stations = fuel_stations.get(station_loc, [])
+
+        if not stations:
+            for loc_name in fuel_stations:
+                if normalize_location(loc_name) == station_loc:
+                    stations = fuel_stations[loc_name]
+                    break
+
+        if stations:
+            nearest = stations[0]
+            if nearest.get("drive_time_min"):
+                drive_time_one_way = nearest["drive_time_min"]
+            else:
+                drive_time_one_way = (nearest["distance_km"] / speed_to_station) * 60
+            drive_time_total = 2 * drive_time_one_way
+            total_time_needed = refuel_time + drive_time_total
+
+            if idle_gap >= total_time_needed:
+                return True, True, {
+                    "station": station_loc,
+                    "fuel_station": nearest["name"],
+                    "drive_time": drive_time_total,
+                    "idle_gap": idle_gap
+                }
+
+    return False, False, None
+
+
 def apply_fuel_constraints(rotations: list, fuel_config: dict,
                            fuel_stations: dict,
                            deadhead_matrix: dict = None,
-                           deadhead_km_matrix: dict = None) -> tuple:
-    """Apply fuel constraints to rotations, splitting where necessary.
+                           deadhead_km_matrix: dict = None,
+                           turnaround_map: dict = None) -> tuple:
+    """Apply fuel constraints to rotations with smart reassignment.
+
+    Instead of just splitting rotations when fuel constraints are violated,
+    this function tries to reassign orphan trips to other rotations that
+    have fuel headroom and compatible timing.
 
     Args:
         rotations: List of bus rotations
@@ -1507,16 +1628,21 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         fuel_stations: Fuel stations per location
         deadhead_matrix: Optional {origin: {dest: minutes}} for deadhead time
         deadhead_km_matrix: Optional {origin: {dest: km}} from Google Maps
+        turnaround_map: Optional {bus_type: min_turnaround_minutes}
 
     Returns: (new_rotations, validation_results, split_count)
-    - new_rotations: list of rotations after applying splits
+    - new_rotations: list of rotations after applying constraints
     - validation_results: {rotation_id: FuelValidationResult}
-    - split_count: number of chains that were split
+    - split_count: number of original chains that had fuel issues
     """
-    new_rotations = []
+    if turnaround_map is None:
+        turnaround_map = dict(MIN_TURNAROUND_DEFAULTS)
+
+    # Phase 1: Validate all rotations and collect orphans
+    feasible_rotations = []
+    orphan_trips = []  # Trips that need reassignment
     validation_results = {}
     split_count = 0
-    rotation_counter = len(rotations)  # Start numbering after existing
 
     for rotation in rotations:
         result = validate_fuel_feasibility(
@@ -1525,30 +1651,168 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         validation_results[rotation.bus_id] = result
 
         if result.is_feasible:
-            # No splits needed, keep rotation as-is
-            new_rotations.append(rotation)
+            feasible_rotations.append(rotation)
         else:
-            # Need to split at split_points
             split_count += 1
             trips = rotation.trips
             split_indices = [0] + result.split_points + [len(trips)]
 
-            for j in range(len(split_indices) - 1):
+            # First segment stays as a rotation
+            first_segment = trips[split_indices[0]:split_indices[1]]
+            if first_segment:
+                new_rot = BusRotation(
+                    bus_id=f"{rotation.bus_id}_a",
+                    bus_type=rotation.bus_type,
+                    date_str=rotation.date_str,
+                    trips=first_segment,
+                )
+                feasible_rotations.append(new_rot)
+
+            # Remaining segments become orphans for reassignment
+            for j in range(1, len(split_indices) - 1):
                 start_idx = split_indices[j]
                 end_idx = split_indices[j + 1]
-                subset_trips = trips[start_idx:end_idx]
+                for trip in trips[start_idx:end_idx]:
+                    orphan_trips.append(trip)
 
-                if subset_trips:
-                    rotation_counter += 1
-                    new_rotation = BusRotation(
-                        bus_id=f"{rotation.date_str}_{rotation.bus_type[:2]}_{rotation_counter:03d}",
-                        bus_type=rotation.bus_type,
-                        date_str=rotation.date_str,
-                        trips=subset_trips,
+    # Phase 2: Try to reassign orphan trips to existing rotations
+    reassigned = set()
+
+    for orphan in orphan_trips:
+        best_rotation = None
+        best_gap = float('inf')
+        best_pos = None
+        best_refuel_info = None
+
+        for rot in feasible_rotations:
+            # Must be same bus type
+            if rot.bus_type != orphan.bus_type:
+                continue
+
+            # Try inserting at end
+            if rot.trips:
+                last_trip = rot.trips[-1]
+                # Check timing: can we connect?
+                ok, dh_time = can_connect(last_trip, orphan, turnaround_map,
+                                          service_constraint=False,
+                                          deadhead_matrix=deadhead_matrix)
+                if ok:
+                    # Check fuel feasibility
+                    can_insert, needs_refuel, refuel_info = _can_insert_trip_with_fuel(
+                        rot, orphan, "end", fuel_config, fuel_stations,
+                        deadhead_matrix, deadhead_km_matrix
                     )
-                    new_rotations.append(new_rotation)
+                    if can_insert:
+                        gap = orphan.departure - last_trip.arrival
+                        if gap < best_gap:
+                            best_gap = gap
+                            best_rotation = rot
+                            best_pos = "end"
+                            best_refuel_info = refuel_info if needs_refuel else None
 
-    return new_rotations, validation_results, split_count
+            # Try inserting at start
+            if rot.trips:
+                first_trip = rot.trips[0]
+                # Check timing: can orphan connect to first trip?
+                ok, dh_time = can_connect(orphan, first_trip, turnaround_map,
+                                          service_constraint=False,
+                                          deadhead_matrix=deadhead_matrix)
+                if ok:
+                    # Check fuel (inserting at start is trickier for fuel tracking)
+                    # For simplicity, only allow if total km still fits
+                    can_insert, needs_refuel, refuel_info = _can_insert_trip_with_fuel(
+                        rot, orphan, "start", fuel_config, fuel_stations,
+                        deadhead_matrix, deadhead_km_matrix
+                    )
+                    if can_insert and not needs_refuel:  # No refuel for start insert
+                        gap = first_trip.departure - orphan.arrival
+                        if gap < best_gap:
+                            best_gap = gap
+                            best_rotation = rot
+                            best_pos = "start"
+                            best_refuel_info = None
+
+        if best_rotation is not None:
+            # Reassign the orphan to this rotation
+            if best_pos == "end":
+                best_rotation.trips.append(orphan)
+            else:
+                best_rotation.trips.insert(0, orphan)
+            reassigned.add(id(orphan))
+
+    # Phase 3: Create new rotations for unassigned orphans
+    unassigned = [t for t in orphan_trips if id(t) not in reassigned]
+    rotation_counter = len(rotations) + len(feasible_rotations)
+
+    # Group unassigned by date and bus type, then chain them
+    from collections import defaultdict
+    unassigned_groups = defaultdict(list)
+    for trip in unassigned:
+        key = (trip.date_str, trip.bus_type)
+        unassigned_groups[key].append(trip)
+
+    for (date_str, bus_type), trips in unassigned_groups.items():
+        # Sort by departure time
+        trips.sort(key=lambda t: (t.departure, t.arrival))
+
+        # Simple greedy chaining for unassigned trips
+        chains = []
+        for trip in trips:
+            placed = False
+            for chain in chains:
+                last_trip = chain[-1]
+                ok, _ = can_connect(last_trip, trip, turnaround_map,
+                                    service_constraint=False,
+                                    deadhead_matrix=deadhead_matrix)
+                if ok:
+                    # Check fuel for this chain
+                    temp_rot = BusRotation(
+                        bus_id="temp", bus_type=bus_type, date_str=date_str, trips=chain
+                    )
+                    can_add, _, _ = _can_insert_trip_with_fuel(
+                        temp_rot, trip, "end", fuel_config, fuel_stations,
+                        deadhead_matrix, deadhead_km_matrix
+                    )
+                    if can_add:
+                        chain.append(trip)
+                        placed = True
+                        break
+            if not placed:
+                chains.append([trip])
+
+        # Convert chains to rotations
+        for chain in chains:
+            rotation_counter += 1
+            new_rot = BusRotation(
+                bus_id=f"{date_str}_{bus_type[:2]}_fuel_{rotation_counter:03d}",
+                bus_type=bus_type,
+                date_str=date_str,
+                trips=chain,
+            )
+            feasible_rotations.append(new_rot)
+
+    # Recalculate idle times for all rotations
+    for rot in feasible_rotations:
+        if len(rot.trips) > 1:
+            total_idle = 0
+            for i in range(len(rot.trips) - 1):
+                gap = rot.trips[i + 1].departure - rot.trips[i].arrival
+                if deadhead_matrix:
+                    dh = deadhead_matrix.get(
+                        normalize_location(rot.trips[i].dest_code), {}
+                    ).get(normalize_location(rot.trips[i + 1].origin_code), 0)
+                    gap = max(0, gap - dh)
+                total_idle += max(0, gap)
+            rot.total_idle_minutes = total_idle
+
+    # Report reassignment stats
+    n_reassigned = len(reassigned)
+    n_new_buses = len([r for r in feasible_rotations if "_fuel_" in r.bus_id])
+    if n_reassigned > 0 or n_new_buses > 0:
+        print(f"    Fuel reassignment: {n_reassigned} trips reassigned, "
+              f"{n_new_buses} new buses for remaining {len(unassigned)} trips")
+
+    return feasible_rotations, validation_results, split_count
 
 
 def match_reserve_day(reserve_day: str, trip_dates: list) -> str:
@@ -5662,7 +5926,8 @@ def main():
 
             rot7_orig_count = len(base_rot)
             rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
-                base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix
+                base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
+                turnaround_map=baseline_turnaround
             )
 
             if fuel_splits_7 > 0:
@@ -5736,7 +6001,8 @@ def main():
             if args.fuel_constraints and fuel_config and fuel_stations and not used_v7:
                 rot8_before = len(rot8)
                 rot8, fuel_results_8, fuel_splits_8 = apply_fuel_constraints(
-                    rot8, fuel_config, fuel_stations, deadhead_km_matrix
+                    rot8, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
+                    turnaround_map=baseline_turnaround
                 )
                 if len(rot8) > rot8_before:
                     print(f"    Brandstofvalidatie: {len(rot8) - rot8_before} extra bussen door tankbeperkingen")
@@ -5861,7 +6127,8 @@ def main():
             if args.fuel_constraints and fuel_config and fuel_stations:
                 rot9_before = len(rot9)
                 rot9, fuel_results_9, fuel_splits_9 = apply_fuel_constraints(
-                    rot9, fuel_config, fuel_stations, deadhead_km_matrix
+                    rot9, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
+                    turnaround_map=baseline_turnaround
                 )
                 if len(rot9) > rot9_before:
                     print(f"    Brandstofvalidatie: {len(rot9) - rot9_before} extra bussen door tankbeperkingen")
