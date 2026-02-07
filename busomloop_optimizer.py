@@ -1615,17 +1615,18 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
                            fuel_stations: dict,
                            deadhead_matrix: dict = None,
                            deadhead_km_matrix: dict = None,
-                           turnaround_map: dict = None) -> tuple:
+                           turnaround_map: dict = None,
+                           algorithm: str = "mincost") -> tuple:
     """Apply fuel constraints to rotations with iterative re-optimization.
 
     When fuel constraints cause splits, the remaining trips are re-optimized
-    using mincost algorithm instead of just being assigned greedily.
+    using the selected algorithm instead of just being assigned greedily.
 
     Algorithm:
     1. Validate all rotations for fuel feasibility
     2. Keep feasible rotations and trips up to first split point
     3. Collect remaining trips after split points
-    4. Re-run mincost on remaining trips
+    4. Re-run optimization on remaining trips using selected algorithm
     5. Repeat until no more splits needed
 
     Args:
@@ -1635,6 +1636,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         deadhead_matrix: Optional {origin: {dest: minutes}} for deadhead time
         deadhead_km_matrix: Optional {origin: {dest: km}} from Google Maps
         turnaround_map: Optional {bus_type: min_turnaround_minutes}
+        algorithm: Algorithm to use for re-optimization ("greedy" or "mincost")
 
     Returns: (new_rotations, validation_results, split_count)
     """
@@ -1687,7 +1689,7 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
         if not remaining_trips:
             break  # All rotations are feasible
 
-        # Re-optimize remaining trips using mincost
+        # Re-optimize remaining trips using selected algorithm
         # Group by date and bus type
         from collections import defaultdict
         groups = defaultdict(list)
@@ -1695,14 +1697,17 @@ def apply_fuel_constraints(rotations: list, fuel_config: dict,
             key = (trip.date_str, trip.bus_type)
             groups[key].append(trip)
 
-        # Run mincost on each group and convert to rotations
+        # Select algorithm function
+        algo_func = _optimize_greedy if algorithm == "greedy" else _optimize_mincost
+
+        # Run selected algorithm on each group and convert to rotations
         new_rotations = []
         for (date_str, bus_type), group_trips in groups.items():
             if not group_trips:
                 continue
 
-            # Use mincost to re-optimize these trips
-            chains = _optimize_mincost(
+            # Use selected algorithm to re-optimize these trips
+            chains = algo_func(
                 group_trips, turnaround_map,
                 service_constraint=False,
                 deadhead_matrix=deadhead_matrix,
@@ -5887,7 +5892,7 @@ def main():
             rot7_orig_count = len(base_rot)
             rot7, fuel_results_7, fuel_splits_7 = apply_fuel_constraints(
                 base_rot, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                turnaround_map=baseline_turnaround
+                turnaround_map=baseline_turnaround, algorithm=algo_key
             )
 
             if fuel_splits_7 > 0:
@@ -5962,7 +5967,7 @@ def main():
                 rot8_before = len(rot8)
                 rot8, fuel_results_8, fuel_splits_8 = apply_fuel_constraints(
                     rot8, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                    turnaround_map=baseline_turnaround
+                    turnaround_map=baseline_turnaround, algorithm=algo_key
                 )
                 if len(rot8) > rot8_before:
                     print(f"    Brandstofvalidatie: {len(rot8) - rot8_before} extra bussen door tankbeperkingen")
@@ -6088,7 +6093,7 @@ def main():
                 rot9_before = len(rot9)
                 rot9, fuel_results_9, fuel_splits_9 = apply_fuel_constraints(
                     rot9, fuel_config, fuel_stations, deadhead_matrix, deadhead_km_matrix,
-                    turnaround_map=baseline_turnaround
+                    turnaround_map=baseline_turnaround, algorithm=algo_key
                 )
                 if len(rot9) > rot9_before:
                     print(f"    Brandstofvalidatie: {len(rot9) - rot9_before} extra bussen door tankbeperkingen")
