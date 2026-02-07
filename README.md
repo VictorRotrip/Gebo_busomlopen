@@ -499,13 +499,24 @@ Version 8 uses all financial variables from `additional_inputs.xlsx` to calculat
 
 The profit-maximizing algorithm:
 
-1. **Calculates fixed revenue** — same for all bus configurations (all trips must be covered)
-2. **Explores different bus counts** — from minimum feasible up to +30%
-3. **For each bus count**, calculates total cost:
+1. **Runs its own optimization** — does NOT inherit from Version 7. Re-runs min-cost max-matching from scratch
+2. **Finds minimum buses** — using the same algorithm as Version 5 (service-constrained min-cost matching)
+3. **Explores different bus counts** — from minimum feasible up to +50% (configurable via `max_extra_buses_pct`)
+4. **For each bus count**, calculates total cost:
    - Driver costs (base + ORT + pauzestaffel + overtime + meals)
    - Fuel costs (trips + deadhead + garage travel)
    - Sustainability bonuses (reduces net cost)
-4. **Picks the bus count with maximum profit**
+5. **Picks the bus count with maximum profit**
+
+**Relationship between versions:**
+| Version | What it does | Bus count |
+|---------|--------------|-----------|
+| 5 | Min buses with deadhead repositioning | Minimum feasible |
+| 6 | Same as v5, but splits chains if fuel range exceeded | ≥ v5 (more if fuel-constrained) |
+| 7 | Financial analysis on v6 rotations (no re-optimization) | Same as v6 |
+| 8 | **Re-runs optimization** to maximize profit | Explores min to min+50% |
+
+**Key insight:** Version 8 may find that using MORE buses than the minimum is MORE profitable, because shorter shifts have lower driver costs (less ORT, overtime, break deductions).
 
 **Why more buses can mean more profit:**
 

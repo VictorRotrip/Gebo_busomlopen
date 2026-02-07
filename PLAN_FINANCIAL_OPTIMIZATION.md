@@ -266,12 +266,18 @@ Version 6 now integrates energy constraints directly into the optimization algor
 **Implementation (Feb 2026):**
 - Added `_optimize_profit_maximizing()` algorithm in busomloop_optimizer.py
 - Algorithm:
-  1. Find minimum buses via min-cost max-matching (baseline)
-  2. Try up to +30% more buses by splitting chains
-  3. For each configuration, calculate full profit using financial_calculator
-  4. Return configuration with maximum profit
+  1. Runs its OWN min-cost max-matching (does NOT inherit from v7)
+  2. Find minimum buses via service-constrained matching (same algorithm as v5)
+  3. Try up to +50% more buses by splitting chains (configurable via `max_extra_buses_pct`)
+  4. For each configuration, calculate full profit using financial_calculator
+  5. Return configuration with maximum profit
 - Added garage config to FinancialConfig: `garage_reistijd_enkel_min`, `garage_afstand_enkel_km`
 - CLI flag: `--kosten-optimalisatie`
+
+**Relationship to other versions:**
+- Version 8 does NOT use rotations from v7 - it re-optimizes from scratch
+- v7 is purely analytical (same rotations as v6, just adds financial calculations)
+- v8 explores different bus counts to find profit-maximizing configuration
 
 **Results on test data:**
 ```
